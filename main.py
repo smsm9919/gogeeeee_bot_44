@@ -17,6 +17,7 @@ Patched:
 - Smart Scale-In/Scale-Out based on candlestick patterns + indicators
 - Dynamic Trailing SL based on market regime
 - Trend Amplifier: ADX-based scale-in, dynamic TP, ratchet lock
+- Hold-TP & Impulse Harvest for advanced profit management
 """
 
 import os, time, math, threading, requests, traceback, random
@@ -676,56 +677,86 @@ def smart_exit_check(info, ind):
     """Return True if full close happened."""
     if not (STRATEGY=="smart" and USE_SMART_EXIT and state["open"]):
         return None
-    
+
     # Advanced position management first
     candle_info = detect_candle_pattern(fetch_ohlcv())
     management_action = advanced_position_management(candle_info, ind)
     if management_action:
         print(colored(f"🎯 MANAGEMENT: {management_action} - {state['action_reason']}", "yellow"))
-    
-    px = info["price"]; e=state["entry"]; side=state["side"]
+
+    px = info["price"]; e = state["entry"]; side = state["side"]
     rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
     atr = ind.get("atr") or 0.0
     adx = ind.get("adx") or 0.0
+    rsi = ind.get("rsi") or 50.0
 
-    # Trend Amplifier: Dynamic TP based on ADX
-    tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
-    current_tp1_pct = TP1_PCT * tp_multiplier
-    current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
-    
-    # Trend Amplifier: Convert to percentages for comparison with rr
-    current_tp1_pct_pct = current_tp1_pct * 100.0
-    current_trail_activate_pct = current_trail_activate * 100.0
+    # ---------- HOLD-TP: لا خروج بدري مع ترند قوي ----------
+    if side == "long" and adx >= 30 and rsi >= RSI_TREND_BUY:
+        print(colored("💎 HOLD-TP: strong uptrend continues, delaying TP", "cyan"))
+        # نكمل من غير أي إغلاقات مبكرة
+    elif side == "short" and adx >= 30 and rsi <= RSI_TREND_SELL:
+        print(colored("💎 HOLD-TP: strong downtrend continues, delaying TP", "cyan"))
+        # نكمل من غير أي إغلاقات مبكرة
 
-    # Update highest profit for ratchet lock
-    if rr > state["highest_profit_pct"]:
-        state["highest_profit_pct"] = rr
-        if tp_multiplier > 1.0:
-            print(colored(f"🎯 TREND AMPLIFIER: New high {rr:.2f}% • TP={current_tp1_pct_pct:.2f}% • TrailActivate={current_trail_activate_pct:.2f}%", "green"))
+    # ---------- Impulse Harvest: استغلال الشموع الطويلة ----------
+    try:
+        df_last = fetch_ohlcv()
+        idx = -1 if USE_TV_BAR else -2
+        o0 = float(df_last["open"].iloc[idx]); c0 = float(df_last["close"].iloc[idx])
+        body = abs(c0 - o0)
+        dir_candle = 1 if c0 > o0 else -1
+        impulse = (body / atr) if atr > 0 else 0.0
+
+        # شمعة قوية في اتجاه الصفقة ⇒ جني أرباح جزئي سريع
+        if impulse >= 1.2 and ((side == "long" and dir_candle > 0) or (side == "short" and dir_candle < 0)):
+            harvest_frac = 0.33 if impulse < 2.0 else 0.50
+            close_partial(harvest_frac, f"Impulse x{impulse:.2f} ATR")
+            # قفّل على الأقل بريك-إيفن وفعّل تريل لو مش مفعّل
+            state["breakeven"] = state.get("breakeven") or e
+            if atr and ATR_MULT_TRAIL > 0:
+                gap = atr * ATR_MULT_TRAIL
+                if side == "long":
+                    state["trail"] = max(state.get("trail") or (px - gap), px - gap)
+                else:
+                    state["trail"] = min(state.get("trail") or (px + gap), px + gap)
+    except Exception as _:
+        pass
 
     # انتظر كام شمعة بعد الدخول لتجنب الخروج السريع
     if state["bars"] < 2:
         return None
 
-    # TP1 جزئي للموجات الصغيرة
+    # Trend Amplifier: Dynamic TP based on ADX
+    tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
+    current_tp1_pct = TP1_PCT * tp_multiplier
+    current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
+    current_tp1_pct_pct = current_tp1_pct * 100.0
+    current_trail_activate_pct = current_trail_activate * 100.0
+
+    # Highest profit (ratchet)
+    if rr > state["highest_profit_pct"]:
+        state["highest_profit_pct"] = rr
+        if tp_multiplier > 1.0:
+            print(colored(f"🎯 TREND AMPLIFIER: New high {rr:.2f}% • TP={current_tp1_pct_pct:.2f}% • TrailActivate={current_trail_activate_pct:.2f}%", "green"))
+
+    # TP1 الجزئي (بعد الانتظار)
     if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
         close_partial(TP1_CLOSE_FRAC, f"TP1@{current_tp1_pct_pct:.2f}%")
-        state["tp1_done"]=True
-        # حرك الوقف لبريك-إيفن بعد مكسب معقول
+        state["tp1_done"] = True
         if rr >= BREAKEVEN_AFTER * 100.0:
-            state["breakeven"]=e
+            state["breakeven"] = e
 
-    # Ratchet Lock: قفل الأرباح عند التراجع
+    # Ratchet lock على التراجع
     if (state["highest_profit_pct"] >= current_trail_activate_pct and
         rr < state["highest_profit_pct"] * RATCHET_LOCK_PCT):
         close_partial(0.5, f"Ratchet Lock @ {state['highest_profit_pct']:.2f}%")
-        state["highest_profit_pct"] = rr  # Reset to current level
+        state["highest_profit_pct"] = rr
         return None
 
-    # Trailing ATR للاستفادة القصوى من الترند
-    if rr >= current_trail_activate_pct and atr and ATR_MULT_TRAIL>0:
+    # Trailing ATR
+    if rr >= current_trail_activate_pct and atr and ATR_MULT_TRAIL > 0:
         gap = atr * ATR_MULT_TRAIL
-        if side=="long":
+        if side == "long":
             new_trail = px - gap
             state["trail"] = max(state["trail"] or new_trail, new_trail)
             if state["breakeven"] is not None:
