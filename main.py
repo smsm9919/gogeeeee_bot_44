@@ -200,10 +200,12 @@ def compute_indicators(df: pd.DataFrame):
     adx = wilder_ema(dx, ADX_LEN)
 
     i = len(df)-1 if USE_TV_BAR else len(df)-2
+    prev_i = max(0, i-1)
     return {
         "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
         "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
-        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i])
+        "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i]),
+        "adx_prev": float(adx.iloc[prev_i])
     }
 
 # ------------ Advanced Candle Analytics ------------
@@ -507,7 +509,7 @@ def should_scale_out(candle_info: dict, ind: dict, current_side: str) -> tuple:
         return True, f"Warning pattern: {candle_info.get('name_en')}"
     
     # ADX weakening after strong move
-    if adx > 30 and ind.get("adx_prev", adx + 1) > adx + 2:  # ADX dropping significantly
+    if adx > 30 and ind.get("adx_prev", 0) > adx + 2:  # ADX dropping significantly
         return True, f"ADX weakening: {ind.get('adx_prev', 0):.1f} → {adx:.1f}"
     
     # RSI extreme in current trend
@@ -543,7 +545,7 @@ def open_market(side, qty, price):
             lev_params = {"positionSide": params["positionSide"]} if BINGX_POSITION_MODE=="hedge" else {"positionSide":"BOTH"}
             try: ex.set_leverage(LEVERAGE, SYMBOL, params=lev_params)
             except Exception as e: print(colored(f"⚠️ set_leverage: {e}", "yellow"))
-            ex.create_order(SYMBOL, "market", side, qty, params=params)
+            ex.create_order(SYMBOL, "market", side, qty, None, params)
         except Exception as e:
             print(colored(f"❌ open: {e}", "red"))
             return  # لا نُحدّث الحالة إذا فشل التنفيذ الفعلي
@@ -569,7 +571,7 @@ def scale_in_position(scale_pct: float, reason: str):
     
     if MODE_LIVE:
         try: 
-            ex.create_order(SYMBOL, "market", side, additional_qty, params=_position_params_for_open(side))
+            ex.create_order(SYMBOL, "market", side, additional_qty, None, _position_params_for_open(side))
         except Exception as e: 
             print(colored(f"❌ scale_in: {e}","red")); return
     
@@ -592,7 +594,7 @@ def close_partial(frac, reason):
     px = price_now() or state["entry"]
     side = "sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,qty_close,params=_position_params_for_close())
+        try: ex.create_order(SYMBOL,"market",side,qty_close,None,_position_params_for_close())
         except Exception as e: print(colored(f"❌ partial close: {e}","red")); return
     pnl=(px-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
     compound_pnl+=pnl
@@ -622,7 +624,7 @@ def close_market(reason):
     px=price_now() or state["entry"]; qty=state["qty"]
     side="sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,qty,params=_position_params_for_close())
+        try: ex.create_order(SYMBOL,"market",side,qty,None,_position_params_for_close())
         except Exception as e: print(colored(f"❌ close: {e}","red")); return
     pnl=(px-state["entry"])*qty*(1 if state["side"]=="long" else -1)
     compound_pnl+=pnl
