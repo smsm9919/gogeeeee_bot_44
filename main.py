@@ -25,6 +25,7 @@ Patched:
 3. ATR protection in Impulse Harvest (prevents division by zero)
 4. REAL-TIME SIGNALS: Uses current closed candle (len(df)-1) for instant TradingView sync
 5. FIXED: UnboundLocalError in advanced_position_management (variable name conflict)
+6. AUTO-FULL CLOSE: Auto close position if remaining qty < 60 DOGE
 """
 
 import os, time, math, threading, requests, traceback, random
@@ -109,6 +110,7 @@ print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEE
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView sync)", "green"))
 print(colored(f"✅ PATCHED: Fixed UnboundLocalError in advanced_position_management", "green"))
+print(colored(f"✅ PATCHED: Auto-full close if remaining qty < 60 DOGE", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ Exchange ------------
@@ -625,7 +627,12 @@ def close_partial(frac, reason):
     global state, compound_pnl
     if not state["open"]: return
     qty_close = max(0.0, state["qty"]*min(max(frac,0.0),1.0))
-    if qty_close<=0: return
+    
+    # ✅ FIX: Prevent partial close smaller than 1 DOGE
+    if qty_close < 1:
+        print(colored(f"⚠️ skip partial close (amount={fmt(qty_close,4)} < 1 DOGE)", "yellow"))
+        return
+        
     px = price_now() or state["entry"]
     side = "sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
@@ -638,6 +645,13 @@ def close_partial(frac, reason):
     state["last_action"] = "SCALE_OUT"
     state["action_reason"] = reason
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
+    
+    # ✅ Auto-full close if remaining qty too small (below 60 DOGE)
+    if state["qty"] < 60:
+        print(colored(f"⚠️ Remaining qty={fmt(state['qty'],2)} < 60 DOGE → full close triggered", "yellow"))
+        close_market("auto_full_close_small_qty")
+        return
+        
     if state["qty"]<=0:
         reset_after_full_close("fully_exited")
 
