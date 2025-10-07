@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RF Futures Bot — Smart Pro (BingX Perp, CCXT)
+RF Futures Bot — Smart Pro (BingX Perp, CCXT) - HARDENED EDITION
 - Entries: TradingView Range Filter EXACT (BUY/SELL)
 - Size: 60% balance × leverage (default 10x)
 - Exit:
@@ -8,6 +8,18 @@ RF Futures Bot — Smart Pro (BingX Perp, CCXT)
   • Smart Profit: TP1 partial + move to breakeven + ATR trailing (trend-riding)
 - Advanced Candle & Indicator Analysis for Position Management
 - Robust keepalive (SELF_URL/RENDER_EXTERNAL_URL), retries, /metrics
+
+✅ HARDENING PACK APPLIED:
+1. Market specs & amount normalization (precision/min step)
+2. Leverage & position mode confirmation  
+3. State persistence to disk (survives restarts)
+4. File logging with rotation (5MB × 7 files)
+5. Watchdog for main loop stall detection
+6. Bar clock sanity check
+7. Network error backoff (circuit breaker)
+8. Idempotency guard for duplicate opening
+9. Graceful exit on SIGTERM/SIGINT
+10. Enhanced health endpoint
 
 Patched:
 - BingX position mode support (oneway|hedge) with correct positionSide
@@ -18,17 +30,11 @@ Patched:
 - Dynamic Trailing SL based on market regime
 - Trend Amplifier: ADX-based scale-in, dynamic TP, ratchet lock
 - Hold-TP & Impulse Harvest for advanced profit management
-
-✅ PATCHES APPLIED:
-1. Safety guards for insufficient data (prevents IndexError)
-2. Accurate Effective Equity display in paper mode  
-3. ATR protection in Impulse Harvest (prevents division by zero)
-4. REAL-TIME SIGNALS: Uses current closed candle (len(df)-1) for instant TradingView sync
-5. FIXED: UnboundLocalError in advanced_position_management (variable name conflict)
-6. AUTO-FULL CLOSE: Auto close position if remaining qty < 60 DOGE
+- Auto-full close if remaining qty < 60 DOGE
 """
 
-import os, time, math, threading, requests, traceback, random
+import os, time, math, threading, requests, traceback, random, signal, sys, logging
+from logging.handlers import RotatingFileHandler
 import pandas as pd
 import ccxt
 from flask import Flask, jsonify
@@ -102,16 +108,52 @@ SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
 KEEPALIVE_SECONDS = 50
 PORT = int(os.getenv("PORT", 5000))
 
+# ------------ HARDENING PACK: State Persistence ------------
+STATE_FILE = "bot_state.json"
+
+# ------------ HARDENING PACK: Network Error Backoff ------------
+_consec_err = 0
+
+# ------------ HARDENING PACK: Idempotency Guard ------------
+last_open_fingerprint = None
+
+# ------------ HARDENING PACK: Watchdog ------------
+last_loop_ts = time.time()
+
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
 print(colored(f"ADVANCED POSITION MGMT: SCALE_IN_STEPS={SCALE_IN_MAX_STEPS} • ADX_STRONG={ADX_STRONG_THRESH}", "yellow"))
 print(colored(f"TREND AMPLIFIER: ADX_TIERS[{ADX_TIER1}/{ADX_TIER2}/{ADX_TIER3}] • RATCHET_LOCK={RATCHET_LOCK_PCT*100}%", "yellow"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
+print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
 print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView sync)", "green"))
-print(colored(f"✅ PATCHED: Fixed UnboundLocalError in advanced_position_management", "green"))
 print(colored(f"✅ PATCHED: Auto-full close if remaining qty < 60 DOGE", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
+
+# ------------ HARDENING PACK: File Logging with Rotation ------------
+def setup_file_logging():
+    """Setup rotating file logging (5MB × 7 files)"""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    fh = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=7, encoding="utf-8")
+    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+    print(colored("🗂️ file logging with rotation enabled", "cyan"))
+
+setup_file_logging()
+
+# ------------ HARDENING PACK: Graceful Exit ------------
+def _graceful_exit(signum, frame):
+    """Save state and exit gracefully on SIGTERM/SIGINT"""
+    print(colored(f"🛑 signal {signum} → saving state & exiting", "red"))
+    save_state()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _graceful_exit)
+signal.signal(signal.SIGINT,  _graceful_exit)
 
 # ------------ Exchange ------------
 def make_exchange():
@@ -124,10 +166,157 @@ def make_exchange():
     })
 
 ex = make_exchange()
+
+# ------------ HARDENING PACK: Market Specs & Amount Normalization ------------
+MARKET = {}
+AMT_PREC = 0
+LOT_STEP = None
+LOT_MIN = None
+
+def load_market_specs():
+    """Load market specifications for amount normalization"""
+    global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
+    try:
+        MARKET = ex.markets.get(SYMBOL, {})
+        AMT_PREC = MARKET.get("precision", {}).get("amount", 0)
+        LOT_STEP = (MARKET.get("limits", {}).get("amount", {}) or {}).get("step", None)
+        LOT_MIN = (MARKET.get("limits", {}).get("amount", {}) or {}).get("min", None)
+        print(colored(f"📊 Market specs: precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}", "cyan"))
+    except Exception as e:
+        print(colored(f"⚠️ load_market_specs: {e}", "yellow"))
+
+def _round_amt(q):
+    """Round amount according to market specifications"""
+    if q is None: return 0.0
+    if LOT_STEP:   # snap to step
+        q = max(0.0, math.floor(q / LOT_STEP) * LOT_STEP)
+    if AMT_PREC is not None:
+        q = float(f"{q:.{AMT_PREC}f}")
+    if LOT_MIN:
+        q = 0.0 if q < LOT_MIN else q
+    return q
+
+def safe_qty(q):
+    """Validate and normalize quantity"""
+    q = _round_amt(q)
+    if q <= 0:
+        print(colored(f"⚠️ qty invalid after normalize → {q}", "yellow"))
+    return q
+
+# ------------ HARDENING PACK: Leverage & Position Mode Confirmation ------------
+def ensure_leverage_and_mode():
+    """Ensure leverage and position mode are set correctly"""
+    try:
+        params = {"positionSide": "BOTH"} if BINGX_POSITION_MODE == "oneway" else {"positionSide": "LONG"}
+        try:
+            ex.set_leverage(LEVERAGE, SYMBOL, params=params)
+            print(colored(f"✅ leverage set TRY: {LEVERAGE}x", "green"))
+        except Exception as e:
+            print(colored(f"⚠️ set_leverage warn: {e}", "yellow"))
+        print(colored(f"ℹ️ position mode target: {BINGX_POSITION_MODE}", "cyan"))
+    except Exception as e:
+        print(colored(f"⚠️ ensure_leverage_and_mode: {e}", "yellow"))
+
+# Load markets and specs
 try:
     ex.load_markets()
+    load_market_specs()
+    ensure_leverage_and_mode()
 except Exception as e:
     print(colored(f"⚠️ load_markets: {e}", "yellow"))
+
+# ------------ HARDENING PACK: State Persistence Functions ------------
+def save_state():
+    """Save bot state to disk"""
+    try:
+        data = {
+            "state": state,
+            "compound_pnl": compound_pnl,
+            "last_signal_id": last_signal_id,
+            "timestamp": time.time()
+        }
+        with open(STATE_FILE, "w") as f:
+            import json
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        logging.info(f"State saved: compound_pnl={compound_pnl}")
+    except Exception as e:
+        print(colored(f"⚠️ save_state: {e}", "yellow"))
+        logging.error(f"save_state error: {e}")
+
+def load_state():
+    """Load bot state from disk"""
+    global state, compound_pnl, last_signal_id
+    try:
+        import json, os
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+            state.update(data.get("state", {}))
+            compound_pnl = data.get("compound_pnl", 0.0)
+            ls = data.get("last_signal_id")
+            if ls:
+                globals()["last_signal_id"] = ls
+            print(colored("✅ state restored from disk", "green"))
+            logging.info(f"State loaded: compound_pnl={compound_pnl}, open={state['open']}")
+    except Exception as e:
+        print(colored(f"⚠️ load_state: {e}", "yellow"))
+        logging.error(f"load_state error: {e}")
+
+# ------------ HARDENING PACK: Network Error Backoff ------------
+def net_guard(success):
+    """Circuit breaker for network errors"""
+    global _consec_err
+    if success:
+        _consec_err = 0
+    else:
+        _consec_err += 1
+        if _consec_err in (3, 5, 8):
+            wait = min(60, 5 * _consec_err)
+            print(colored(f"🌐 network backoff: {_consec_err} errors → sleep {wait}s", "yellow"))
+            logging.warning(f"Network backoff: {_consec_err} errors, sleeping {wait}s")
+            time.sleep(wait)
+
+# ------------ HARDENING PACK: Watchdog Functions ------------
+def loop_heartbeat():
+    """Update main loop heartbeat"""
+    global last_loop_ts
+    last_loop_ts = time.time()
+
+def watchdog_check(max_stall=180):
+    """Watchdog thread to detect main loop stalls"""
+    while True:
+        try:
+            stall_time = time.time() - last_loop_ts
+            if stall_time > max_stall:
+                print(colored(f"🛑 WATCHDOG: main loop stall > {max_stall}s", "red"))
+                logging.critical(f"WATCHDOG: main loop stalled for {stall_time:.0f}s")
+            time.sleep(60)
+        except Exception as e:
+            logging.error(f"watchdog_check error: {e}")
+            time.sleep(60)
+
+# ------------ HARDENING PACK: Bar Clock Sanity Check ------------
+def sanity_check_bar_clock(df):
+    """Check for bar interval anomalies"""
+    try:
+        if len(df) < 2: return
+        tf = _interval_seconds(INTERVAL)
+        delta = (int(df["time"].iloc[-1]) - int(df["time"].iloc[-2]))/1000
+        if abs(delta - tf) > tf*0.5:
+            print(colored(f"⚠️ bar interval anomaly: {delta}s vs tf {tf}s", "yellow"))
+            logging.warning(f"Bar interval anomaly: {delta}s vs tf {tf}s")
+    except Exception as e:
+        logging.error(f"sanity_check_bar_clock error: {e}")
+
+# ------------ HARDENING PACK: Idempotency Guard ------------
+def can_open(sig, price):
+    """Prevent duplicate opening using fingerprint"""
+    global last_open_fingerprint
+    fp = f"{sig}|{int(price or 0)}|{INTERVAL}|{SYMBOL}"
+    if fp == last_open_fingerprint:
+        return False
+    last_open_fingerprint = fp
+    return True
 
 # ------------ Helpers ------------
 def fmt(v, d=6, na="N/A"):
@@ -138,8 +327,12 @@ def fmt(v, d=6, na="N/A"):
 
 def with_retry(fn, attempts=3, base_wait=0.4):
     for i in range(attempts):
-        try: return fn()
+        try: 
+            result = fn()
+            net_guard(True)
+            return result
         except Exception:
+            net_guard(False)
             if i == attempts-1: raise
             time.sleep(base_wait*(2**i) + random.random()*0.2)
 
@@ -429,7 +622,8 @@ post_close_cooldown = 0
 
 def compute_size(balance, price):
     capital = (balance or 0.0) * RISK_ALLOC * LEVERAGE
-    return max(0.0, capital / max(float(price or 0.0), 1e-9))
+    raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
+    return safe_qty(raw)
 
 def sync_from_exchange_once():
     try:
@@ -453,10 +647,12 @@ def sync_from_exchange_once():
                 "highest_profit_pct": 0.0
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
+            logging.info(f"Position synced: {side} qty={qty} entry={entry}")
             return
         print(colored("↔️  Sync: no open position on exchange.","yellow"))
     except Exception as e:
         print(colored(f"❌ sync error: {e}","red"))
+        logging.error(f"sync_from_exchange_once error: {e}")
 
 # ------------ BingX params helpers ------------
 def _position_params_for_open(side: str):
@@ -585,6 +781,7 @@ def open_market(side, qty, price):
             ex.create_order(SYMBOL, "market", side, qty, None, params)
         except Exception as e:
             print(colored(f"❌ open: {e}", "red"))
+            logging.error(f"open_market error: {e}")
             return  # لا نُحدّث الحالة إذا فشل التنفيذ الفعلي
 
     state.update({
@@ -596,6 +793,8 @@ def open_market(side, qty, price):
         "highest_profit_pct": 0.0  # Reset ratchet lock
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
+    logging.info(f"OPEN {side} qty={qty} price={price}")
+    save_state()
 
 def scale_in_position(scale_pct: float, reason: str):
     """Add to existing position"""
@@ -603,14 +802,16 @@ def scale_in_position(scale_pct: float, reason: str):
     if not state["open"]: return
     
     current_price = price_now() or state["entry"]
-    additional_qty = state["qty"] * scale_pct
+    additional_qty = safe_qty(state["qty"] * scale_pct)
     side = "buy" if state["side"] == "long" else "sell"
     
     if MODE_LIVE:
         try: 
             ex.create_order(SYMBOL, "market", side, additional_qty, None, _position_params_for_open(side))
         except Exception as e: 
-            print(colored(f"❌ scale_in: {e}","red")); return
+            print(colored(f"❌ scale_in: {e}","red")); 
+            logging.error(f"scale_in_position error: {e}")
+            return
     
     # Update average entry price
     total_qty = state["qty"] + additional_qty
@@ -621,12 +822,14 @@ def scale_in_position(scale_pct: float, reason: str):
     state["action_reason"] = reason
     
     print(colored(f"📈 SCALE IN +{scale_pct*100:.0f}% | Total qty={fmt(state['qty'],4)} | Avg entry={fmt(state['entry'])} | Reason: {reason}", "cyan"))
+    logging.info(f"SCALE_IN +{scale_pct*100:.0f}% total_qty={state['qty']} avg_entry={state['entry']}")
+    save_state()
 
 def close_partial(frac, reason):
     """Close fraction of current position (smart TP1)."""
     global state, compound_pnl
     if not state["open"]: return
-    qty_close = max(0.0, state["qty"]*min(max(frac,0.0),1.0))
+    qty_close = safe_qty(max(0.0, state["qty"]*min(max(frac,0.0),1.0)))
     
     # ✅ FIX: Prevent partial close smaller than 1 DOGE
     if qty_close < 1:
@@ -637,7 +840,10 @@ def close_partial(frac, reason):
     side = "sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
         try: ex.create_order(SYMBOL,"market",side,qty_close,None,_position_params_for_close())
-        except Exception as e: print(colored(f"❌ partial close: {e}","red")); return
+        except Exception as e: 
+            print(colored(f"❌ partial close: {e}","red")); 
+            logging.error(f"close_partial error: {e}")
+            return
     pnl=(px-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
     compound_pnl+=pnl
     state["qty"]-=qty_close
@@ -645,19 +851,24 @@ def close_partial(frac, reason):
     state["last_action"] = "SCALE_OUT"
     state["action_reason"] = reason
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
+    logging.info(f"PARTIAL_CLOSE {reason} qty={qty_close} pnl={pnl} remaining={state['qty']}")
     
     # ✅ Auto-full close if remaining qty too small (below 60 DOGE)
     if state["qty"] < 60:
         print(colored(f"⚠️ Remaining qty={fmt(state['qty'],2)} < 60 DOGE → full close triggered", "yellow"))
+        logging.warning(f"Auto-full close triggered: remaining qty={state['qty']} < 60 DOGE")
         close_market("auto_full_close_small_qty")
         return
         
     if state["qty"]<=0:
         reset_after_full_close("fully_exited")
+    else:
+        save_state()
 
 def reset_after_full_close(reason):
     global state, post_close_cooldown
     print(colored(f"🔚 CLOSE {reason} totalCompounded now={fmt(compound_pnl)}","magenta"))
+    logging.info(f"FULL_CLOSE {reason} total_compounded={compound_pnl}")
     state.update({
         "open": False, "side": None, "entry": None, "qty": 0.0, 
         "pnl": 0.0, "bars": 0, "trail": None, "tp1_done": False, 
@@ -666,6 +877,7 @@ def reset_after_full_close(reason):
         "highest_profit_pct": 0.0
     })
     post_close_cooldown = COOLDOWN_AFTER_CLOSE_BARS
+    save_state()
 
 def close_market(reason):
     global state, compound_pnl
@@ -674,10 +886,14 @@ def close_market(reason):
     side="sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
         try: ex.create_order(SYMBOL,"market",side,qty,None,_position_params_for_close())
-        except Exception as e: print(colored(f"❌ close: {e}","red")); return
+        except Exception as e: 
+            print(colored(f"❌ close: {e}","red")); 
+            logging.error(f"close_market error: {e}")
+            return
     pnl=(px-state["entry"])*qty*(1 if state["side"]=="long" else -1)
     compound_pnl+=pnl
     print(colored(f"🔚 CLOSE {state['side']} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
+    logging.info(f"CLOSE_MARKET {state['side']} reason={reason} pnl={pnl} total={compound_pnl}")
     reset_after_full_close(reason)
 
 # ------------ Advanced Position Management Check ------------
@@ -717,6 +933,7 @@ def advanced_position_management(candle_info: dict, ind: dict):
             state["last_action"] = "TRAIL_ADJUST"
             state["action_reason"] = f"Trail mult {ATR_MULT_TRAIL} → {trail_mult}"
             print(colored(f"🔄 TRAIL ADJUST: multiplier {ATR_MULT_TRAIL} → {trail_mult} ({'STRONG' if trail_mult==TRAIL_MULT_STRONG else 'MED' if trail_mult==TRAIL_MULT_MED else 'CHOP'})", "blue"))
+            logging.info(f"TRAIL_ADJUST {ATR_MULT_TRAIL}→{trail_mult}")
     
     return None
 
@@ -731,6 +948,7 @@ def smart_exit_check(info, ind):
     management_action = advanced_position_management(candle_info, ind)
     if management_action:
         print(colored(f"🎯 MANAGEMENT: {management_action} - {state['action_reason']}", "yellow"))
+        logging.info(f"MANAGEMENT_ACTION: {management_action} - {state['action_reason']}")
 
     px = info["price"]; e = state["entry"]; side = state["side"]
     rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
@@ -793,6 +1011,7 @@ def smart_exit_check(info, ind):
         state["highest_profit_pct"] = rr
         if tp_multiplier > 1.0:
             print(colored(f"🎯 TREND AMPLIFIER: New high {rr:.2f}% • TP={current_tp1_pct_pct:.2f}% • TrailActivate={current_trail_activate_pct:.2f}%", "green"))
+            logging.info(f"TREND_AMPLIFIER new_high={rr:.2f}% TP={current_tp1_pct_pct:.2f}%")
 
     # TP1 الجزئي (بعد الانتظار)
     if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
@@ -906,11 +1125,20 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
 def trade_loop():
     global last_signal_id, state, post_close_cooldown
     sync_from_exchange_once()
+    loop_counter = 0
+    
     while True:
         try:
+            loop_heartbeat()
+            loop_counter += 1
+            
             bal=balance_usdt()
             px=price_now()
             df=fetch_ohlcv()
+            
+            # HARDENING: Bar clock sanity check
+            sanity_check_bar_clock(df)
+            
             info=compute_tv_signals(df)
             ind=compute_indicators(df)
             spread_bps = orderbook_spread_bps()
@@ -945,12 +1173,16 @@ def trade_loop():
 
             # Open new position when flat
             if not state["open"] and (reason is None) and sig:
-                qty=compute_size(bal, px or info["price"])
-                if qty>0:
-                    open_market(sig, qty, px or info["price"])
-                    last_signal_id=f"{info['time']}:{sig}"
+                # HARDENING: Idempotency guard
+                if can_open(sig, px or info["price"]):
+                    qty=compute_size(bal, px or info["price"])
+                    if qty>0:
+                        open_market(sig, qty, px or info["price"])
+                        last_signal_id=f"{info['time']}:{sig}"
+                    else:
+                        reason="qty<=0"
                 else:
-                    reason="qty<=0"
+                    reason="duplicate signal prevented"
 
             snapshot(bal,info,ind,spread_bps,reason, df)
 
@@ -959,8 +1191,13 @@ def trade_loop():
             if post_close_cooldown>0 and not state["open"]:
                 post_close_cooldown -= 1
 
+            # HARDENING: Save state every 5 loops to reduce I/O
+            if loop_counter % 5 == 0:
+                save_state()
+
         except Exception as e:
             print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}","red"))
+            logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
         time.sleep(SLEEP_S)
 
 # ------------ Keepalive + API ------------
@@ -991,9 +1228,9 @@ def keepalive_loop():
 app = Flask(__name__)
 
 # Suppress Werkzeug logs except first GET /
-import logging
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
+import logging as flask_logging
+log = flask_logging.getLogger('werkzeug')
+log.setLevel(flask_logging.ERROR)
 
 root_logged = False
 
@@ -1004,7 +1241,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED"
 
 @app.route("/metrics")
 def metrics():
@@ -1029,12 +1266,37 @@ def metrics():
         }
     })
 
+@app.route("/health")
+def health():
+    """HARDENING: Enhanced health endpoint"""
+    return jsonify({
+        "ok": True,
+        "loop_stall_s": time.time() - last_loop_ts,
+        "mode": "live" if MODE_LIVE else "paper",
+        "open": state["open"],
+        "side": state["side"],
+        "qty": state["qty"],
+        "compound_pnl": compound_pnl,
+        "consecutive_errors": _consec_err,
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
+
 @app.route("/ping")
 def ping(): return "pong", 200
 
-# Boot
-threading.Thread(target=trade_loop, daemon=True).start()
-threading.Thread(target=keepalive_loop, daemon=True).start()
+# ------------ Boot Sequence ------------
 if __name__ == "__main__":
-    print("✅ Starting Flask server...")
+    print("✅ Starting HARDENED Flask server...")
+    
+    # HARDENING: Load persisted state
+    load_state()
+    
+    # HARDENING: Start watchdog thread
+    threading.Thread(target=watchdog_check, daemon=True).start()
+    print("🦮 Watchdog started")
+    
+    # Start main loops
+    threading.Thread(target=trade_loop, daemon=True).start()
+    threading.Thread(target=keepalive_loop, daemon=True).start()
+    
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
