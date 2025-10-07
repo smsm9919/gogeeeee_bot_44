@@ -31,6 +31,7 @@ Patched:
 - Trend Amplifier: ADX-based scale-in, dynamic TP, ratchet lock
 - Hold-TP & Impulse Harvest for advanced profit management
 - Auto-full close if remaining qty < 60 DOGE
+- Fixed BingX leverage warning with correct side parameter
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -129,6 +130,7 @@ print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
 print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView sync)", "green"))
 print(colored(f"✅ PATCHED: Auto-full close if remaining qty < 60 DOGE", "green"))
+print(colored(f"✅ PATCHED: Fixed BingX leverage warning with side='BOTH'", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ HARDENING PACK: File Logging with Rotation ------------
@@ -207,10 +209,10 @@ def safe_qty(q):
 def ensure_leverage_and_mode():
     """Ensure leverage and position mode are set correctly"""
     try:
-        params = {"positionSide": "BOTH"} if BINGX_POSITION_MODE == "oneway" else {"positionSide": "LONG"}
+        # ✅ FIXED: Use correct side parameter for BingX leverage setting
         try:
-            ex.set_leverage(LEVERAGE, SYMBOL, params=params)
-            print(colored(f"✅ leverage set TRY: {LEVERAGE}x", "green"))
+            ex.set_leverage(LEVERAGE, SYMBOL, params={"side": "BOTH"})
+            print(colored(f"✅ leverage set: {LEVERAGE}x with side=BOTH", "green"))
         except Exception as e:
             print(colored(f"⚠️ set_leverage warn: {e}", "yellow"))
         print(colored(f"ℹ️ position mode target: {BINGX_POSITION_MODE}", "cyan"))
@@ -775,7 +777,8 @@ def open_market(side, qty, price):
 
     if MODE_LIVE:
         try:
-            lev_params = {"positionSide": params["positionSide"]} if BINGX_POSITION_MODE=="hedge" else {"positionSide":"BOTH"}
+            # ✅ FIXED: Use correct side parameter for BingX leverage setting
+            lev_params = {"side": "BOTH"}  # Simplified for oneway mode
             try: ex.set_leverage(LEVERAGE, SYMBOL, params=lev_params)
             except Exception as e: print(colored(f"⚠️ set_leverage: {e}", "yellow"))
             ex.create_order(SYMBOL, "market", side, qty, None, params)
