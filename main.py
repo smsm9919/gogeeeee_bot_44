@@ -18,6 +18,12 @@ Patched:
 - Dynamic Trailing SL based on market regime
 - Trend Amplifier: ADX-based scale-in, dynamic TP, ratchet lock
 - Hold-TP & Impulse Harvest for advanced profit management
+
+✅ PATCHES APPLIED:
+1. Safety guards for insufficient data (prevents IndexError)
+2. Accurate Effective Equity display in paper mode  
+3. ATR protection in Impulse Harvest (prevents division by zero)
+4. REAL-TIME SIGNALS: Uses current closed candle (len(df)-1) for instant TradingView sync
 """
 
 import os, time, math, threading, requests, traceback, random
@@ -49,7 +55,9 @@ COOLDOWN_AFTER_CLOSE_BARS = 2
 RF_SOURCE = "close"
 RF_PERIOD = 20
 RF_MULT = 3.5
-USE_TV_BAR = False
+
+# ✅ PATCH 4: REAL-TIME SIGNALS - Always use current closed candle
+USE_TV_BAR = True  # Now always True for real-time signals
 
 # Indicators
 RSI_LEN = 14
@@ -98,6 +106,7 @@ print(colored(f"ADVANCED POSITION MGMT: SCALE_IN_STEPS={SCALE_IN_MAX_STEPS} • 
 print(colored(f"TREND AMPLIFIER: ADX_TIERS[{ADX_TIER1}/{ADX_TIER2}/{ADX_TIER3}] • RATCHET_LOCK={RATCHET_LOCK_PCT*100}%", "yellow"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
+print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView sync)", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ Exchange ------------
@@ -183,6 +192,11 @@ def time_to_candle_close(df: pd.DataFrame, use_tv_bar: bool) -> int:
 def wilder_ema(s: pd.Series, n: int): return s.ewm(alpha=1/n, adjust=False).mean()
 
 def compute_indicators(df: pd.DataFrame):
+    # ✅ PATCH 1: Safety guard for insufficient data
+    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
+        return {"rsi": 50.0, "plus_di": 0.0, "minus_di": 0.0, "dx": 0.0,
+                "adx": 0.0, "atr": 0.0, "adx_prev": 0.0}
+    
     c, h, l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
     tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
     atr = wilder_ema(tr, ATR_LEN)
@@ -200,7 +214,9 @@ def compute_indicators(df: pd.DataFrame):
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0,1e-12)).fillna(0.0)
     adx = wilder_ema(dx, ADX_LEN)
 
-    i = len(df)-1 if USE_TV_BAR else len(df)-2
+    # ✅ PATCH 4: Always use current closed candle for real-time signals
+    i = len(df)-1  # Always use the latest closed candle
+    
     prev_i = max(0, i-1)
     return {
         "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
@@ -229,7 +245,9 @@ def detect_candle_pattern(df: pd.DataFrame):
     if len(df) < 3:
         return {"pattern": "NONE", "name_ar": "لا شيء", "name_en": "NONE", "strength": 0}
     
-    idx = -1 if USE_TV_BAR else -2
+    # ✅ PATCH 4: Always use current closed candle for real-time signals
+    idx = -1  # Always use the latest closed candle
+    
     o2, h2, l2, c2 = map(float, (df["open"].iloc[idx-2], df["high"].iloc[idx-2], df["low"].iloc[idx-2], df["close"].iloc[idx-2]))
     o1, h1, l1, c1 = map(float, (df["open"].iloc[idx-1], df["high"].iloc[idx-1], df["low"].iloc[idx-1], df["close"].iloc[idx-1]))
     o0, h0, l0, c0 = map(float, (df["open"].iloc[idx], df["high"].iloc[idx], df["low"].iloc[idx], df["close"].iloc[idx]))
@@ -356,6 +374,17 @@ def _rng_filter(src: pd.Series, rsize: pd.Series):
     return filt + rsize, filt - rsize, filt
 
 def compute_tv_signals(df: pd.DataFrame):
+    # ✅ PATCH 1: Safety guard for insufficient data
+    if len(df) < RF_PERIOD + 3:
+        # ✅ PATCH 4: Always use current closed candle
+        i = -1  # Always use the latest closed candle
+        price = float(df["close"].iloc[i]) if len(df) else None
+        return {
+            "time": int(df["time"].iloc[i]) if len(df) else int(time.time()*1000),
+            "price": price or 0.0, "long": False, "short": False,
+            "filter": price or 0.0, "hi": price or 0.0, "lo": price or 0.0, "fdir": 0.0
+        }
+    
     src = df[RF_SOURCE].astype(float)
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
     dfilt = filt - filt.shift(1)
@@ -371,7 +400,10 @@ def compute_tv_signals(df: pd.DataFrame):
         else: CondIni.iloc[i]=CondIni.iloc[i-1]
     longSignal=longCond&(CondIni.shift(1)==-1)
     shortSignal=shortCond&(CondIni.shift(1)==1)
-    i=len(df)-1 if USE_TV_BAR else len(df)-2
+    
+    # ✅ PATCH 4: Always use current closed candle for real-time signals
+    i = len(df)-1  # Always use the latest closed candle
+    
     return {
         "time": int(df["time"].iloc[i]), "price": float(df["close"].iloc[i]),
         "long": bool(longSignal.iloc[i]), "short": bool(shortSignal.iloc[i]),
@@ -701,9 +733,16 @@ def smart_exit_check(info, ind):
     # ---------- Impulse Harvest: استغلال الشموع الطويلة ----------
     try:
         df_last = fetch_ohlcv()
-        idx = -1 if USE_TV_BAR else -2
+        # ✅ PATCH 4: Always use current closed candle
+        idx = -1  # Always use the latest closed candle
+        
         o0 = float(df_last["open"].iloc[idx]); c0 = float(df_last["close"].iloc[idx])
         body = abs(c0 - o0)
+        
+        # ✅ PATCH 3: ATR protection in Impulse Harvest
+        if not (atr and atr > 0 and math.isfinite(atr)):
+            atr = 0.0
+            
         dir_candle = 1 if c0 > o0 else -1
         impulse = (body / atr) if atr > 0 else 0.0
 
@@ -840,7 +879,8 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
 
     # ===== RESULTS =====
     print("📦 RESULTS")
-    eff_eq = (bal or 0.0) + compound_pnl if MODE_LIVE else compound_pnl
+    # ✅ PATCH 2: Accurate Effective Equity display in paper mode
+    eff_eq = (bal or 0.0) + compound_pnl
     print(f"   🧮 CompoundPnL {fmt(compound_pnl)}   🚀 EffectiveEq {fmt(eff_eq)} USDT")
     if reason:
         print(colored(f"   ℹ️ WAIT — reason: {reason}","yellow"))
