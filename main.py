@@ -24,6 +24,7 @@ Patched:
 2. Accurate Effective Equity display in paper mode  
 3. ATR protection in Impulse Harvest (prevents division by zero)
 4. REAL-TIME SIGNALS: Uses current closed candle (len(df)-1) for instant TradingView sync
+5. FIXED: UnboundLocalError in advanced_position_management (variable name conflict)
 """
 
 import os, time, math, threading, requests, traceback, random
@@ -107,6 +108,7 @@ print(colored(f"TREND AMPLIFIER: ADX_TIERS[{ADX_TIER1}/{ADX_TIER2}/{ADX_TIER3}] 
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView sync)", "green"))
+print(colored(f"✅ PATCHED: Fixed UnboundLocalError in advanced_position_management", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ Exchange ------------
@@ -679,9 +681,9 @@ def advanced_position_management(candle_info: dict, ind: dict):
         scale_in_position(step_size, scale_reason)
         return "SCALE_IN"
     
-    # Scale-out check
-    should_scale_out, scale_out_reason = should_scale_out(candle_info, ind, current_side)
-    if should_scale_out:
+    # ✅ PATCH 5: FIXED UnboundLocalError - تغيير اسم المتغير لتجنب التعارض
+    do_scale_out, scale_out_reason = should_scale_out(candle_info, ind, current_side)  # تغيير should_scale_out إلى do_scale_out
+    if do_scale_out:  # استخدام المتغير الجديد
         close_partial(0.3, scale_out_reason)  # Close 30% on warning signals
         return "SCALE_OUT"
     
@@ -852,11 +854,11 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     if state["open"] and STRATEGY == "smart":
         current_side = state["side"]
         should_scale, step_size, scale_reason = should_scale_in(candle_info, ind, current_side)
-        should_scale_out, scale_out_reason = should_scale_out(candle_info, ind, current_side)
+        do_scale_out, scale_out_reason = should_scale_out(candle_info, ind, current_side)
         
         if should_scale:
             print(colored(f"   ✅ SCALE-IN READY: {scale_reason}", "green"))
-        elif should_scale_out:
+        elif do_scale_out:
             print(colored(f"   ⚠️ SCALE-OUT ADVISED: {scale_out_reason}", "yellow"))
         else:
             print(colored(f"   ℹ️ HOLD POSITION: {scale_reason}", "blue"))
