@@ -135,6 +135,7 @@ print(colored(f"✅ PATCHED: Auto-full close if remaining qty < 60 DOGE", "green
 print(colored(f"✅ PATCHED: Fixed BingX leverage warning with side='BOTH'", "green"))
 print(colored(f"✅ NEW: Trend Confirmation Logic (ADX + DI + Candle Analysis)", "green"))
 print(colored(f"✅ PATCH: Instant entry when FLAT + No cooldown after close", "green"))
+print(colored(f"✅ PATCH: Pure Range Filter signals ONLY - No RSI/ADX filtering for entries", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ HARDENING PACK: File Logging with Rotation ------------
@@ -1240,7 +1241,7 @@ def trade_loop():
             # Smart profit (trend-aware) with Trend Amplifier
             smart_exit_check(info, ind)
 
-            # Decide
+            # Decide - ✅ PURE RANGE FILTER SIGNALS ONLY
             sig="buy" if info["long"] else ("sell" if info["short"] else None)
             reason=None
             if not sig:
@@ -1262,7 +1263,7 @@ def trade_loop():
                         snapshot(bal,info,ind,spread_bps,None, df)
                         time.sleep(SLEEP_S); continue
 
-            # ✅ PATCH 2: Open new position when flat — افتح فوراً على إشارة TV طالما لا يوجد مانع آخر
+            # ✅ PATCH: Open new position when flat — PURE RANGE FILTER ONLY
             if not state["open"] and (reason is None) and sig:
                 qty = compute_size(bal, px or info["price"])
                 if qty > 0:
@@ -1331,7 +1332,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER"
 
 @app.route("/metrics")
 def metrics():
