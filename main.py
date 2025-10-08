@@ -634,13 +634,9 @@ last_signal_id = None
 post_close_cooldown = 0
 
 def compute_size(balance, price):
-    # ✅ استخدم الرصيد الفعّال: الرصيد + الربح التراكمي
+    # رصيد فعّال = الرصيد + الربح التراكمي (كومباوند كامل)
     effective_balance = (balance or 0.0) + (compound_pnl or 0.0)
-    
-    # ✅ حماية إضافية: لا يقل عن 0 ولا يتجاوز 3× الرصيد الأساسي
-    effective_balance = max(effective_balance, 0.0)
-    effective_balance = min(effective_balance, balance * 3)  # حماية: لا يتجاوز 3× الرصيد
-    
+
     capital = effective_balance * RISK_ALLOC * LEVERAGE   # 60% × 10x
     raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
     return safe_qty(raw)
