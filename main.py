@@ -634,7 +634,9 @@ last_signal_id = None
 post_close_cooldown = 0
 
 def compute_size(balance, price):
-    capital = (balance or 0.0) * RISK_ALLOC * LEVERAGE
+    # ✅ استخدم الرصيد الفعّال: الرصيد + الربح التراكمي
+    effective_balance = (balance or 0.0) + (compound_pnl or 0.0)
+    capital = effective_balance * RISK_ALLOC * LEVERAGE   # 60% × 10x
     raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
     return safe_qty(raw)
 
