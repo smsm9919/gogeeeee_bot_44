@@ -1238,11 +1238,11 @@ def trade_loop():
             if state["open"] and px:
                 state["pnl"]=(px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
 
-            # Smart profit (trend-aware) with Trend Amplifier
+            # Smart profit (trend-aware) with Trend Amplifier (الخروج فقط)
             smart_exit_check(info, ind)
 
-            # Decide - ✅ PURE RANGE FILTER SIGNALS ONLY
-            sig="buy" if info["long"] else ("sell" if info["short"] else None)
+            # Decide - ✅ PURE RANGE FILTER SIGNALS ONLY (بدون فلترة RSI/ADX للدخول)
+            sig = "buy" if info["long"] else ("sell" if info["short"] else None)
             reason=None
             if not sig:
                 reason="no signal"
