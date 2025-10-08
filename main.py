@@ -32,6 +32,7 @@ Patched:
 - Hold-TP & Impulse Harvest for advanced profit management
 - Auto-full close if remaining qty < 60 DOGE
 - Fixed BingX leverage warning with correct side parameter
+- Trend Confirmation Logic: ADX + DI + Candle Analysis
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -131,6 +132,7 @@ print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, networ
 print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView sync)", "green"))
 print(colored(f"✅ PATCHED: Auto-full close if remaining qty < 60 DOGE", "green"))
 print(colored(f"✅ PATCHED: Fixed BingX leverage warning with side='BOTH'", "green"))
+print(colored(f"✅ NEW: Trend Confirmation Logic (ADX + DI + Candle Analysis)", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ HARDENING PACK: File Logging with Rotation ------------
@@ -688,10 +690,59 @@ def get_dynamic_tp_params(adx: float) -> tuple:
     else:
         return 1.0, 1.0
 
+# ====== NEW: TREND CONFIRMATION LOGIC ======
+def check_trend_confirmation(candle_info: dict, ind: dict, current_side: str) -> str:
+    """
+    تحليل تأكيد الاتجاه باستخدام ADX + DI + الشموع
+    Returns:
+        "CONFIRMED_CONTINUE" - اتجاه مؤكد: استمرار في الترند
+        "CONFIRMED_REVERSAL" - انعكاس مؤكد: خروج جزئي  
+        "NO_SIGNAL" - لا إشارة واضحة
+    """
+    try:
+        pattern = candle_info.get("pattern", "NONE")
+        adx = float(ind.get("adx") or 0)
+        plus_di = float(ind.get("plus_di") or 0)
+        minus_di = float(ind.get("minus_di") or 0)
+        rsi = float(ind.get("rsi") or 50)
+        
+        # قائمة بأنماط الشموع الانعكاسية
+        reversal_patterns = ["DOJI", "HAMMER", "SHOOTING_STAR", "EVENING_STAR", "MORNING_STAR"]
+        
+        # إذا كانت هناك شمعة انعكاسية
+        if pattern in reversal_patterns:
+            # حالة 1: ترند قوي (ADX > 25) واتجاه DI مؤكد ⇒ انعكاس وهمي
+            if adx > 25:
+                if current_side == "long" and plus_di > minus_di and rsi >= RSI_TREND_BUY:
+                    return "CONFIRMED_CONTINUE"
+                elif current_side == "short" and minus_di > plus_di and rsi <= RSI_TREND_SELL:
+                    return "CONFIRMED_CONTINUE"
+                else:
+                    return "CONFIRMED_REVERSAL"
+            
+            # حالة 2: ترند ضعيف (ADX < 20) ⇒ انعكاس حقيقي
+            elif adx < 20:
+                return "CONFIRMED_REVERSAL"
+                
+            # حالة 3: ترند متوسط (20-25) ⇒ لا إشارة واضحة
+            else:
+                return "NO_SIGNAL"
+        
+        return "NO_SIGNAL"
+        
+    except Exception as e:
+        print(colored(f"⚠️ check_trend_confirmation error: {e}", "yellow"))
+        return "NO_SIGNAL"
+
 def should_scale_in(candle_info: dict, ind: dict, current_side: str) -> tuple:
     """Return (should_scale, step_size, reason)"""
     if state["scale_ins"] >= SCALE_IN_MAX_STEPS:
         return False, 0.0, "Max scale-in steps reached"
+    
+    # NEW: Trend confirmation check before scale-in
+    trend_signal = check_trend_confirmation(candle_info, ind, current_side)
+    if trend_signal == "CONFIRMED_REVERSAL":
+        return False, 0.0, "Trend reversal confirmed - no scale-in"
     
     adx = ind.get("adx", 0)
     rsi = ind.get("rsi", 50)
@@ -720,6 +771,10 @@ def should_scale_in(candle_info: dict, ind: dict, current_side: str) -> tuple:
     if candle_strength < 2:
         return False, 0.0, f"Weak candle pattern: {candle_info.get('name_en', 'NONE')}"
     
+    # NEW: Only scale-in with trend confirmation
+    if trend_signal == "CONFIRMED_CONTINUE":
+        return True, step_size, f"Trend confirmed + {step_reason}"
+    
     # Specific strong patterns for scale-in
     strong_patterns = ["THREE_WHITE_SOLDIERS", "THREE_BLACK_CROWS", "ENGULF_BULL", "ENGULF_BEAR", "MARUBOZU_BULL", "MARUBOZU_BEAR"]
     if candle_info.get("pattern") in strong_patterns:
@@ -731,6 +786,11 @@ def should_scale_out(candle_info: dict, ind: dict, current_side: str) -> tuple:
     """Return (should_scale_out, reason)"""
     if state["qty"] <= 0:
         return False, "No position to scale out"
+    
+    # NEW: Trend confirmation check for scale-out
+    trend_signal = check_trend_confirmation(candle_info, ind, current_side)
+    if trend_signal == "CONFIRMED_REVERSAL":
+        return True, f"Confirmed reversal: {candle_info.get('name_en', 'NONE')}"
     
     adx = ind.get("adx", 0)
     rsi = ind.get("rsi", 50)
@@ -901,12 +961,23 @@ def close_market(reason):
 
 # ------------ Advanced Position Management Check ------------
 def advanced_position_management(candle_info: dict, ind: dict):
-    """Handle scale-in, scale-out, and dynamic trailing"""
+    """Handle scale-in, scale-out, and dynamic trailing with trend confirmation"""
     if not state["open"]:
         return None
     
     current_side = state["side"]
     px = ind.get("price") or price_now() or state["entry"]
+    
+    # NEW: Trend Confirmation Logic - تطبيق منطق تأكيد الاتجاه
+    trend_signal = check_trend_confirmation(candle_info, ind, current_side)
+    if trend_signal == "CONFIRMED_CONTINUE":
+        print(colored("📈 اتجاه مؤكد: استمرار في الترند", "green"))
+        logging.info("Trend confirmed: continuing in the same direction")
+    elif trend_signal == "CONFIRMED_REVERSAL":
+        print(colored("⚠️ انعكاس مؤكد: خروج جزئي", "red"))
+        logging.info("Reversal confirmed: partial exit")
+        close_partial(0.3, "Reversal confirmed by trend analysis")  # إغلاق 30% كخروج جزئي
+        return "SCALE_OUT_REVERSAL"
     
     # Scale-in check with dynamic step
     should_scale, step_size, scale_reason = should_scale_in(candle_info, ind, current_side)
@@ -1092,6 +1163,15 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         should_scale, step_size, scale_reason = should_scale_in(candle_info, ind, current_side)
         do_scale_out, scale_out_reason = should_scale_out(candle_info, ind, current_side)
         
+        # NEW: Trend confirmation display
+        trend_signal = check_trend_confirmation(candle_info, ind, current_side)
+        if trend_signal == "CONFIRMED_CONTINUE":
+            print(colored(f"   📈 اتجاه مؤكد: استمرار في الترند", "green"))
+        elif trend_signal == "CONFIRMED_REVERSAL":
+            print(colored(f"   ⚠️ انعكاس مؤكد: خروج جزئي", "red"))
+        else:
+            print(colored(f"   ℹ️ لا إشارة اتجاه واضحة", "blue"))
+        
         if should_scale:
             print(colored(f"   ✅ SCALE-IN READY: {scale_reason}", "green"))
         elif do_scale_out:
@@ -1244,7 +1324,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION"
 
 @app.route("/metrics")
 def metrics():
