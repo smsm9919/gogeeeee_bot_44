@@ -33,6 +33,7 @@ Patched:
 - Auto-full close if remaining qty < 60 DOGE
 - Fixed BingX leverage warning with correct side parameter
 - Trend Confirmation Logic: ADX + DI + Candle Analysis
+- ✅ PATCH: Instant entry when FLAT + No cooldown after close
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -59,7 +60,7 @@ INTERVAL = "15m"
 LEVERAGE = 10
 RISK_ALLOC = 0.60
 SPREAD_GUARD_BPS = 6
-COOLDOWN_AFTER_CLOSE_BARS = 2
+COOLDOWN_AFTER_CLOSE_BARS = 0  # ✅ PATCH 3: No cooldown after close
 
 # Range Filter params
 RF_SOURCE = "close"
@@ -133,6 +134,7 @@ print(colored(f"✅ REAL-TIME SIGNALS: Using current closed candle (TradingView 
 print(colored(f"✅ PATCHED: Auto-full close if remaining qty < 60 DOGE", "green"))
 print(colored(f"✅ PATCHED: Fixed BingX leverage warning with side='BOTH'", "green"))
 print(colored(f"✅ NEW: Trend Confirmation Logic (ADX + DI + Candle Analysis)", "green"))
+print(colored(f"✅ PATCH: Instant entry when FLAT + No cooldown after close", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ HARDENING PACK: File Logging with Rotation ------------
@@ -314,7 +316,13 @@ def sanity_check_bar_clock(df):
 
 # ------------ HARDENING PACK: Idempotency Guard ------------
 def can_open(sig, price):
-    """Prevent duplicate opening using fingerprint"""
+    """
+    ✅ PATCH 1: يسمح بالدخول فوراً لو الحساب FLAT.
+    يمنع التكرار فقط أثناء وجود صفقة مفتوحة.
+    """
+    if not state.get("open"):
+        return True
+
     global last_open_fingerprint
     fp = f"{sig}|{int(price or 0)}|{INTERVAL}|{SYMBOL}"
     if fp == last_open_fingerprint:
@@ -590,7 +598,7 @@ def compute_tv_signals(df: pd.DataFrame):
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
     dfilt = filt - filt.shift(1)
     fdir = pd.Series(0.0, index=filt.index).mask(dfilt>0,1).mask(dfilt<0,-1).ffill().fillna(0.0)
-    upward = (fdir==1).astype(int); downward=(fdir==-1).astype(int)
+    upward = (fdir==1).astype(int); downward = (fdir == -1).astype(int)
     src_gt_f=(src>filt); src_lt_f=(src<filt); src_gt_p=(src>src.shift(1)); src_lt_p=(src<src.shift(1))
     longCond=(src_gt_f&((src_gt_p)|(src_lt_p))&(upward>0))
     shortCond=(src_lt_f&((src_lt_p)|(src_gt_p))&(downward>0))
@@ -1254,18 +1262,17 @@ def trade_loop():
                         snapshot(bal,info,ind,spread_bps,None, df)
                         time.sleep(SLEEP_S); continue
 
-            # Open new position when flat
+            # ✅ PATCH 2: Open new position when flat — افتح فوراً على إشارة TV طالما لا يوجد مانع آخر
             if not state["open"] and (reason is None) and sig:
-                # HARDENING: Idempotency guard
-                if can_open(sig, px or info["price"]):
-                    qty=compute_size(bal, px or info["price"])
-                    if qty>0:
-                        open_market(sig, qty, px or info["price"])
-                        last_signal_id=f"{info['time']}:{sig}"
-                    else:
-                        reason="qty<=0"
+                qty = compute_size(bal, px or info["price"])
+                if qty > 0:
+                    open_market(sig, qty, px or info["price"])
+                    # صفّر البصمة بعد فتح صفقة حقيقية
+                    global last_open_fingerprint
+                    last_open_fingerprint = None
+                    last_signal_id = f"{info['time']}:{sig}"
                 else:
-                    reason="duplicate signal prevented"
+                    reason = "qty<=0"
 
             snapshot(bal,info,ind,spread_bps,reason, df)
 
@@ -1324,7 +1331,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY"
 
 @app.route("/metrics")
 def metrics():
