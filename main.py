@@ -35,7 +35,6 @@ Patched:
 - Trend Confirmation Logic: ADX + DI + Candle Analysis
 - ✅ PATCH: Instant entry when FLAT + No cooldown after close
 - ✅ PATCH: Strict Exchange Close with retry & verification
-- ✅ PATCH: Fixed EffectiveEq calculation in LIVE mode (no double counting)
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -149,7 +148,6 @@ print(colored(f"✅ NEW: Trend Confirmation Logic (ADX + DI + Candle Analysis)",
 print(colored(f"✅ PATCH: Instant entry when FLAT + No cooldown after close", "green"))
 print(colored(f"✅ PATCH: Pure Range Filter signals ONLY - No RSI/ADX filtering for entries", "green"))
 print(colored(f"✅ PATCH: Strict Exchange Close with retry & verification", "green"))
-print(colored(f"✅ PATCH: Fixed EffectiveEq calculation in LIVE mode (no double counting)", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ HARDENING PACK: File Logging with Rotation ------------
@@ -693,13 +691,8 @@ last_signal_id = None
 post_close_cooldown = 0
 
 def compute_size(balance, price):
-    # ✅ PATCH: Fixed EffectiveEq calculation - no double counting in LIVE mode
-    # في اللايف: الرصيد الفعلي من البورصة بالفعل يحتوي على الأرباح المحققة
-    if MODE_LIVE:
-        effective_balance = (balance or 0.0)
-    else:
-        # في الـ PAPER نحافظ على الكومباوندينج النظري
-        effective_balance = (balance or 0.0) + (compound_pnl or 0.0)
+    # رصيد فعّال = الرصيد + الربح التراكمي (كومباوند كامل)
+    effective_balance = (balance or 0.0) + (compound_pnl or 0.0)
 
     capital = effective_balance * RISK_ALLOC * LEVERAGE   # 60% × 10x
     raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
@@ -726,7 +719,7 @@ def sync_from_exchange_once():
                 "last_action": "SYNC", "action_reason": "Position synced from exchange",
                 "highest_profit_pct": 0.0
             })
-            print(colored(f"✅ Synced position ⇒ {side.UP() if side=='long' else 'SHORT'} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
+            print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
             return
         print(colored("↔️  Sync: no open position on exchange.","yellow"))
@@ -1406,14 +1399,8 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
 
     # ===== RESULTS =====
     print("📦 RESULTS")
-    # ✅ PATCH: Fixed EffectiveEq calculation - no double counting in LIVE mode
-    # في اللايف: الرصيد الفعلي من البورصة بالفعل يحتوي على الأرباح المحققة
-    if MODE_LIVE:
-        eff_eq = (bal or 0.0)
-    else:
-        # في الـ PAPER نحافظ على الكومباوندينج النظري
-        eff_eq = (bal or 0.0) + compound_pnl
-        
+    # ✅ PATCH 2: Accurate Effective Equity display in paper mode
+    eff_eq = (bal or 0.0) + compound_pnl
     print(f"   🧮 CompoundPnL {fmt(compound_pnl)}   🚀 EffectiveEq {fmt(eff_eq)} USDT")
     if reason:
         print(colored(f"   ℹ️ WAIT — reason: {reason}","yellow"))
@@ -1552,7 +1539,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.UP()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — FIXED EFFECTIVE_EQ"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE"
 
 @app.route("/metrics")
 def metrics():
@@ -1575,8 +1562,7 @@ def metrics():
             "action_reason": state.get("action_reason"),
             "highest_profit_pct": state.get("highest_profit_pct", 0)
         },
-        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "effective_eq_fixed": True
+        "strict_close_enabled": STRICT_EXCHANGE_CLOSE
     })
 
 @app.route("/health")
@@ -1592,8 +1578,7 @@ def health():
         "compound_pnl": compound_pnl,
         "consecutive_errors": _consec_err,
         "timestamp": datetime.utcnow().isoformat(),
-        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "effective_eq_fixed": True
+        "strict_close_enabled": STRICT_EXCHANGE_CLOSE
     }), 200
 
 @app.route("/ping")
