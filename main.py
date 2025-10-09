@@ -48,6 +48,7 @@ Patched:
 - ✅ PATCH: TP1 fallback when trade_mode not decided
 - ✅ PATCH: Safety guard to avoid float-None operations after strict close
 - ✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-entry
+- ✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closing
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -169,6 +170,7 @@ print(colored(f"✅ PATCH: Strict profit target closing with exchange verificati
 print(colored(f"✅ PATCH: TP1 fallback when trade_mode not decided", "green"))
 print(colored(f"✅ PATCH: Safety guard to avoid float-None operations after strict close", "green"))
 print(colored(f"✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-entry", "green"))
+print(colored(f"✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closing", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -718,7 +720,12 @@ state={
     "highest_profit_pct": 0.0,  # Trend Amplifier: ratchet lock
     "trade_mode": None,  # ✅ NEW: Trade mode (SCALP/TREND)
     "profit_targets_achieved": 0,  # ✅ NEW: Track profit targets
-    "entry_time": None  # ✅ NEW: Track entry time for time-based exits
+    "entry_time": None,  # ✅ NEW: Track entry time for time-based exits
+    # ✅ NEW: Fakeout Protection fields
+    "fakeout_pending": False,          # هل في احتمال انعكاس جارٍ؟
+    "fakeout_need_side": None,         # 'long' أو 'short' الاتجاه المطلوب لتأكيد الانعكاس
+    "fakeout_confirm_bars": 0,         # عدّاد الشموع المطلوبة للتأكيد
+    "fakeout_started_at": None         # طابع زمني/شمعة بدء الاشتباه
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -754,7 +761,12 @@ def sync_from_exchange_once():
                 "highest_profit_pct": 0.0,
                 "trade_mode": None,  # Reset trade mode on sync
                 "profit_targets_achieved": 0,
-                "entry_time": time.time()
+                "entry_time": time.time(),
+                # ✅ NEW: Reset fakeout protection on sync
+                "fakeout_pending": False,
+                "fakeout_need_side": None,
+                "fakeout_confirm_bars": 0,
+                "fakeout_started_at": None
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -924,8 +936,9 @@ def check_trend_confirmation(candle_info: dict, ind: dict, current_side: str) ->
     تحليل تأكيد الاتجاه باستخدام ADX + DI + الشموع
     Returns:
         "CONFIRMED_CONTINUE" - اتجاه مؤكد: استمرار في الترند
-        "CONFIRMED_REVERSAL" - انعكاس مؤكد: خروج جزئي  
-        "NO_SIGNAL" - لا إشارة واضحة
+        "POSSIBLE_FAKEOUT" - اشتباه انعكاس، نحتاج انتظار
+        "CONFIRMED_REVERSAL" - انعكاس مؤكد بعد التحقق
+        "NO_SIGNAL"
     """
     try:
         pattern = candle_info.get("pattern", "NONE")
@@ -937,24 +950,37 @@ def check_trend_confirmation(candle_info: dict, ind: dict, current_side: str) ->
         # قائمة بأنماط الشموع الانعكاسية
         reversal_patterns = ["DOJI", "HAMMER", "SHOOTING_STAR", "EVENING_STAR", "MORNING_STAR"]
         
-        # إذا كانت هناك شمعة انعكاسية
+        # ✅ NEW: Fakeout Protection Logic
         if pattern in reversal_patterns:
-            # حالة 1: ترند قوي (ADX > 25) واتجاه DI مؤكد ⇒ انعكاس وهمي
-            if adx > 25:
+            # حالة 1: ترند قوي (ADX ≥ 25) واتجاه DI مؤكد ⇒ انعكاس وهمي
+            if adx >= 25:
                 if current_side == "long" and plus_di > minus_di and rsi >= RSI_TREND_BUY:
                     return "CONFIRMED_CONTINUE"
                 elif current_side == "short" and minus_di > plus_di and rsi <= RSI_TREND_SELL:
                     return "CONFIRMED_CONTINUE"
                 else:
-                    return "CONFIRMED_REVERSAL"
+                    # ✅ NEW: Check for confirmed reversal with strong indicators
+                    if current_side == "long" and minus_di > plus_di and rsi < 45:
+                        return "CONFIRMED_REVERSAL"
+                    elif current_side == "short" and plus_di > minus_di and rsi > 55:
+                        return "CONFIRMED_REVERSAL"
+                    else:
+                        return "POSSIBLE_FAKEOUT"
             
-            # حالة 2: ترند ضعيف (ADX < 20) ⇒ انعكاس حقيقي
-            elif adx < 20:
-                return "CONFIRMED_REVERSAL"
+            # حالة 2: ترند ضعيف (ADX < 25) ⇒ احتمال انعكاس وهمي
+            elif adx < 25:
+                return "POSSIBLE_FAKEOUT"
                 
-            # حالة 3: ترند متوسط (20-25) ⇒ لا إشارة واضحة
+            # حالة 3: ترند متوسط (25-30) ⇒ لا إشارة واضحة
             else:
                 return "NO_SIGNAL"
+        
+        # ✅ NEW: Strong trend continuation
+        if adx >= 30:
+            if current_side == "long" and plus_di > minus_di and rsi >= RSI_TREND_BUY:
+                return "CONFIRMED_CONTINUE"
+            elif current_side == "short" and minus_di > plus_di and rsi <= RSI_TREND_SELL:
+                return "CONFIRMED_CONTINUE"
         
         return "NO_SIGNAL"
         
@@ -1339,7 +1365,12 @@ def open_market(side, qty, price):
         "highest_profit_pct": 0.0,  # Reset ratchet lock
         "trade_mode": None,  # ✅ NEW: Reset trade mode
         "profit_targets_achieved": 0,  # ✅ NEW: Reset profit targets
-        "entry_time": time.time()  # ✅ NEW: Track entry time
+        "entry_time": time.time(),  # ✅ NEW: Track entry time
+        # ✅ NEW: Reset fakeout protection on new position
+        "fakeout_pending": False,
+        "fakeout_need_side": None,
+        "fakeout_confirm_bars": 0,
+        "fakeout_started_at": None
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1426,7 +1457,12 @@ def reset_after_full_close(reason):
         "highest_profit_pct": 0.0,
         "trade_mode": None,  # ✅ NEW: Reset trade mode
         "profit_targets_achieved": 0,  # ✅ NEW: Reset profit targets
-        "entry_time": None  # ✅ NEW: Reset entry time
+        "entry_time": None,  # ✅ NEW: Reset entry time
+        # ✅ NEW: Reset fakeout protection on full close
+        "fakeout_pending": False,
+        "fakeout_need_side": None,
+        "fakeout_confirm_bars": 0,
+        "fakeout_started_at": None
     })
     post_close_cooldown = COOLDOWN_AFTER_CLOSE_BARS
     save_state()
@@ -1526,6 +1562,53 @@ def smart_exit_check(info, ind):
     if e is None or px is None or side is None or e == 0:
         return None
 
+    # ✅ NEW: Fakeout Protection Logic - قبل أي إغلاق نهائي
+    if state["open"]:
+        trend_signal = check_trend_confirmation(candle_info, ind, state["side"])
+        
+        # حالة 1: اشتباه انعكاس وهمي - تفعيل الانتظار
+        if (trend_signal == "POSSIBLE_FAKEOUT" and 
+            not state["fakeout_pending"] and 
+            state["fakeout_confirm_bars"] == 0):
+            
+            state["fakeout_pending"] = True
+            state["fakeout_confirm_bars"] = 2  # انتظر شمعتين مغلقتين
+            state["fakeout_need_side"] = "short" if state["side"] == "long" else "long"
+            state["fakeout_started_at"] = info["time"]
+            
+            print(colored("🕒 WAITING — possible fake reversal detected, holding position...", "yellow"))
+            logging.info("FAKEOUT PROTECTION: Possible fake reversal detected, waiting for confirmation")
+            return None  # لا تغلق الآن
+        
+        # حالة 2: في انتظار تأكيد الانعكاس
+        elif state["fakeout_pending"]:
+            # تحقق من تأكيد الانعكاس
+            if (trend_signal == "CONFIRMED_REVERSAL" and 
+                state["fakeout_need_side"] == ("short" if state["side"] == "long" else "long")):
+                
+                state["fakeout_confirm_bars"] -= 1
+                print(colored(f"🕒 FAKEOUT CONFIRMATION — {state['fakeout_confirm_bars']} bars left", "yellow"))
+                
+                if state["fakeout_confirm_bars"] <= 0:
+                    print(colored("⚠️ CONFIRMED REVERSAL — closing position", "red"))
+                    logging.info("FAKEOUT PROTECTION: Confirmed reversal after fakeout delay")
+                    close_market_strict("CONFIRMED REVERSAL after fakeout delay")
+                    # إعادة تعيين حالة الـ fakeout
+                    state["fakeout_pending"] = False
+                    state["fakeout_need_side"] = None
+                    state["fakeout_confirm_bars"] = 0
+                    state["fakeout_started_at"] = None
+                    return True  # Position closed
+            
+            # حالة 3: إلغاء الاشتباه - العودة لصالح الصفقة
+            elif trend_signal == "CONFIRMED_CONTINUE":
+                state["fakeout_pending"] = False
+                state["fakeout_need_side"] = None
+                state["fakeout_confirm_bars"] = 0
+                state["fakeout_started_at"] = None
+                print(colored("✅ CONTINUE — fakeout ignored, staying in trade", "green"))
+                logging.info("FAKEOUT PROTECTION: Fakeout ignored, continuing in trade")
+
     rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
     atr = ind.get("atr") or 0.0
     adx = ind.get("adx") or 0.0
@@ -1622,6 +1705,10 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     if not state["open"] and wait_for_next_signal_side:
         print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal on CLOSED candle", "cyan"))
     
+    # ✅ NEW: Display fakeout protection status
+    if state["open"] and state["fakeout_pending"]:
+        print(colored(f"   🛡️ FAKEOUT PROTECTION — waiting {state['fakeout_confirm_bars']} bars for confirmation", "yellow"))
+    
     print(f"   ⏱️ Candle closes in ~ {left_s}s")
     print()
 
@@ -1654,6 +1741,8 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         trend_signal = check_trend_confirmation(candle_info, ind, current_side)
         if trend_signal == "CONFIRMED_CONTINUE":
             print(colored(f"   📈 اتجاه مؤكد: استمرار في الترند", "green"))
+        elif trend_signal == "POSSIBLE_FAKEOUT":
+            print(colored(f"   🕒 اشتباه انعكاس وهمي: في انتظار التأكيد", "yellow"))
         elif trend_signal == "CONFIRMED_REVERSAL":
             print(colored(f"   ⚠️ انعكاس مؤكد: خروج جزئي", "red"))
         else:
@@ -1847,7 +1936,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION"
 
 @app.route("/metrics")
 def metrics():
@@ -1873,7 +1962,13 @@ def metrics():
             "profit_targets_achieved": state.get("profit_targets_achieved", 0)  # ✅ NEW
         },
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "waiting_for_signal": wait_for_next_signal_side  # ✅ NEW
+        "waiting_for_signal": wait_for_next_signal_side,  # ✅ NEW
+        "fakeout_protection": {  # ✅ NEW
+            "pending": state.get("fakeout_pending", False),
+            "need_side": state.get("fakeout_need_side"),
+            "confirm_bars": state.get("fakeout_confirm_bars", 0),
+            "started_at": state.get("fakeout_started_at")
+        }
     })
 
 @app.route("/health")
@@ -1892,7 +1987,8 @@ def health():
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
         "trade_mode": state.get("trade_mode"),  # ✅ NEW
         "profit_targets_achieved": state.get("profit_targets_achieved", 0),  # ✅ NEW
-        "waiting_for_signal": wait_for_next_signal_side  # ✅ NEW
+        "waiting_for_signal": wait_for_next_signal_side,  # ✅ NEW
+        "fakeout_protection_active": state.get("fakeout_pending", False)  # ✅ NEW
     }), 200
 
 @app.route("/ping")
