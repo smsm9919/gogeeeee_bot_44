@@ -46,6 +46,8 @@ Patched:
 - ✅ PATCH: CLOSED CANDLE SIGNALS ONLY - No premature entries
 - ✅ PATCH: Strict profit target closing with exchange verification
 - ✅ PATCH: TP1 fallback when trade_mode not decided
+- ✅ PATCH: Safety guard to avoid float-None operations after strict close
+- ✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-entry
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -140,6 +142,11 @@ CLOSE_RETRY_ATTEMPTS   = 6          # عدد المحاولات القصوى
 CLOSE_VERIFY_WAIT_S    = 2.0        # مدة الانتظار بين كل تحقق من إغلاق المنصة (ثواني)
 MIN_RESIDUAL_TO_FORCE  = 1.0        # أي بقايا كمية ≥ هذا الرقم نعيد إغلاقها
 
+# === Post-close signal gating ===
+REQUIRE_NEW_BAR_AFTER_CLOSE = True
+wait_for_next_signal_side = None    # 'buy' أو 'sell' أو None
+last_close_signal_time = None       # time للشمعة التي تم عندها الإغلاق
+
 # ------------ HARDENING PACK: State Persistence ------------
 STATE_FILE = "bot_state.json"
 
@@ -160,6 +167,8 @@ print(colored(f"✅ NEW: SMART POST-ENTRY MANAGEMENT ENABLED", "green"))
 print(colored(f"✅ PATCH: CLOSED CANDLE SIGNALS ONLY - No premature entries", "green"))
 print(colored(f"✅ PATCH: Strict profit target closing with exchange verification", "green"))
 print(colored(f"✅ PATCH: TP1 fallback when trade_mode not decided", "green"))
+print(colored(f"✅ PATCH: Safety guard to avoid float-None operations after strict close", "green"))
+print(colored(f"✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-entry", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -1512,6 +1521,11 @@ def smart_exit_check(info, ind):
         logging.info(f"POST_ENTRY_ACTION: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}")
 
     px = info["price"]; e = state["entry"]; side = state["side"]
+    
+    # ✅ PATCH: safety guard to avoid float-None operations after strict close
+    if e is None or px is None or side is None or e == 0:
+        return None
+
     rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
     atr = ind.get("atr") or 0.0
     adx = ind.get("adx") or 0.0
@@ -1603,6 +1617,11 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     
     candle_info = insights['candle']
     print(f"   🕯️ Candles = {insights['candle_emoji']} {candle_info['name_ar']} / {candle_info['name_en']} (Strength: {candle_info['strength']}/4)")
+    
+    # ✅ NEW: Display waiting status
+    if not state["open"] and wait_for_next_signal_side:
+        print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal on CLOSED candle", "cyan"))
+    
     print(f"   ⏱️ Candle closes in ~ {left_s}s")
     print()
 
@@ -1682,7 +1701,7 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
 
 # ------------ Decision Loop ------------
 def trade_loop():
-    global last_signal_id, state, post_close_cooldown
+    global last_signal_id, state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time
     sync_from_exchange_once()
     loop_counter = 0
     
@@ -1718,33 +1737,50 @@ def trade_loop():
             elif post_close_cooldown>0:
                 reason=f"cooldown {post_close_cooldown} bars"
 
-            # ✅ PATCH: Close on opposite RF signal ALWAYS (using closed candle)
+            # ✅ PATCH: Close on opposite RF signal (using closed candle) + WAIT for next signal
             if state["open"] and sig and (reason is None):
-                desired="long" if sig=="buy" else "short"
-                if state["side"]!=desired:
+                desired = "long" if sig == "buy" else "short"
+                if state["side"] != desired:
+                    prev_side = state["side"]  # احفظ اتجاه الصفقة القديمة
                     close_market_strict("opposite_signal")
-                    # انتظر الإشارة التالية من الفلتر قبل فتح صفقة جديدة
-                    qty=compute_size(bal, px or info["price"])
-                    if qty>0:
-                        open_market(sig, qty, px or info["price"])
-                        last_signal_id=f"{info['time']}:{sig}"
-                        snapshot(bal,info,ind,spread_bps,None, df)
-                        # ✅ PATCH: Adaptive pacing for faster entries near candle close
-                        sleep_s = compute_next_sleep(df)
-                        time.sleep(sleep_s)
-                        continue
 
-            # ✅ PATCH: Open new position when flat — PURE RANGE FILTER ONLY (using closed candle)
+                    # فعّل وضع الانتظار للإشارة التالية المعاكسة
+                    wait_for_next_signal_side = "sell" if prev_side == "long" else "buy"
+                    last_close_signal_time = info["time"]  # وقت الشمعة الحالية
+                    # لا تفتح دلوقتي، استنى الإشارة التالية
+                    snapshot(bal, info, ind, spread_bps, "waiting next opposite signal", df)
+                    # نام قليلًا وكمّل اللوب
+                    time.sleep(compute_next_sleep(df))
+                    continue
+
+            # ✅ PATCH: Open only when allowed (respect wait_for_next_signal_side & next bar)
             if not state["open"] and (reason is None) and sig:
-                qty = compute_size(bal, px or info["price"])
-                if qty > 0:
-                    open_market(sig, qty, px or info["price"])
-                    # صفّر البصمة بعد فتح صفقة حقيقية
-                    global last_open_fingerprint
-                    last_open_fingerprint = None
-                    last_signal_id = f"{info['time']}:{sig}"
+                # لو في انتظار لاتجاه محدد بعد إغلاق، طبّق الشرط
+                if wait_for_next_signal_side:
+                    if sig != wait_for_next_signal_side:
+                        reason = f"waiting opposite signal: need {wait_for_next_signal_side}"
+                    elif REQUIRE_NEW_BAR_AFTER_CLOSE and last_close_signal_time is not None and info["time"] == last_close_signal_time:
+                        reason = "waiting next closed candle after close"
+                    else:
+                        qty = compute_size(bal, px or info["price"])
+                        if qty > 0:
+                            open_market(sig, qty, px or info["price"])
+                            # امسح حالة الانتظار
+                            wait_for_next_signal_side = None
+                            last_close_signal_time = None
+                            last_open_fingerprint = None
+                            last_signal_id = f"{info['time']}:{sig}"
+                        else:
+                            reason = "qty<=0"
                 else:
-                    reason = "qty<=0"
+                    # الحالة العادية بدون انتظار خاص
+                    qty = compute_size(bal, px or info["price"])
+                    if qty > 0:
+                        open_market(sig, qty, px or info["price"])
+                        last_open_fingerprint = None
+                        last_signal_id = f"{info['time']}:{sig}"
+                    else:
+                        reason = "qty<=0"
 
             snapshot(bal,info,ind,spread_bps,reason, df)
 
@@ -1811,7 +1847,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE"
 
 @app.route("/metrics")
 def metrics():
@@ -1836,7 +1872,8 @@ def metrics():
             "trade_mode": state.get("trade_mode"),  # ✅ NEW
             "profit_targets_achieved": state.get("profit_targets_achieved", 0)  # ✅ NEW
         },
-        "strict_close_enabled": STRICT_EXCHANGE_CLOSE
+        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
+        "waiting_for_signal": wait_for_next_signal_side  # ✅ NEW
     })
 
 @app.route("/health")
@@ -1854,7 +1891,8 @@ def health():
         "timestamp": datetime.utcnow().isoformat(),
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
         "trade_mode": state.get("trade_mode"),  # ✅ NEW
-        "profit_targets_achieved": state.get("profit_targets_achieved", 0)  # ✅ NEW
+        "profit_targets_achieved": state.get("profit_targets_achieved", 0),  # ✅ NEW
+        "waiting_for_signal": wait_for_next_signal_side  # ✅ NEW
     }), 200
 
 @app.route("/ping")
