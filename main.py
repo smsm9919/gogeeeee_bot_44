@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 RF Futures Bot — Smart Pro (BingX Perp, CCXT) - HARDENED EDITION
-- Entries: TradingView Range Filter EXACT (BUY/SELL)
+- Entries: TradingView Range Filter EXACT (BUY/SELL) on CLOSED candle
 - Size: 60% balance × leverage (default 10x)
 - Exit:
-  • Opposite RF signal ALWAYS closes
+  • Opposite RF signal ALWAYS closes (strict exchange close)
   • Smart Profit: TP1 partial + move to breakeven + ATR trailing (trend-riding)
 - Advanced Candle & Indicator Analysis for Position Management
 - Robust keepalive (SELF_URL/RENDER_EXTERNAL_URL), retries, /metrics
@@ -43,7 +43,9 @@ Patched:
 - Trend Confirmation Logic: ADX + DI + Candle Analysis
 - ✅ PATCH: Instant entry when FLAT + No cooldown after close
 - ✅ PATCH: Strict Exchange Close with retry & verification
-- ✅ NEW: Smart Post-Entry Management with Trade Mode Detection
+- ✅ PATCH: CLOSED CANDLE SIGNALS ONLY - No premature entries
+- ✅ PATCH: Strict profit target closing with exchange verification
+- ✅ PATCH: TP1 fallback when trade_mode not decided
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -155,6 +157,9 @@ print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_E
 print(colored(f"ADVANCED POSITION MGMT: SCALE_IN_STEPS={SCALE_IN_MAX_STEPS} • ADX_STRONG={ADX_STRONG_THRESH}", "yellow"))
 print(colored(f"TREND AMPLIFIER: ADX_TIERS[{ADX_TIER1}/{ADX_TIER2}/{ADX_TIER3}] • RATCHET_LOCK={RATCHET_LOCK_PCT*100}%", "yellow"))
 print(colored(f"✅ NEW: SMART POST-ENTRY MANAGEMENT ENABLED", "green"))
+print(colored(f"✅ PATCH: CLOSED CANDLE SIGNALS ONLY - No premature entries", "green"))
+print(colored(f"✅ PATCH: Strict profit target closing with exchange verification", "green"))
+print(colored(f"✅ PATCH: TP1 fallback when trade_mode not decided", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -1220,12 +1225,9 @@ def scalp_profit_taking(ind: dict):
         
         state["profit_targets_achieved"] = achieved + 1
         
-        # إذا تم تحقيق جميع الأهداف ⇒ إغلاق كامل
+        # ✅ PATCH: إذا تم تحقيق جميع الأهداف ⇒ إغلاق كامل صارم
         if state["profit_targets_achieved"] >= len(targets):
-            if STRICT_EXCHANGE_CLOSE:
-                close_market_strict("Scalp targets achieved")
-            else:
-                close_market("Scalp targets achieved")
+            close_market_strict("Scalp targets achieved")
             return "SCALP_COMPLETE"
         
         return "SCALP_TARGET"
@@ -1395,10 +1397,7 @@ def close_partial(frac, reason):
     if state["qty"] < 60:
         print(colored(f"⚠️ Remaining qty={fmt(state['qty'],2)} < 60 DOGE → full close triggered", "yellow"))
         logging.warning(f"Auto-full close triggered: remaining qty={state['qty']} < 60 DOGE")
-        if STRICT_EXCHANGE_CLOSE:
-            close_market_strict("auto_full_close_small_qty")
-        else:
-            close_market("auto_full_close_small_qty")
+        close_market_strict("auto_full_close_small_qty")
         return
         
     if state["qty"]<=0:
@@ -1518,6 +1517,19 @@ def smart_exit_check(info, ind):
     adx = ind.get("adx") or 0.0
     rsi = ind.get("rsi") or 50.0
 
+    # Trend Amplifier: Dynamic TP based on ADX
+    tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
+    current_tp1_pct = TP1_PCT * tp_multiplier
+    current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
+    current_tp1_pct_pct = current_tp1_pct * 100.0
+    current_trail_activate_pct = current_trail_activate * 100.0
+
+    # ✅ PATCH: TP1 fallback if trade_mode not decided yet
+    if state.get("trade_mode") is None:
+        if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
+            close_partial(TP1_CLOSE_FRAC, f"TP1@{current_tp1_pct_pct:.2f}%")
+            state["tp1_done"] = True
+
     # ---------- HOLD-TP: لا خروج بدري مع ترند قوي ----------
     if side == "long" and adx >= 30 and rsi >= RSI_TREND_BUY:
         print(colored("💎 HOLD-TP: strong uptrend continues, delaying TP", "cyan"))
@@ -1529,13 +1541,6 @@ def smart_exit_check(info, ind):
     # انتظر كام شمعة بعد الدخول لتجنب الخروج السريع
     if state["bars"] < 2:
         return None
-
-    # Trend Amplifier: Dynamic TP based on ADX
-    tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
-    current_tp1_pct = TP1_PCT * tp_multiplier
-    current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
-    current_tp1_pct_pct = current_tp1_pct * 100.0
-    current_trail_activate_pct = current_trail_activate * 100.0
 
     # Highest profit (ratchet)
     if rr > state["highest_profit_pct"]:
@@ -1567,10 +1572,7 @@ def smart_exit_check(info, ind):
             if state["breakeven"] is not None:
                 state["trail"] = max(state["trail"], state["breakeven"])
             if px < state["trail"]:
-                if STRICT_EXCHANGE_CLOSE:
-                    close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
-                else:
-                    close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
                 return True
         else:
             new_trail = px + gap
@@ -1578,10 +1580,7 @@ def smart_exit_check(info, ind):
             if state["breakeven"] is not None:
                 state["trail"] = min(state["trail"], state["breakeven"])
             if px > state["trail"]:
-                if STRICT_EXCHANGE_CLOSE:
-                    close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
-                else:
-                    close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
                 return True
     return None
 
@@ -1719,14 +1718,12 @@ def trade_loop():
             elif post_close_cooldown>0:
                 reason=f"cooldown {post_close_cooldown} bars"
 
-            # Close on opposite RF signal ALWAYS
+            # ✅ PATCH: Close on opposite RF signal ALWAYS (using closed candle)
             if state["open"] and sig and (reason is None):
                 desired="long" if sig=="buy" else "short"
                 if state["side"]!=desired:
-                    if STRICT_EXCHANGE_CLOSE:
-                        close_market_strict("opposite_signal")
-                    else:
-                        close_market("opposite_signal")
+                    close_market_strict("opposite_signal")
+                    # انتظر الإشارة التالية من الفلتر قبل فتح صفقة جديدة
                     qty=compute_size(bal, px or info["price"])
                     if qty>0:
                         open_market(sig, qty, px or info["price"])
@@ -1737,7 +1734,7 @@ def trade_loop():
                         time.sleep(sleep_s)
                         continue
 
-            # ✅ PATCH: Open new position when flat — PURE RANGE FILTER ONLY
+            # ✅ PATCH: Open new position when flat — PURE RANGE FILTER ONLY (using closed candle)
             if not state["open"] and (reason is None) and sig:
                 qty = compute_size(bal, px or info["price"])
                 if qty > 0:
@@ -1814,7 +1811,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS"
 
 @app.route("/metrics")
 def metrics():
