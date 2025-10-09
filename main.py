@@ -21,6 +21,14 @@ RF Futures Bot — Smart Pro (BingX Perp, CCXT) - HARDENED EDITION
 9. Graceful exit on SIGTERM/SIGINT
 10. Enhanced health endpoint
 
+✅ SMART POST-ENTRY MANAGEMENT ADDED:
+1. Trade mode detection (SCALP/TREND)
+2. Impulse & long wick harvesting
+3. Ratchet protection for profit locking
+4. Dynamic profit taking based on trade mode
+5. Trend confirmation with ADX + DI + RSI
+6. Compound PnL integration
+
 Patched:
 - BingX position mode support (oneway|hedge) with correct positionSide
 - Safe state updates (no local open if exchange order failed)
@@ -35,6 +43,7 @@ Patched:
 - Trend Confirmation Logic: ADX + DI + Candle Analysis
 - ✅ PATCH: Instant entry when FLAT + No cooldown after close
 - ✅ PATCH: Strict Exchange Close with retry & verification
+- ✅ NEW: Smart Post-Entry Management with Trade Mode Detection
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -106,6 +115,13 @@ RATCHET_LOCK_PCT = 0.60
 # Position mode
 BINGX_POSITION_MODE = "oneway"
 
+# ✅ NEW: Smart Post-Entry Management Settings
+SCALP_PROFIT_TARGETS = [0.30, 0.50, 1.00]  # 30%, 50%, 100% of position
+TREND_PROFIT_TARGETS = [0.20, 0.40, 0.80]  # More conservative for trend riding
+IMPULSE_HARVEST_THRESHOLD = 1.2  # Body >= 1.2x ATR
+LONG_WICK_HARVEST_THRESHOLD = 0.60  # Wick >= 60% of range
+RATCHET_RETRACE_THRESHOLD = 0.40  # Close partial on 40% retrace from high
+
 # pacing / keepalive
 ADAPTIVE_PACING = True
 BASE_SLEEP = 10        # نوم عادي بعيدًا عن الإغلاق
@@ -138,6 +154,7 @@ print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} •
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
 print(colored(f"ADVANCED POSITION MGMT: SCALE_IN_STEPS={SCALE_IN_MAX_STEPS} • ADX_STRONG={ADX_STRONG_THRESH}", "yellow"))
 print(colored(f"TREND AMPLIFIER: ADX_TIERS[{ADX_TIER1}/{ADX_TIER2}/{ADX_TIER3}] • RATCHET_LOCK={RATCHET_LOCK_PCT*100}%", "yellow"))
+print(colored(f"✅ NEW: SMART POST-ENTRY MANAGEMENT ENABLED", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -684,7 +701,10 @@ state={
     "pnl": 0.0, "bars": 0, "trail": None, "tp1_done": False, 
     "breakeven": None, "scale_ins": 0, "scale_outs": 0,
     "last_action": None, "action_reason": None,
-    "highest_profit_pct": 0.0  # Trend Amplifier: ratchet lock
+    "highest_profit_pct": 0.0,  # Trend Amplifier: ratchet lock
+    "trade_mode": None,  # ✅ NEW: Trade mode (SCALP/TREND)
+    "profit_targets_achieved": 0,  # ✅ NEW: Track profit targets
+    "entry_time": None  # ✅ NEW: Track entry time for time-based exits
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -717,7 +737,10 @@ def sync_from_exchange_once():
                 "pnl": 0.0, "bars": 0, "trail": None, "tp1_done": False, 
                 "breakeven": None, "scale_ins": 0, "scale_outs": 0,
                 "last_action": "SYNC", "action_reason": "Position synced from exchange",
-                "highest_profit_pct": 0.0
+                "highest_profit_pct": 0.0,
+                "trade_mode": None,  # Reset trade mode on sync
+                "profit_targets_achieved": 0,
+                "entry_time": time.time()
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -1018,6 +1041,264 @@ def get_trail_multiplier(ind: dict) -> float:
     else:
         return TRAIL_MULT_CHOP    # Choppy market
 
+# ====== NEW: SMART POST-ENTRY MANAGEMENT ======
+def determine_trade_mode(df: pd.DataFrame, ind: dict) -> str:
+    """
+    تحديد نمط الصفقة بناءً على ظروف السوق
+    Returns: "SCALP" أو "TREND"
+    """
+    adx = ind.get("adx", 0)
+    atr = ind.get("atr", 0)
+    price = ind.get("price", 0)
+    
+    # حساب نسبة ATR للسعر
+    atr_pct = (atr / price) * 100 if price > 0 else 0
+    
+    # تحليل الشموع الأخيرة
+    if len(df) >= 3:
+        # ✅ PATCH 4: Always use current closed candle
+        idx = -1  # Always use the latest closed candle
+        
+        # حساب متوسط مدى الشموع الأخيرة
+        recent_ranges = []
+        for i in range(max(0, idx-2), idx+1):
+            high = float(df["high"].iloc[i])
+            low = float(df["low"].iloc[i])
+            recent_ranges.append(high - low)
+        
+        avg_range = sum(recent_ranges) / len(recent_ranges) if recent_ranges else 0
+        range_pct = (avg_range / price) * 100 if price > 0 else 0
+        
+        # شروط الترند القوي
+        if (adx >= 25 and 
+            atr_pct >= 1.0 and 
+            range_pct >= 1.5 and
+            ind.get("plus_di", 0) > ind.get("minus_di", 0) if state["side"] == "long" else ind.get("minus_di", 0) > ind.get("plus_di", 0)):
+            return "TREND"
+    
+    # شروط السكالب (نطاق ضيق أو ترند ضعيف)
+    if adx < 20 or atr_pct < 0.8:
+        return "SCALP"
+    
+    # الافتراضي
+    return "SCALP"
+
+def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
+    """
+    معالجة الشموع الانفجارية والذيل الطويل لجني الأرباح
+    """
+    if not state["open"] or state["qty"] <= 0:
+        return None
+    
+    try:
+        # ✅ PATCH 4: Always use current closed candle
+        idx = -1  # Always use the latest closed candle
+        
+        o0 = float(df["open"].iloc[idx])
+        h0 = float(df["high"].iloc[idx])
+        l0 = float(df["low"].iloc[idx])
+        c0 = float(df["close"].iloc[idx])
+        
+        current_price = ind.get("price") or c0
+        entry = state["entry"]
+        side = state["side"]
+        
+        # حساب الربح النسبي
+        rr = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
+        
+        # إحصائيات الشمعة الحالية
+        candle_range = h0 - l0
+        body = abs(c0 - o0)
+        upper_wick = h0 - max(o0, c0)
+        lower_wick = min(o0, c0) - l0
+        
+        # نسبة الجسم والذيل
+        body_pct = (body / candle_range) * 100 if candle_range > 0 else 0
+        upper_wick_pct = (upper_wick / candle_range) * 100 if candle_range > 0 else 0
+        lower_wick_pct = (lower_wick / candle_range) * 100 if candle_range > 0 else 0
+        
+        atr = ind.get("atr", 0)
+        
+        # الشموع الانفجارية (Impulse)
+        if atr > 0 and body >= IMPULSE_HARVEST_THRESHOLD * atr:
+            # التأكد من اتجاه الشمعة مع اتجاه الصفقة
+            candle_direction = 1 if c0 > o0 else -1
+            trade_direction = 1 if side == "long" else -1
+            
+            if candle_direction == trade_direction:
+                # تحديد نسبة الجني بناءً على قوة الاندفاع
+                if body >= 2.0 * atr:
+                    harvest_frac = 0.50  # جني 50% للاندفاعات القوية
+                    reason = f"Strong Impulse x{body/atr:.2f} ATR"
+                else:
+                    harvest_frac = 0.33  # جني 33% للاندفاعات المتوسطة
+                    reason = f"Impulse x{body/atr:.2f} ATR"
+                
+                close_partial(harvest_frac, reason)
+                
+                # تفعيل بريك إيفن بعد الجني
+                if not state["breakeven"] and rr >= BREAKEVEN_AFTER * 100:
+                    state["breakeven"] = entry
+                
+                # تفعيل التريلينغ
+                if atr and ATR_MULT_TRAIL > 0:
+                    gap = atr * ATR_MULT_TRAIL
+                    if side == "long":
+                        state["trail"] = max(state.get("trail") or (current_price - gap), current_price - gap)
+                    else:
+                        state["trail"] = min(state.get("trail") or (current_price + gap), current_price + gap)
+                
+                return "IMPULSE_HARVEST"
+        
+        # الذيل الطويل في اتجاه المكسب
+        if side == "long" and lower_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
+            # ذيل طويل في الاتجاه الصاعد ⇒ جني جزئي
+            close_partial(0.25, f"Long lower wick {lower_wick_pct:.1f}%")
+            return "LONG_WICK_HARVEST"
+        
+        if side == "short" and upper_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
+            # ذيل طويل في الاتجاه الهابط ⇒ جني جزئي
+            close_partial(0.25, f"Long upper wick {upper_wick_pct:.1f}%")
+            return "LONG_WICK_HARVEST"
+            
+    except Exception as e:
+        print(colored(f"⚠️ handle_impulse_and_long_wicks error: {e}", "yellow"))
+        logging.error(f"handle_impulse_and_long_wicks error: {e}")
+    
+    return None
+
+def ratchet_protection(ind: dict):
+    """
+    حماية المكاسب من التراجع الشديد
+    """
+    if not state["open"] or state["qty"] <= 0:
+        return None
+    
+    current_price = ind.get("price") or price_now() or state["entry"]
+    entry = state["entry"]
+    side = state["side"]
+    
+    # حساب الربح النسبي الحالي
+    current_rr = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
+    
+    # تحديث أعلى ربح
+    if current_rr > state["highest_profit_pct"]:
+        state["highest_profit_pct"] = current_rr
+    
+    # تطبيق حماية الراتشيت إذا تراجع الربح بنسبة معينة من القمة
+    if (state["highest_profit_pct"] >= 20 and  # على الأقل 20% ربح
+        current_rr < state["highest_profit_pct"] * (1 - RATCHET_RETRACE_THRESHOLD)):
+        
+        close_partial(0.5, f"Ratchet protection: {state['highest_profit_pct']:.1f}% → {current_rr:.1f}%")
+        state["highest_profit_pct"] = current_rr  # إعادة ضبط القمة
+        return "RATCHET_PROTECTION"
+    
+    return None
+
+def scalp_profit_taking(ind: dict):
+    """
+    جني الأرباح في نمط السكالب
+    """
+    if not state["open"] or state["qty"] <= 0:
+        return None
+    
+    current_price = ind.get("price") or price_now() or state["entry"]
+    entry = state["entry"]
+    side = state["side"]
+    
+    # حساب الربح النسبي
+    rr = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
+    
+    # أهداف الربح للسكالب
+    targets = SCALP_PROFIT_TARGETS
+    achieved = state.get("profit_targets_achieved", 0)
+    
+    if achieved < len(targets) and rr >= targets[achieved]:
+        # جني الربح حسب الهدف
+        close_frac = 0.3 if achieved == 0 else 0.5  # 30% ثم 50% ثم الباقي
+        close_partial(close_frac, f"Scalp target {targets[achieved]}%")
+        
+        state["profit_targets_achieved"] = achieved + 1
+        
+        # إذا تم تحقيق جميع الأهداف ⇒ إغلاق كامل
+        if state["profit_targets_achieved"] >= len(targets):
+            if STRICT_EXCHANGE_CLOSE:
+                close_market_strict("Scalp targets achieved")
+            else:
+                close_market("Scalp targets achieved")
+            return "SCALP_COMPLETE"
+        
+        return "SCALP_TARGET"
+    
+    return None
+
+def trend_profit_taking(ind: dict):
+    """
+    جني الأرباح في نمط الترند
+    """
+    if not state["open"] or state["qty"] <= 0:
+        return None
+    
+    current_price = ind.get("price") or price_now() or state["entry"]
+    entry = state["entry"]
+    side = state["side"]
+    
+    # حساب الربح النسبي
+    rr = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
+    
+    # أهداف الربح للترند (أكثر تحفظًا)
+    targets = TREND_PROFIT_TARGETS
+    achieved = state.get("profit_targets_achieved", 0)
+    
+    if achieved < len(targets) and rr >= targets[achieved]:
+        # جني جزئي للترند
+        close_frac = 0.2  # 20% لكل هدف
+        close_partial(close_frac, f"Trend target {targets[achieved]}%")
+        
+        state["profit_targets_achieved"] = achieved + 1
+        return "TREND_TARGET"
+    
+    return None
+
+def smart_post_entry_manager(df: pd.DataFrame, ind: dict):
+    """
+    المدير الذكي للصفقة بعد الدخول
+    """
+    if not state["open"] or state["qty"] <= 0:
+        return None
+    
+    # تحديد نمط الصفقة إذا لم يكن محددًا
+    if state.get("trade_mode") is None:
+        trade_mode = determine_trade_mode(df, ind)
+        state["trade_mode"] = trade_mode
+        state["profit_targets_achieved"] = 0
+        state["entry_time"] = time.time()
+        
+        print(colored(f"🎯 TRADE MODE DETECTED: {trade_mode}", "cyan"))
+        logging.info(f"Trade mode detected: {trade_mode}")
+    
+    # معالجة الشموع الانفجارية والذيل الطويل
+    impulse_action = handle_impulse_and_long_wicks(df, ind)
+    if impulse_action:
+        return impulse_action
+    
+    # حماية المكاسب
+    ratchet_action = ratchet_protection(ind)
+    if ratchet_action:
+        return ratchet_action
+    
+    # جني الأربح حسب نمط الصفقة
+    if state["trade_mode"] == "SCALP":
+        scalp_action = scalp_profit_taking(ind)
+        if scalp_action:
+            return scalp_action
+    else:  # TREND
+        trend_action = trend_profit_taking(ind)
+        if trend_action:
+            return trend_action
+    
+    return None
+
 # ------------ Orders ------------
 def open_market(side, qty, price):
     global state
@@ -1044,7 +1325,10 @@ def open_market(side, qty, price):
         "trail": None, "tp1_done": False, "breakeven": None,
         "scale_ins": 0, "scale_outs": 0,
         "last_action": "OPEN", "action_reason": "Initial position",
-        "highest_profit_pct": 0.0  # Reset ratchet lock
+        "highest_profit_pct": 0.0,  # Reset ratchet lock
+        "trade_mode": None,  # ✅ NEW: Reset trade mode
+        "profit_targets_achieved": 0,  # ✅ NEW: Reset profit targets
+        "entry_time": time.time()  # ✅ NEW: Track entry time
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1131,7 +1415,10 @@ def reset_after_full_close(reason):
         "pnl": 0.0, "bars": 0, "trail": None, "tp1_done": False, 
         "breakeven": None, "scale_ins": 0, "scale_outs": 0,
         "last_action": "CLOSE", "action_reason": reason,
-        "highest_profit_pct": 0.0
+        "highest_profit_pct": 0.0,
+        "trade_mode": None,  # ✅ NEW: Reset trade mode
+        "profit_targets_achieved": 0,  # ✅ NEW: Reset profit targets
+        "entry_time": None  # ✅ NEW: Reset entry time
     })
     post_close_cooldown = COOLDOWN_AFTER_CLOSE_BARS
     save_state()
@@ -1218,6 +1505,13 @@ def smart_exit_check(info, ind):
         print(colored(f"🎯 MANAGEMENT: {management_action} - {state['action_reason']}", "yellow"))
         logging.info(f"MANAGEMENT_ACTION: {management_action} - {state['action_reason']}")
 
+    # ✅ NEW: Smart Post-Entry Management
+    df = fetch_ohlcv()
+    post_entry_action = smart_post_entry_manager(df, ind)
+    if post_entry_action:
+        print(colored(f"🎯 POST-ENTRY: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}", "cyan"))
+        logging.info(f"POST_ENTRY_ACTION: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}")
+
     px = info["price"]; e = state["entry"]; side = state["side"]
     rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
     atr = ind.get("atr") or 0.0
@@ -1231,37 +1525,6 @@ def smart_exit_check(info, ind):
     elif side == "short" and adx >= 30 and rsi <= RSI_TREND_SELL:
         print(colored("💎 HOLD-TP: strong downtrend continues, delaying TP", "cyan"))
         # نكمل من غير أي إغلاقات مبكرة
-
-    # ---------- Impulse Harvest: استغلال الشموع الطويلة ----------
-    try:
-        df_last = fetch_ohlcv()
-        # ✅ PATCH 4: Always use current closed candle
-        idx = -1  # Always use the latest closed candle
-        
-        o0 = float(df_last["open"].iloc[idx]); c0 = float(df_last["close"].iloc[idx])
-        body = abs(c0 - o0)
-        
-        # ✅ PATCH 3: ATR protection in Impulse Harvest
-        if not (atr and atr > 0 and math.isfinite(atr)):
-            atr = 0.0
-            
-        dir_candle = 1 if c0 > o0 else -1
-        impulse = (body / atr) if atr > 0 else 0.0
-
-        # شمعة قوية في اتجاه الصفقة ⇒ جني أرباح جزئي سريع
-        if impulse >= 1.2 and ((side == "long" and dir_candle > 0) or (side == "short" and dir_candle < 0)):
-            harvest_frac = 0.33 if impulse < 2.0 else 0.50
-            close_partial(harvest_frac, f"Impulse x{impulse:.2f} ATR")
-            # قفّل على الأقل بريك-إيفن وفعّل تريل لو مش مفعّل
-            state["breakeven"] = state.get("breakeven") or e
-            if atr and ATR_MULT_TRAIL > 0:
-                gap = atr * ATR_MULT_TRAIL
-                if side == "long":
-                    state["trail"] = max(state.get("trail") or (px - gap), px - gap)
-                else:
-                    state["trail"] = min(state.get("trail") or (px + gap), px + gap)
-    except Exception as _:
-        pass
 
     # انتظر كام شمعة بعد الدخول لتجنب الخروج السريع
     if state["bars"] < 2:
@@ -1349,9 +1612,13 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     print(f"   💰 Balance {fmt(bal,2)} USDT   Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x   PostCloseCooldown={post_close_cooldown}")
     if state["open"]:
         lamp = '🟩 LONG' if state['side']=='long' else '🟥 SHORT'
+        trade_mode_display = state.get('trade_mode', 'DETECTING')
+        targets_achieved = state.get('profit_targets_achieved', 0)
+        
         print(f"   📌 {lamp}  Entry={fmt(state['entry'])}  Qty={fmt(state['qty'],4)}  Bars={state['bars']}  PnL={fmt(state['pnl'])}")
         print(f"   🎯 Management: Scale-ins={state['scale_ins']}/{SCALE_IN_MAX_STEPS}  Scale-outs={state['scale_outs']}  Trail={fmt(state['trail'])}")
         print(f"   📊 TP1_done={state['tp1_done']}  Breakeven={fmt(state['breakeven'])}  HighestProfit={fmt(state['highest_profit_pct'],2)}%")
+        print(f"   🔧 Trade Mode: {trade_mode_display}  Targets Achieved: {targets_achieved}")
         if state['last_action']:
             print(f"   🔄 Last Action: {state['last_action']} - {state['action_reason']}")
     else:
@@ -1393,6 +1660,14 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         trail_mult = get_trail_multiplier({**ind, "price": info.get("price")})
         trail_type = "STRONG" if trail_mult == TRAIL_MULT_STRONG else "MED" if trail_mult == TRAIL_MULT_MED else "CHOP"
         print(f"   🛡️ Trail Multiplier: {trail_mult} ({trail_type})")
+        
+        # ✅ NEW: Smart Post-Entry Management Status
+        trade_mode = state.get('trade_mode')
+        if trade_mode:
+            targets = SCALP_PROFIT_TARGETS if trade_mode == "SCALP" else TREND_PROFIT_TARGETS
+            achieved = state.get('profit_targets_achieved', 0)
+            remaining_targets = len(targets) - achieved
+            print(colored(f"   🧠 SMART MANAGEMENT: {trade_mode} mode • {achieved}/{len(targets)} targets • {remaining_targets} remaining", "magenta"))
     else:
         print("   🔄 Waiting for trading signals...")
     print()
@@ -1539,7 +1814,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT"
 
 @app.route("/metrics")
 def metrics():
@@ -1560,7 +1835,9 @@ def metrics():
             "scale_outs": state.get("scale_outs", 0),
             "last_action": state.get("last_action"),
             "action_reason": state.get("action_reason"),
-            "highest_profit_pct": state.get("highest_profit_pct", 0)
+            "highest_profit_pct": state.get("highest_profit_pct", 0),
+            "trade_mode": state.get("trade_mode"),  # ✅ NEW
+            "profit_targets_achieved": state.get("profit_targets_achieved", 0)  # ✅ NEW
         },
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE
     })
@@ -1578,7 +1855,9 @@ def health():
         "compound_pnl": compound_pnl,
         "consecutive_errors": _consec_err,
         "timestamp": datetime.utcnow().isoformat(),
-        "strict_close_enabled": STRICT_EXCHANGE_CLOSE
+        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
+        "trade_mode": state.get("trade_mode"),  # ✅ NEW
+        "profit_targets_achieved": state.get("profit_targets_achieved", 0)  # ✅ NEW
     }), 200
 
 @app.route("/ping")
