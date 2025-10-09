@@ -106,7 +106,11 @@ RATCHET_LOCK_PCT = 0.60
 BINGX_POSITION_MODE = "oneway"
 
 # pacing / keepalive
-SLEEP_S = 30
+ADAPTIVE_PACING = True
+BASE_SLEEP = 10        # نوم عادي بعيدًا عن الإغلاق
+NEAR_CLOSE_SLEEP = 1   # قرب الإغلاق وبعده مباشرة
+JUST_CLOSED_WINDOW = 8 # ثواني بعد الإغلاق نكثّف الفحص
+
 SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
 KEEPALIVE_SECONDS = 50
 PORT = int(os.getenv("PORT", 5000))
@@ -185,7 +189,11 @@ def load_market_specs():
     global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
     try:
         MARKET = ex.markets.get(SYMBOL, {})
-        AMT_PREC = MARKET.get("precision", {}).get("amount", 0)
+        amt_prec = MARKET.get("precision", {}).get("amount", 0)
+        try:
+            AMT_PREC = int(amt_prec)
+        except (TypeError, ValueError):
+            AMT_PREC = 0
         LOT_STEP = (MARKET.get("limits", {}).get("amount", {}) or {}).get("step", None)
         LOT_MIN = (MARKET.get("limits", {}).get("amount", {}) or {}).get("min", None)
         print(colored(f"📊 Market specs: precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}", "cyan"))
@@ -193,14 +201,33 @@ def load_market_specs():
         print(colored(f"⚠️ load_market_specs: {e}", "yellow"))
 
 def _round_amt(q):
-    """Round amount according to market specifications"""
-    if q is None: return 0.0
-    if LOT_STEP:   # snap to step
+    """Round amount according to market specifications (robust)."""
+    if q is None:
+        return 0.0
+
+    # snap to step (لو فيه step موجب)
+    if LOT_STEP and isinstance(LOT_STEP, (int, float)) and LOT_STEP > 0:
         q = max(0.0, math.floor(q / LOT_STEP) * LOT_STEP)
-    if AMT_PREC is not None:
-        q = float(f"{q:.{AMT_PREC}f}")
-    if LOT_MIN:
+
+    # precision guard
+    prec = 0
+    try:
+        prec = int(AMT_PREC) if AMT_PREC is not None else 0
+        if prec < 0:
+            prec = 0
+    except Exception:
+        prec = 0
+
+    # apply precision safely
+    try:
+        q = float(f"{float(q):.{prec}f}")
+    except Exception:
+        q = float(q)
+
+    # respect min lot if موجود
+    if LOT_MIN and isinstance(LOT_MIN, (int, float)) and LOT_MIN > 0:
         q = 0.0 if q < LOT_MIN else q
+
     return q
 
 def safe_qty(q):
@@ -397,6 +424,28 @@ def time_to_candle_close(df: pd.DataFrame, use_tv_bar: bool) -> int:
         next_close_ms += tf*1000
     left = max(0, next_close_ms - now_ms)
     return int(left/1000)
+
+# ------------ Adaptive Pacing Function ------------
+def compute_next_sleep(df):
+    """حدد مدة النوم القادمة حسب زمن إغلاق الشمعة (بدون لمس التداول)."""
+    if not ADAPTIVE_PACING:
+        return BASE_SLEEP
+    try:
+        left_s = time_to_candle_close(df, USE_TV_BAR)
+        tf = _interval_seconds(INTERVAL)
+
+        # قرب الإغلاق جدًا → فحص كل ثانية
+        if left_s <= 10:
+            return NEAR_CLOSE_SLEEP
+
+        # أول ثواني بعد الإغلاق (لالتقاط الإشارة فورًا)
+        if (tf - left_s) <= JUST_CLOSED_WINDOW:
+            return NEAR_CLOSE_SLEEP
+
+        # غير ذلك نوم معقول لتخفيف الضغط
+        return BASE_SLEEP
+    except Exception:
+        return BASE_SLEEP
 
 # ------------ Indicators (display-only) ------------
 def wilder_ema(s: pd.Series, n: int): return s.ewm(alpha=1/n, adjust=False).mean()
@@ -1264,7 +1313,10 @@ def trade_loop():
                         open_market(sig, qty, px or info["price"])
                         last_signal_id=f"{info['time']}:{sig}"
                         snapshot(bal,info,ind,spread_bps,None, df)
-                        time.sleep(SLEEP_S); continue
+                        # ✅ PATCH: Adaptive pacing for faster entries near candle close
+                        sleep_s = compute_next_sleep(df)
+                        time.sleep(sleep_s)
+                        continue
 
             # ✅ PATCH: Open new position when flat — PURE RANGE FILTER ONLY
             if not state["open"] and (reason is None) and sig:
@@ -1289,10 +1341,15 @@ def trade_loop():
             if loop_counter % 5 == 0:
                 save_state()
 
+            # ✅ PATCH: Adaptive pacing for faster entries near candle close
+            sleep_s = compute_next_sleep(df)
+            time.sleep(sleep_s)
+
         except Exception as e:
             print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}","red"))
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
-        time.sleep(SLEEP_S)
+            # ✅ PATCH: Use base sleep on error to avoid rapid retries
+            time.sleep(BASE_SLEEP)
 
 # ------------ Keepalive + API ------------
 def keepalive_loop():
