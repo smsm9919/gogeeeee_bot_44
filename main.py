@@ -34,6 +34,8 @@ Patched:
 - Fixed BingX leverage warning with correct side parameter
 - Trend Confirmation Logic: ADX + DI + Candle Analysis
 - ✅ PATCH: Instant entry when FLAT + No cooldown after close
+- ✅ PATCH: Strict Exchange Close with retry & verification
+- ✅ PATCH: Fixed EffectiveEq calculation in LIVE mode (no double counting)
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -115,6 +117,12 @@ SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
 KEEPALIVE_SECONDS = 50
 PORT = int(os.getenv("PORT", 5000))
 
+# ─── STRICT EXCHANGE CLOSE ───────────────────────────────────────────────
+STRICT_EXCHANGE_CLOSE = True        # تفعيل الإغلاق الصارم المؤكد من المنصة
+CLOSE_RETRY_ATTEMPTS   = 6          # عدد المحاولات القصوى
+CLOSE_VERIFY_WAIT_S    = 2.0        # مدة الانتظار بين كل تحقق من إغلاق المنصة (ثواني)
+MIN_RESIDUAL_TO_FORCE  = 1.0        # أي بقايا كمية ≥ هذا الرقم نعيد إغلاقها
+
 # ------------ HARDENING PACK: State Persistence ------------
 STATE_FILE = "bot_state.json"
 
@@ -140,6 +148,8 @@ print(colored(f"✅ PATCHED: Fixed BingX leverage warning with side='BOTH'", "gr
 print(colored(f"✅ NEW: Trend Confirmation Logic (ADX + DI + Candle Analysis)", "green"))
 print(colored(f"✅ PATCH: Instant entry when FLAT + No cooldown after close", "green"))
 print(colored(f"✅ PATCH: Pure Range Filter signals ONLY - No RSI/ADX filtering for entries", "green"))
+print(colored(f"✅ PATCH: Strict Exchange Close with retry & verification", "green"))
+print(colored(f"✅ PATCH: Fixed EffectiveEq calculation in LIVE mode (no double counting)", "green"))
 print(colored(f"SERVER: Starting on port {PORT}", "green"))
 
 # ------------ HARDENING PACK: File Logging with Rotation ------------
@@ -683,8 +693,13 @@ last_signal_id = None
 post_close_cooldown = 0
 
 def compute_size(balance, price):
-    # رصيد فعّال = الرصيد + الربح التراكمي (كومباوند كامل)
-    effective_balance = (balance or 0.0) + (compound_pnl or 0.0)
+    # ✅ PATCH: Fixed EffectiveEq calculation - no double counting in LIVE mode
+    # في اللايف: الرصيد الفعلي من البورصة بالفعل يحتوي على الأرباح المحققة
+    if MODE_LIVE:
+        effective_balance = (balance or 0.0)
+    else:
+        # في الـ PAPER نحافظ على الكومباوندينج النظري
+        effective_balance = (balance or 0.0) + (compound_pnl or 0.0)
 
     capital = effective_balance * RISK_ALLOC * LEVERAGE   # 60% × 10x
     raw = max(0.0, capital / max(float(price or 0.0), 1e-9))
@@ -711,7 +726,7 @@ def sync_from_exchange_once():
                 "last_action": "SYNC", "action_reason": "Position synced from exchange",
                 "highest_profit_pct": 0.0
             })
-            print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
+            print(colored(f"✅ Synced position ⇒ {side.UP() if side=='long' else 'SHORT'} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
             return
         print(colored("↔️  Sync: no open position on exchange.","yellow"))
@@ -729,6 +744,128 @@ def _position_params_for_close():
     if BINGX_POSITION_MODE == "hedge":
         return {"positionSide": "LONG" if state.get("side")=="long" else "SHORT", "reduceOnly": True}
     return {"positionSide": "BOTH", "reduceOnly": True}
+
+# ─── STRICT EXCHANGE CLOSE FUNCTIONS ─────────────────────────────────────
+def _read_exchange_position():
+    """
+    يرجع (qty, side, entry) لمركز SYMBOL على BingX (type=swap).
+    qty=0 يعني مفيش مركز.
+    """
+    try:
+        poss = ex.fetch_positions(params={"type": "swap"})
+        for p in poss:
+            sym = (p.get("symbol") or p.get("info",{}).get("symbol") or "")
+            if SYMBOL.split(":")[0] not in sym:
+                continue
+            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
+            if qty <= 0:
+                return 0.0, None, None
+            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
+            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
+            side = "long" if ("long" in side_raw or float(p.get("cost",0)) > 0) else "short"
+            return qty, side, entry
+    except Exception as e:
+        logging.error(f"_read_exchange_position error: {e}")
+    return 0.0, None, None
+
+def close_market_strict(reason):
+    """
+    إغلاق كامل صارم:
+    - يقرأ الكمية الفعلية من المنصة
+    - يرسل market reduceOnly على الكمية
+    - يتحقق مرارًا حتى يصبح المركز = 0
+    - يعيد المحاولة عند وجود بقايا أو خطأ شبكة
+    """
+    global state, compound_pnl
+
+    # لو مفيش مركز محليًا، برضه نتحقق من المنصة (في حال desync)
+    local_open = state.get("open", False)
+    local_side = state.get("side")
+    px_now = price_now() or state.get("entry")
+
+    # 1) اسحب الحالة الفعلية من المنصة
+    exch_qty, exch_side, exch_entry = _read_exchange_position()
+    if exch_qty <= 0:
+        # لا يوجد مركز على المنصة → صفّر محليًا لو لازال مفتوح
+        if local_open:
+            reset_after_full_close("strict_close_already_zero")
+        return
+
+    # 2) حدّد جانب الإغلاق و الكمية
+    side_to_close = "sell" if (exch_side == "long") else "buy"
+    qty_to_close  = safe_qty(exch_qty)
+
+    # 3) نفّذ أمر الإغلاق وكرّر التحقق
+    attempts = 0
+    last_error = None
+    while attempts < CLOSE_RETRY_ATTEMPTS:
+        try:
+            if MODE_LIVE:
+                params = _position_params_for_close()
+                # reduceOnly= True بالفعل داخل المساعد، بس بنؤكد
+                params["reduceOnly"] = True
+                ex.create_order(SYMBOL, "market", side_to_close, qty_to_close, None, params)
+
+            # انتظر شوية ثم تحقّق
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+            left_qty, _, _ = _read_exchange_position()
+
+            if left_qty <= 0:
+                # تم الإغلاق على المنصة: احسب PnL واغلق محليًا
+                px = price_now() or px_now or state.get("entry")
+                entry_px = state.get("entry") or exch_entry or px
+                side = state.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
+                qty = exch_qty  # الكمية التي أغلقناها
+
+                pnl = (px - entry_px) * qty * (1 if side == "long" else -1)
+                compound_pnl += pnl
+                print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
+                logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
+                reset_after_full_close(reason)
+                return
+
+            # يوجد بقايا → جهّز لمحاولة جديدة بنفس الاتجاه والكمية المتبقية
+            qty_to_close = safe_qty(left_qty)
+            attempts += 1
+            print(colored(f"⚠️ strict close retry {attempts}/{CLOSE_RETRY_ATTEMPTS} — residual={fmt(left_qty,4)}","yellow"))
+
+            # لو الباقى صغير جدًا، زوّد مهلة واعِد المحاولة
+            if qty_to_close < MIN_RESIDUAL_TO_FORCE:
+                time.sleep(CLOSE_VERIFY_WAIT_S)
+
+        except Exception as e:
+            last_error = e
+            logging.error(f"close_market_strict error attempt {attempts+1}: {e}")
+            attempts += 1
+            time.sleep(CLOSE_VERIFY_WAIT_S)
+
+    # لو وصلنا هنا، فشلنا بعد كل المحاولات
+    print(colored(f"❌ STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — manual check needed. Last error: {last_error}", "red"))
+    logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
+
+def sync_consistency_guard():
+    """يتحقق من اتساق الحالة المحلية مع المنصة ويصحح أي تباين"""
+    if not state["open"]:
+        return
+    
+    exch_qty, exch_side, exch_entry = _read_exchange_position()
+    
+    # لو المنصة تقول مفيش مركز لكن محليًا مفتوح → نُصلح
+    if exch_qty <= 0 and state["open"]:
+        print(colored("🛠️  CONSISTENCY GUARD: Exchange shows no position but locally open → resetting", "yellow"))
+        logging.warning("Consistency guard: resetting local state (exchange shows no position)")
+        reset_after_full_close("consistency_guard_no_position")
+        return
+    
+    # لو الكمية مختلفة بشكل كبير → نُصلح
+    if exch_qty > 0 and state["open"]:
+        diff_pct = abs(exch_qty - state["qty"]) / max(exch_qty, state["qty"])
+        if diff_pct > 0.1:  # فرق أكثر من 10%
+            print(colored(f"🛠️  CONSISTENCY GUARD: Quantity mismatch local={state['qty']} vs exchange={exch_qty} → syncing", "yellow"))
+            logging.warning(f"Consistency guard: quantity mismatch local={state['qty']} exchange={exch_qty}")
+            state["qty"] = exch_qty
+            state["entry"] = exch_entry or state["entry"]
+            save_state()
 
 # ------------ Trend Amplifier ------------
 def get_dynamic_scale_in_step(adx: float) -> tuple:
@@ -981,7 +1118,10 @@ def close_partial(frac, reason):
     if state["qty"] < 60:
         print(colored(f"⚠️ Remaining qty={fmt(state['qty'],2)} < 60 DOGE → full close triggered", "yellow"))
         logging.warning(f"Auto-full close triggered: remaining qty={state['qty']} < 60 DOGE")
-        close_market("auto_full_close_small_qty")
+        if STRICT_EXCHANGE_CLOSE:
+            close_market_strict("auto_full_close_small_qty")
+        else:
+            close_market("auto_full_close_small_qty")
         return
         
     if state["qty"]<=0:
@@ -1171,14 +1311,22 @@ def smart_exit_check(info, ind):
             if state["breakeven"] is not None:
                 state["trail"] = max(state["trail"], state["breakeven"])
             if px < state["trail"]:
-                close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)"); return True
+                if STRICT_EXCHANGE_CLOSE:
+                    close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                else:
+                    close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                return True
         else:
             new_trail = px + gap
             state["trail"] = min(state["trail"] or new_trail, new_trail)
             if state["breakeven"] is not None:
                 state["trail"] = min(state["trail"], state["breakeven"])
             if px > state["trail"]:
-                close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)"); return True
+                if STRICT_EXCHANGE_CLOSE:
+                    close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                else:
+                    close_market(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                return True
     return None
 
 # ------------ Enhanced HUD (rich logs) ------------
@@ -1258,8 +1406,14 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
 
     # ===== RESULTS =====
     print("📦 RESULTS")
-    # ✅ PATCH 2: Accurate Effective Equity display in paper mode
-    eff_eq = (bal or 0.0) + compound_pnl
+    # ✅ PATCH: Fixed EffectiveEq calculation - no double counting in LIVE mode
+    # في اللايف: الرصيد الفعلي من البورصة بالفعل يحتوي على الأرباح المحققة
+    if MODE_LIVE:
+        eff_eq = (bal or 0.0)
+    else:
+        # في الـ PAPER نحافظ على الكومباوندينج النظري
+        eff_eq = (bal or 0.0) + compound_pnl
+        
     print(f"   🧮 CompoundPnL {fmt(compound_pnl)}   🚀 EffectiveEq {fmt(eff_eq)} USDT")
     if reason:
         print(colored(f"   ℹ️ WAIT — reason: {reason}","yellow"))
@@ -1307,7 +1461,10 @@ def trade_loop():
             if state["open"] and sig and (reason is None):
                 desired="long" if sig=="buy" else "short"
                 if state["side"]!=desired:
-                    close_market("opposite_signal")
+                    if STRICT_EXCHANGE_CLOSE:
+                        close_market_strict("opposite_signal")
+                    else:
+                        close_market("opposite_signal")
                     qty=compute_size(bal, px or info["price"])
                     if qty>0:
                         open_market(sig, qty, px or info["price"])
@@ -1340,6 +1497,9 @@ def trade_loop():
             # HARDENING: Save state every 5 loops to reduce I/O
             if loop_counter % 5 == 0:
                 save_state()
+
+            # ✅ PATCH: Strict Exchange Close consistency guard
+            sync_consistency_guard()
 
             # ✅ PATCH: Adaptive pacing for faster entries near candle close
             sleep_s = compute_next_sleep(df)
@@ -1392,7 +1552,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.UP()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — FIXED EFFECTIVE_EQ"
 
 @app.route("/metrics")
 def metrics():
@@ -1414,7 +1574,9 @@ def metrics():
             "last_action": state.get("last_action"),
             "action_reason": state.get("action_reason"),
             "highest_profit_pct": state.get("highest_profit_pct", 0)
-        }
+        },
+        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
+        "effective_eq_fixed": True
     })
 
 @app.route("/health")
@@ -1429,7 +1591,9 @@ def health():
         "qty": state["qty"],
         "compound_pnl": compound_pnl,
         "consecutive_errors": _consec_err,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.utcnow().isoformat(),
+        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
+        "effective_eq_fixed": True
     }), 200
 
 @app.route("/ping")
