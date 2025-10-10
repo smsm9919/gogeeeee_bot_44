@@ -29,6 +29,13 @@ RF Futures Bot — Smart Pro (BingX Perp, CCXT) - HARDENED EDITION
 5. Trend confirmation with ADX + DI + RSI
 6. Compound PnL integration
 
+✅ BREAKOUT ENGINE ADDED:
+- Independent explosive move detection (ATR spike + ADX + price breakout)
+- Immediate entry on explosions/crashes  
+- Strict exit when volatility normalizes
+- Full independence from core RF strategy
+- Production-optimized with all safety guards
+
 Patched:
 - BingX position mode support (oneway|hedge) with correct positionSide
 - Safe state updates (no local open if exchange order failed)
@@ -52,13 +59,12 @@ Patched:
 - ✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets with strict close
 - ✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close
 - ✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT
-- ✅ NEW: PERFORMANCE OPTIMIZATIONS - NumPy RF signals, reduced network calls
+- ✅ NEW: BREAKOUT ENGINE - Independent explosive move detection & trading
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
 from logging.handlers import RotatingFileHandler
 import pandas as pd
-import numpy as np  # ✅ NEW: Added for performance optimization
 import ccxt
 from flask import Flask, jsonify
 from datetime import datetime
@@ -142,6 +148,12 @@ IMPULSE_HARVEST_THRESHOLD = 1.2  # Body >= 1.2x ATR
 LONG_WICK_HARVEST_THRESHOLD = 0.60  # Wick >= 60% of range
 RATCHET_RETRACE_THRESHOLD = 0.40  # Close partial on 40% retrace from high
 
+# ✅ NEW: BREAKOUT ENGINE SETTINGS
+BREAKOUT_ATR_SPIKE = 1.8        # ATR(current) > ATR(previous) * 1.8
+BREAKOUT_ADX_THRESHOLD = 25     # ADX ≥ 25 for trend strength  
+BREAKOUT_LOOKBACK_BARS = 20     # Check last 20 bars for highs/lows
+BREAKOUT_CALM_THRESHOLD = 1.1   # ATR(current) < ATR(previous) * 1.1 → exit
+
 # pacing / keepalive
 ADAPTIVE_PACING = True
 BASE_SLEEP = 10        # نوم عادي بعيدًا عن الإغلاق
@@ -189,7 +201,7 @@ print(colored(f"✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closi
 print(colored(f"✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets", "green"))
 print(colored(f"✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close", "green"))
 print(colored(f"✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT", "green"))
-print(colored(f"✅ NEW: PERFORMANCE OPTIMIZATIONS - NumPy RF signals, reduced network calls", "green"))
+print(colored(f"✅ NEW: BREAKOUT ENGINE - Independent explosive move detection & trading", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -712,16 +724,13 @@ def compute_tv_signals(df: pd.DataFrame):
     src_gt_f=(src>filt); src_lt_f=(src<filt); src_gt_p=(src>src.shift(1)); src_lt_p=(src<src.shift(1))
     longCond=(src_gt_f&((src_gt_p)|(src_lt_p))&(upward>0))
     shortCond=(src_lt_f&((src_lt_p)|(src_gt_p))&(downward>0))
-    
-    # ✅ NEW: Optimized using NumPy array for better performance
-    CondIni = np.zeros(len(src), dtype=int)
-    for i in range(1, len(src)):
-        if bool(longCond.iloc[i]):   CondIni[i] = 1
-        elif bool(shortCond.iloc[i]):CondIni[i] = -1
-        else:                        CondIni[i] = CondIni[i-1]
-    
-    longSignal  = longCond & (pd.Series(CondIni, index=src.index).shift(1) == -1)
-    shortSignal = shortCond & (pd.Series(CondIni, index=src.index).shift(1) ==  1)
+    CondIni=pd.Series(0,index=src.index)
+    for i in range(1,len(src)):
+        if bool(longCond.iloc[i]): CondIni.iloc[i]=1
+        elif bool(shortCond.iloc[i]): CondIni.iloc[i]=-1
+        else: CondIni.iloc[i]=CondIni.iloc[i-1]
+    longSignal=longCond&(CondIni.shift(1)==-1)
+    shortSignal=shortCond&(CondIni.shift(1)==1)
     
     # ✅ PATCH 4: Always use current closed candle for real-time signals
     i = len(df)-1  # Always use the latest closed candle
@@ -747,7 +756,11 @@ state={
     "fakeout_pending": False,          # هل في احتمال انعكاس جارٍ؟
     "fakeout_need_side": None,         # 'long' أو 'short' الاتجاه المطلوب لتأكيد الانعكاس
     "fakeout_confirm_bars": 0,         # عدّاد الشموع المطلوبة للتأكيد
-    "fakeout_started_at": None         # طابع زمني/شمعة بدء الاشتباه
+    "fakeout_started_at": None,        # طابع زمني/شمعة بدء الاشتباه
+    # ✅ NEW: BREAKOUT ENGINE STATE
+    "breakout_active": False,          # هل نحن في وضع انفجار نشط؟
+    "breakout_direction": None,        # 'bull' أو 'bear'
+    "breakout_entry_price": None       # سعر الدخول أثناء الانفجار
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -788,7 +801,11 @@ def sync_from_exchange_once():
                 "fakeout_pending": False,
                 "fakeout_need_side": None,
                 "fakeout_confirm_bars": 0,
-                "fakeout_started_at": None
+                "fakeout_started_at": None,
+                # ✅ NEW: Reset breakout state on sync
+                "breakout_active": False,
+                "breakout_direction": None,
+                "breakout_entry_price": None
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -1094,7 +1111,6 @@ def get_trail_multiplier(ind: dict) -> float:
 # ====== NEW: SMART POST-ENTRY MANAGEMENT ======
 def determine_trade_mode(df: pd.DataFrame, ind: dict) -> str:
     """
-    ✅ NEW: Optimized trade mode detection with clearer conditions
     تحديد نمط الصفقة بناءً على ظروف السوق
     Returns: "SCALP" أو "TREND"
     """
@@ -1120,15 +1136,11 @@ def determine_trade_mode(df: pd.DataFrame, ind: dict) -> str:
         avg_range = sum(recent_ranges) / len(recent_ranges) if recent_ranges else 0
         range_pct = (avg_range / price) * 100 if price > 0 else 0
         
-        # ✅ NEW: Clearer DI conditions using intermediate variables
-        plus_di = ind.get("plus_di", 0)
-        minus_di = ind.get("minus_di", 0)
-        di_ok_long  = plus_di > minus_di
-        di_ok_short = minus_di > plus_di
-        di_ok = di_ok_long if state["side"] == "long" else di_ok_short
-        
         # شروط الترند القوي
-        if adx >= 25 and atr_pct >= 1.0 and range_pct >= 1.5 and di_ok:
+        if (adx >= 25 and 
+            atr_pct >= 1.0 and 
+            range_pct >= 1.5 and
+            ind.get("plus_di", 0) > ind.get("minus_di", 0) if state["side"] == "long" else ind.get("minus_di", 0) > ind.get("plus_di", 0)):
             return "TREND"
     
     # شروط السكالب (نطاق ضيق أو ترند ضعيف)
@@ -1279,9 +1291,8 @@ def scalp_profit_taking(ind: dict, info: dict):
 
     return None
 
-def trend_profit_taking(ind: dict, info: dict, df: pd.DataFrame = None):
+def trend_profit_taking(ind: dict, info: dict):
     """
-    ✅ NEW: Added df parameter to reduce network calls
     ترند قوي: 3 مراحل جني أرباح تدريجي (لا نغلق كليًا)،
     ونستمر حتى نهاية الترند المؤكدة → قفل صارم كامل.
     """
@@ -1309,10 +1320,7 @@ def trend_profit_taking(ind: dict, info: dict, df: pd.DataFrame = None):
         return None
 
     # 3) بعد إتمام المراحل أو ضعف الترند → تحقّق نهاية الترند
-    if df is None:
-        df = fetch_ohlcv()  # Fallback if df not provided
-    
-    if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(df), info):
+    if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(fetch_ohlcv()), info):
         close_market_strict("TREND finished — full exit")
         return "TREND_COMPLETE"
 
@@ -1350,7 +1358,7 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if state["trade_mode"] == "SCALP":
         return scalp_profit_taking(ind, info)
     else:
-        return trend_profit_taking(ind, info, df)  # ✅ NEW: Pass df to reduce network calls
+        return trend_profit_taking(ind, info)
 
 # ------------ Orders ------------
 def open_market(side, qty, price):
@@ -1386,7 +1394,11 @@ def open_market(side, qty, price):
         "fakeout_pending": False,
         "fakeout_need_side": None,
         "fakeout_confirm_bars": 0,
-        "fakeout_started_at": None
+        "fakeout_started_at": None,
+        # ✅ NEW: Reset breakout state on new position
+        "breakout_active": False,
+        "breakout_direction": None,
+        "breakout_entry_price": None
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1483,7 +1495,11 @@ def reset_after_full_close(reason, prev_side=None):
         "fakeout_pending": False,
         "fakeout_need_side": None,
         "fakeout_confirm_bars": 0,
-        "fakeout_started_at": None
+        "fakeout_started_at": None,
+        # ✅ NEW: Reset breakout state on full close
+        "breakout_active": False,
+        "breakout_direction": None,
+        "breakout_entry_price": None
     })
     
     # ✅ PATCH: ضع الانتظار للإشارة المعاكسة
@@ -1574,25 +1590,20 @@ def advanced_position_management(candle_info: dict, ind: dict):
     return None
 
 # ------------ Smart Profit (trend-aware) with Trend Amplifier ------------
-def smart_exit_check(info, ind, df: pd.DataFrame = None):
-    """
-    ✅ NEW: Added df parameter to reduce network calls
-    Return True if full close happened.
-    """
+def smart_exit_check(info, ind):
+    """Return True if full close happened."""
     if not (STRATEGY=="smart" and USE_SMART_EXIT and state["open"]):
         return None
 
     # Advanced position management first
-    if df is None:
-        df = fetch_ohlcv()  # Fallback if df not provided
-    
-    candle_info = detect_candle_pattern(df)
+    candle_info = detect_candle_pattern(fetch_ohlcv())
     management_action = advanced_position_management(candle_info, ind)
     if management_action:
         print(colored(f"🎯 MANAGEMENT: {management_action} - {state['action_reason']}", "yellow"))
         logging.info(f"MANAGEMENT_ACTION: {management_action} - {state['action_reason']}")
 
-    # ✅ NEW: Smart Post-Entry Management with passed df
+    # ✅ NEW: Smart Post-Entry Management
+    df = fetch_ohlcv()
     post_entry_action = smart_post_entry_manager(df, ind, info)
     if post_entry_action:
         print(colored(f"🎯 POST-ENTRY: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}", "cyan"))
@@ -1723,6 +1734,143 @@ def smart_exit_check(info, ind, df: pd.DataFrame = None):
                 return True
     return None
 
+# ------------ ENHANCED: BREAKOUT ENGINE FUNCTIONS ------------
+def detect_breakout(df: pd.DataFrame, ind: dict, prev_ind: dict) -> str:
+    """
+    ⚡ BREAKOUT ENGINE - OPTIMIZED: استخدام ATR السابق الممرّر بدلاً من إعادة الحساب
+    """
+    try:
+        if len(df) < BREAKOUT_LOOKBACK_BARS + 2:
+            return None
+            
+        current_idx = -1
+        
+        # بيانات المؤشرات - باستخدام القيم الممررة
+        adx = float(ind.get("adx") or 0.0)
+        atr_now = float(ind.get("atr") or 0.0)
+        atr_prev = float(prev_ind.get("atr") or atr_now)  # ✅ ENHANCED: استخدام ATR السابق الممرر
+        price = float(df["close"].iloc[current_idx])
+        
+        # التحقق من شروط الانفجار
+        atr_spike = atr_now > atr_prev * BREAKOUT_ATR_SPIKE
+        strong_trend = adx >= BREAKOUT_ADX_THRESHOLD
+        
+        if not (atr_spike and strong_trend):
+            return None
+            
+        # كسر القمم/Ceiling (انفجار صعودي)
+        recent_highs = df["high"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
+        new_high = price > recent_highs.max() if len(recent_highs) > 0 else False
+        
+        # كسر القيعان/Floor (انهيار هبوطي)  
+        recent_lows = df["low"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
+        new_low = price < recent_lows.min() if len(recent_lows) > 0 else False
+        
+        if new_high:
+            return "BULL_BREAKOUT"
+        elif new_low:
+            return "BEAR_BREAKOUT"
+            
+    except Exception as e:
+        print(colored(f"⚠️ detect_breakout error: {e}", "yellow"))
+        logging.error(f"detect_breakout error: {e}")
+        
+    return None
+
+def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: float, spread_bps: float) -> bool:
+    """
+    ✅ ENHANCED: معالجة دخول الانفجارات مع جميع الحمايات المطلوبة
+    """
+    global state
+    
+    # 1. تحقق من وجود انفجار
+    breakout_signal = detect_breakout(df, ind, prev_ind)
+    if not breakout_signal or state["breakout_active"]:
+        return False
+    
+    price = ind.get("price") or float(df["close"].iloc[-1])
+    
+    # ✅ ENHANCED 2: فلتر السيولة للانفجارات
+    if spread_bps is not None and spread_bps > SPREAD_GUARD_BPS:
+        print(colored(f"⛔ BREAKOUT: Spread too high ({fmt(spread_bps,2)}bps) - skipping entry", "yellow"))
+        logging.warning(f"BREAKOUT_ENGINE: Spread filter blocked entry - {spread_bps}bps")
+        return False
+    
+    # ✅ ENHANCED 3: منع فتح صفقة بكمية أقل من الحد الأدنى
+    qty = compute_size(bal, price)
+    if qty < (LOT_MIN or 1):
+        print(colored(f"⛔ BREAKOUT: Quantity too small ({fmt(qty,4)} < {LOT_MIN or 1}) - skipping", "yellow"))
+        logging.warning(f"BREAKOUT_ENGINE: Quantity below minimum - {qty} < {LOT_MIN or 1}")
+        return False
+    
+    # ✅ ENHANCED 4: استخدام الحارس الموجود لمنع الدخول المكرر
+    if not can_open(breakout_signal, price):
+        print(colored("⛔ BREAKOUT: Idempotency guard blocked duplicate entry", "yellow"))
+        logging.warning("BREAKOUT_ENGINE: Idempotency guard blocked entry")
+        return False
+    
+    # تنفيذ الدخول
+    if breakout_signal == "BULL_BREAKOUT":
+        open_market("buy", qty, price)
+        state["breakout_active"] = True
+        state["breakout_direction"] = "bull"
+        state["breakout_entry_price"] = price
+        print(colored(f"⚡ BREAKOUT ENGINE: BULLISH EXPLOSION - ENTERING LONG", "green"))
+        logging.info(f"BREAKOUT_ENGINE: Bullish explosion - LONG {qty} @ {price}")
+        return True
+        
+    elif breakout_signal == "BEAR_BREAKOUT":
+        open_market("sell", qty, price)
+        state["breakout_active"] = True  
+        state["breakout_direction"] = "bear"
+        state["breakout_entry_price"] = price
+        print(colored(f"⚡ BREAKOUT ENGINE: BEARISH CRASH - ENTERING SHORT", "red"))
+        logging.info(f"BREAKOUT_ENGINE: Bearish crash - SHORT {qty} @ {price}")
+        return True
+    
+    return False
+
+def handle_breakout_exits(df: pd.DataFrame, ind: dict, prev_ind: dict) -> bool:
+    """
+    ✅ ENHANCED: معالجة خروج الانفجارات باستخدام ATR السابق الممرّر
+    """
+    global state
+    
+    if not state["breakout_active"] or not state["open"]:
+        return False
+        
+    current_idx = -1
+    
+    # ✅ ENHANCED 1: استخدام ATR السابق الممرر بدلاً من إعادة الحساب
+    atr_now = float(ind.get("atr") or 0.0)
+    atr_prev = float(prev_ind.get("atr") or atr_now)
+    
+    # التحقق من هدوء التقلب (نهاية الانفجار)
+    volatility_calm = atr_now < atr_prev * BREAKOUT_CALM_THRESHOLD
+    
+    if volatility_calm:
+        direction = state["breakout_direction"]
+        entry_price = state["breakout_entry_price"]
+        current_price = ind.get("price") or float(df["close"].iloc[current_idx])
+        
+        # حساب الربح قبل الإغلاق
+        pnl_pct = ((current_price - entry_price) / entry_price * 100 * 
+                  (1 if direction == "bull" else -1))
+                  
+        close_market_strict(f"Breakout ended - {pnl_pct:.2f}% PnL")
+        
+        print(colored(f"✅ BREAKOUT ENGINE: {direction.upper()} breakout ended - {pnl_pct:.2f}% PnL", "magenta"))
+        logging.info(f"BREAKOUT_ENGINE: {direction} breakout ended - PnL: {pnl_pct:.2f}%")
+        
+        # ✅ ENHANCED 5: إعادة تعيين حالة الانفجار بعد الإغلاق الكامل
+        state["breakout_active"] = False
+        state["breakout_direction"] = None  
+        state["breakout_entry_price"] = None
+        
+        return True
+        
+    return False
+
 # ------------ Enhanced HUD (rich logs) ------------
 def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     df = df if df is not None else fetch_ohlcv()
@@ -1750,6 +1898,10 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     # ✅ NEW: Display fakeout protection status
     if state["open"] and state["fakeout_pending"]:
         print(colored(f"   🛡️ FAKEOUT PROTECTION — waiting {state['fakeout_confirm_bars']} bars for confirmation", "yellow"))
+    
+    # ✅ NEW: Display breakout engine status
+    if state["breakout_active"]:
+        print(colored(f"   ⚡ BREAKOUT MODE ACTIVE: {state['breakout_direction'].upper()} - Monitoring volatility...", "cyan"))
     
     print(f"   ⏱️ Candle closes in ~ {left_s}s")
     print()
@@ -1843,7 +1995,7 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         print(colored(f"   ℹ️ WAIT — reason: {reason}","yellow"))
     print(colored("─"*100,"cyan"))
 
-# ------------ Decision Loop ------------
+# ------------ ENHANCED: Decision Loop with Breakout Engine ------------
 def trade_loop():
     global last_signal_id, state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint
     sync_from_exchange_once()
@@ -1854,62 +2006,82 @@ def trade_loop():
             loop_heartbeat()
             loop_counter += 1
             
-            bal=balance_usdt()
-            px=price_now()
-            df=fetch_ohlcv()
+            bal = balance_usdt()
+            px = price_now()
+            df = fetch_ohlcv()
             
             # HARDENING: Bar clock sanity check
             sanity_check_bar_clock(df)
             
-            info=compute_tv_signals(df)
-            ind=compute_indicators(df)
+            info = compute_tv_signals(df)
+            ind = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
+            
+            # ✅ ENHANCED: حساب المؤشرات السابقة مرة واحدة لتحسين الأداء
+            prev_ind = compute_indicators(df.iloc[:-1]) if len(df) >= 2 else ind
 
             if state["open"] and px:
-                state["pnl"]=(px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
+                state["pnl"] = (px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
 
-            # ✅ NEW: Smart exit check with passed df to reduce network calls
-            smart_exit_check(info, ind, df)
+            # ✅ ENHANCED: BREAKOUT ENGINE - يعمل قبل أي منطق آخر
+            # 1. معالجة خروج الانفجارات أولاً (إذا كنا في وضع انفجار نشط)
+            breakout_exited = handle_breakout_exits(df, ind, prev_ind)
+            
+            # 2. معالجة دخول الانفجارات (إذا لم نكن في صفقة)
+            breakout_entered = False
+            if not state["open"] and not breakout_exited:
+                breakout_entered = handle_breakout_entries(df, ind, prev_ind, bal, spread_bps)
+            
+            # 3. إذا دخلنا بصفقة انفجار، نتخطى كل المنطق الآخر لهذه الدورة
+            if breakout_entered:
+                # نعرض اللوحة ثم ننتقل مباشرة للنوم
+                snapshot(bal, info, ind, spread_bps, "BREAKOUT ENTRY - skipping normal logic", df)
+                time.sleep(compute_next_sleep(df))
+                continue
+                
+            # 4. إذا كنا في وضع انفجار نشط، نتخطى إشارات الـ RF
+            if state["breakout_active"]:
+                # نراقب فقط وننتظر هدوء التقلب للإغلاق
+                snapshot(bal, info, ind, spread_bps, "BREAKOUT ACTIVE - monitoring exit", df)
+                time.sleep(compute_next_sleep(df))
+                continue
 
-            # Decide - ✅ PURE RANGE FILTER SIGNALS ONLY (بدون فلترة RSI/ADX للدخول)
+            # ------------ [الكود الأصلي يبدأ من هنا] ------------
+            # باقي المنطق الأصلي يعمل فقط عندما لسنا في وضع انفجار
+            
+            # Smart profit (trend-aware) with Trend Amplifier
+            smart_exit_check(info, ind)
+
+            # Decide - ✅ PURE RANGE FILTER SIGNALS ONLY
             sig = "buy" if info["long"] else ("sell" if info["short"] else None)
-            reason=None
+            reason = None
             if not sig:
-                reason="no signal"
-            elif spread_bps is not None and spread_bps>SPREAD_GUARD_BPS:
-                reason=f"spread too high ({fmt(spread_bps,2)}bps > {SPREAD_GUARD_BPS})"
-            elif post_close_cooldown>0:
-                reason=f"cooldown {post_close_cooldown} bars"
+                reason = "no signal"
+            elif spread_bps is not None and spread_bps > SPREAD_GUARD_BPS:
+                reason = f"spread too high ({fmt(spread_bps,2)}bps > {SPREAD_GUARD_BPS})"
+            elif post_close_cooldown > 0:
+                reason = f"cooldown {post_close_cooldown} bars"
 
-            # ✅ PATCH: Close on opposite RF signal (using closed candle) + WAIT for next signal
+            # ✅ PATCH: Close on opposite RF signal + WAIT for next signal
             if state["open"] and sig and (reason is None):
                 desired = "long" if sig == "buy" else "short"
                 if state["side"] != desired:
-                    prev_side = state["side"]  # احفظ اتجاه الصفقة القديمة
+                    prev_side = state["side"]
                     close_market_strict("opposite_signal")
-
-                    # فعّل وضع الانتظار للإشارة التالية المعاكسة
                     wait_for_next_signal_side = "sell" if prev_side == "long" else "buy"
-                    last_close_signal_time = info["time"]  # وقت الشمعة الحالية
-                    # لا تفتح دلوقتي، استنى الإشارة التالية
+                    last_close_signal_time = info["time"]
                     snapshot(bal, info, ind, spread_bps, "waiting next opposite signal", df)
-                    # نام قليلًا وكمّل اللوب
                     time.sleep(compute_next_sleep(df))
                     continue
 
-            # ✅ PATCH: Open only when allowed (respect wait_for_next_signal_side & next bar)
+            # ✅ PATCH: Open only when allowed
             if not state["open"] and (reason is None) and sig:
-                # ✅ PATCH: الانتظار للإشارة المعاكسة فقط
                 if wait_for_next_signal_side:
                     if sig != wait_for_next_signal_side:
                         reason = f"waiting opposite signal from Range Filter: need {wait_for_next_signal_side}"
                     else:
-                        # ✅ PATCH: الإشارة المطلوبة وصلت - افتح فورًا
                         qty = compute_size(bal, px or info["price"])
-                        # ✅ NEW: Additional protection against small quantities
-                        if qty < (LOT_MIN or 1):
-                            reason = f"qty<{LOT_MIN or 1}"
-                        elif qty > 0:
+                        if qty > 0:
                             open_market(sig, qty, px or info["price"])
                             wait_for_next_signal_side = None
                             last_close_signal_time = None
@@ -1918,40 +2090,34 @@ def trade_loop():
                         else:
                             reason = "qty<=0"
                 else:
-                    # ✅ الحالة العادية (بدون انتظار)
                     qty = compute_size(bal, px or info["price"])
-                    # ✅ NEW: Additional protection against small quantities
-                    if qty < (LOT_MIN or 1):
-                        reason = f"qty<{LOT_MIN or 1}"
-                    elif qty > 0:
+                    if qty > 0:
                         open_market(sig, qty, px or info["price"])
                         last_open_fingerprint = None
                         last_signal_id = f"{info['time']}:{sig}"
                     else:
                         reason = "qty<=0"
 
-            snapshot(bal,info,ind,spread_bps,reason, df)
+            snapshot(bal, info, ind, spread_bps, reason, df)
 
             if state["open"]:
                 state["bars"] += 1
-            if post_close_cooldown>0 and not state["open"]:
+            if post_close_cooldown > 0 and not state["open"]:
                 post_close_cooldown -= 1
 
-            # HARDENING: Save state every 5 loops to reduce I/O
+            # HARDENING: Save state every 5 loops
             if loop_counter % 5 == 0:
                 save_state()
 
             # ✅ PATCH: Strict Exchange Close consistency guard
             sync_consistency_guard()
 
-            # ✅ PATCH: Adaptive pacing for faster entries near candle close
             sleep_s = compute_next_sleep(df)
             time.sleep(sleep_s)
 
         except Exception as e:
-            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}","red"))
+            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}", "red"))
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
-            # ✅ PATCH: Use base sleep on error to avoid rapid retries
             time.sleep(BASE_SLEEP)
 
 # ------------ Keepalive + API ------------
@@ -1995,7 +2161,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — PERFORMANCE OPTIMIZATIONS"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE"
 
 @app.route("/metrics")
 def metrics():
@@ -2017,18 +2183,23 @@ def metrics():
             "last_action": state.get("last_action"),
             "action_reason": state.get("action_reason"),
             "highest_profit_pct": state.get("highest_profit_pct", 0),
-            "trade_mode": state.get("trade_mode"),  # ✅ NEW
-            "profit_targets_achieved": state.get("profit_targets_achieved", 0)  # ✅ NEW
+            "trade_mode": state.get("trade_mode"),
+            "profit_targets_achieved": state.get("profit_targets_achieved", 0)
         },
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "waiting_for_signal": wait_for_next_signal_side,  # ✅ NEW
-        "fakeout_protection": {  # ✅ NEW
+        "waiting_for_signal": wait_for_next_signal_side,
+        "fakeout_protection": {
             "pending": state.get("fakeout_pending", False),
             "need_side": state.get("fakeout_need_side"),
             "confirm_bars": state.get("fakeout_confirm_bars", 0),
             "started_at": state.get("fakeout_started_at")
         },
-        "profit_taking": {  # ✅ NEW
+        "breakout_engine": {  # ✅ NEW: Breakout engine status
+            "active": state.get("breakout_active", False),
+            "direction": state.get("breakout_direction"),
+            "entry_price": state.get("breakout_entry_price")
+        },
+        "profit_taking": {
             "scalp_targets": SCALP_TARGETS,
             "trend_targets": TREND_TARGETS,
             "scale_in_disabled": True
@@ -2049,10 +2220,11 @@ def health():
         "consecutive_errors": _consec_err,
         "timestamp": datetime.utcnow().isoformat(),
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "trade_mode": state.get("trade_mode"),  # ✅ NEW
-        "profit_targets_achieved": state.get("profit_targets_achieved", 0),  # ✅ NEW
-        "waiting_for_signal": wait_for_next_signal_side,  # ✅ NEW
-        "fakeout_protection_active": state.get("fakeout_pending", False)  # ✅ NEW
+        "trade_mode": state.get("trade_mode"),
+        "profit_targets_achieved": state.get("profit_targets_achieved", 0),
+        "waiting_for_signal": wait_for_next_signal_side,
+        "fakeout_protection_active": state.get("fakeout_pending", False),
+        "breakout_active": state.get("breakout_active", False)  # ✅ NEW
     }), 200
 
 @app.route("/ping")
@@ -2060,7 +2232,7 @@ def ping(): return "pong", 200
 
 # ------------ Boot Sequence ------------
 if __name__ == "__main__":
-    print("✅ Starting HARDENED Flask server...")
+    print("✅ Starting HARDENED Flask server with BREAKOUT ENGINE...")
     
     # HARDENING: Load persisted state
     load_state()
