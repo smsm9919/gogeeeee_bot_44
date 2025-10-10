@@ -36,6 +36,12 @@ RF Futures Bot — Smart Pro (BingX Perp, CCXT) - HARDENED EDITION
 - Full independence from core RF strategy
 - Production-optimized with all safety guards
 
+✅ EMERGENCY PROTECTION LAYER ADDED:
+- Smart Pump/Crash detection (ATR spike + high ADX + extreme RSI)
+- In favor: Smart profit harvesting + breakeven + emergency trail
+- Against: Immediate full close to minimize loss
+- Independent layer with configurable policies
+
 Patched:
 - BingX position mode support (oneway|hedge) with correct positionSide
 - Safe state updates (no local open if exchange order failed)
@@ -60,6 +66,7 @@ Patched:
 - ✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close
 - ✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT
 - ✅ NEW: BREAKOUT ENGINE - Independent explosive move detection & trading
+- ✅ NEW: EMERGENCY PROTECTION LAYER - Smart Pump/Crash response system
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -154,6 +161,28 @@ BREAKOUT_ADX_THRESHOLD = 25     # ADX ≥ 25 for trend strength
 BREAKOUT_LOOKBACK_BARS = 20     # Check last 20 bars for highs/lows
 BREAKOUT_CALM_THRESHOLD = 1.1   # ATR(current) < ATR(previous) * 1.1 → exit
 
+# ✅ NEW: EMERGENCY BREAKOUT/CRASH PROTECTION (SMART LAYER)
+EMERGENCY_PROTECTION_ENABLED = True
+
+# شروط التفعيل
+EMERGENCY_ADX_MIN = 40             # قوة ترند لازمة
+EMERGENCY_ATR_SPIKE_RATIO = 1.6    # ATR_now > ATR_prev * ratio
+EMERGENCY_RSI_PUMP = 72            # Pump
+EMERGENCY_RSI_CRASH = 28           # Crash
+
+# سياسات التصرّف
+# - "tp_then_close": جني جزئي ثم إغلاق باقي المركز فورًا
+# - "tp_then_trail": جني جزئي + بريك إيفن + تريل طارئ (نركب لو فيه امتداد)
+# - "close_always": إغلاق فوري كامل بغض النظر
+EMERGENCY_POLICY = "tp_then_close"
+
+# إعدادات الجني الذكي
+EMERGENCY_HARVEST_FRAC = 0.60      # يجني 60% فور التفعيل (لو في صالحنا)
+EMERGENCY_FULL_CLOSE_PROFIT = 1.0  # % لو الربح ≥ القيمة دي → إغلاق كامل بدل الجني الجزئي
+
+# تريل طارئ (أقوى من العادي)
+EMERGENCY_TRAIL_ATR_MULT = 1.2     # أترايل أضيق عشان نحافظ على المكسب
+
 # pacing / keepalive
 ADAPTIVE_PACING = True
 BASE_SLEEP = 10        # نوم عادي بعيدًا عن الإغلاق
@@ -202,6 +231,7 @@ print(colored(f"✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets", 
 print(colored(f"✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close", "green"))
 print(colored(f"✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT", "green"))
 print(colored(f"✅ NEW: BREAKOUT ENGINE - Independent explosive move detection & trading", "green"))
+print(colored(f"✅ NEW: EMERGENCY PROTECTION LAYER - Smart Pump/Crash response system", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -720,7 +750,7 @@ def compute_tv_signals(df: pd.DataFrame):
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
     dfilt = filt - filt.shift(1)
     fdir = pd.Series(0.0, index=filt.index).mask(dfilt>0,1).mask(dfilt<0,-1).ffill().fillna(0.0)
-    upward = (fdir==1).astype(int); downward = (fdir == -1).astype(int)
+    upward = (fdir==1).astype(int); downward = (fdir == -1).astiatype(int)
     src_gt_f=(src>filt); src_lt_f=(src<filt); src_gt_p=(src>src.shift(1)); src_lt_p=(src<src.shift(1))
     longCond=(src_gt_f&((src_gt_p)|(src_lt_p))&(upward>0))
     shortCond=(src_lt_f&((src_lt_p)|(src_gt_p))&(downward>0))
@@ -1871,6 +1901,108 @@ def handle_breakout_exits(df: pd.DataFrame, ind: dict, prev_ind: dict) -> bool:
         
     return False
 
+# ------------ NEW: SMART EMERGENCY PROTECTION LAYER FUNCTION ------------
+def breakout_emergency_protection(ind: dict, prev_ind: dict) -> bool:
+    """
+    🛡️ Smart Emergency Layer:
+    - يكتشف Pump/Crash قوي (ATR spike + ADX عالي + RSI متطرف).
+    - في صالح الصفقة: جني أرباح ذكي (partial) + بريك إيفن + تريل طارئ
+      * أو إغلاق كامل لو الربح كفاية.
+    - ضد الصفقة: إغلاق كامل فوري لتقليل الخسارة.
+    - يرجّع True لو أغلق أو نفّذ جني/تريل طارئ.
+    """
+    if not (EMERGENCY_PROTECTION_ENABLED and state.get("open")):
+        return False
+
+    try:
+        adx = float(ind.get("adx") or 0.0)
+        rsi = float(ind.get("rsi") or 50.0)
+        atr_now  = float(ind.get("atr") or 0.0)
+        atr_prev = float(prev_ind.get("atr") or atr_now)
+        price = ind.get("price") or price_now() or state.get("entry")
+
+        # تحقق الشروط
+        atr_spike = atr_now > atr_prev * EMERGENCY_ATR_SPIKE_RATIO
+        strong_trend = adx >= EMERGENCY_ADX_MIN
+        if not (atr_spike and strong_trend):
+            return False
+
+        pump  = rsi >= EMERGENCY_RSI_PUMP
+        crash = rsi <= EMERGENCY_RSI_CRASH
+        if not (pump or crash):
+            return False
+
+        side  = state.get("side")
+        entry = state.get("entry") or price
+        if not (side and entry and price):
+            return False
+
+        # ربح الصفقة الحالي %
+        rr_pct = (price - entry) / entry * 100.0 * (1 if side == "long" else -1)
+
+        print(colored(f"🛡️ EMERGENCY LAYER DETECTED: {side.upper()} | RSI={rsi:.1f} | ADX={adx:.1f} | ATR Spike={atr_now/atr_prev:.2f}x | PnL={rr_pct:.2f}%", "yellow"))
+        logging.info(f"EMERGENCY_LAYER: {side} RSI={rsi} ADX={adx} ATR_ratio={atr_now/atr_prev:.2f} PnL={rr_pct:.2f}%")
+
+        # ضد اتجاهنا → إغلاق فوري
+        if (pump and side == "short") or (crash and side == "long"):
+            close_market_strict("EMERGENCY opposite pump/crash — close now")
+            print(colored(f"🛑 EMERGENCY: AGAINST POSITION - FULL CLOSE", "red"))
+            logging.warning(f"EMERGENCY_LAYER: Against position - full close")
+            return True
+
+        # في صالحنا:
+        if EMERGENCY_POLICY == "close_always":
+            close_market_strict("EMERGENCY favorable pump/crash — close all")
+            print(colored(f"🟡 EMERGENCY: FAVORABLE - POLICY CLOSE ALL", "yellow"))
+            logging.info(f"EMERGENCY_LAYER: Favorable - policy close all")
+            return True
+
+        # لو الربح أصلاً كبير كفاية → إغلاق كامل
+        if rr_pct >= EMERGENCY_FULL_CLOSE_PROFIT:
+            close_market_strict(f"EMERGENCY full close @ {rr_pct:.2f}%")
+            print(colored(f"🟢 EMERGENCY: PROFIT TARGET HIT - FULL CLOSE @ {rr_pct:.2f}%", "green"))
+            logging.info(f"EMERGENCY_LAYER: Profit target hit - full close @ {rr_pct:.2f}%")
+            return True
+
+        # جني ذكي جزئي + حماية
+        harvest = max(0.0, min(1.0, EMERGENCY_HARVEST_FRAC))
+        if harvest > 0:
+            close_partial(harvest, f"EMERGENCY {'PUMP' if pump else 'CRASH'} harvest {harvest*100:.0f}%")
+            print(colored(f"💰 EMERGENCY: HARVEST {harvest*100:.0f}% - PnL={rr_pct:.2f}%", "cyan"))
+            logging.info(f"EMERGENCY_LAYER: Harvest {harvest*100:.0f}% - PnL={rr_pct:.2f}%")
+
+        # بريك إيفن + تريل طارئ
+        state["breakeven"] = entry
+        if atr_now > 0:
+            if side == "long":
+                new_trail = price - atr_now * EMERGENCY_TRAIL_ATR_MULT
+                state["trail"] = max(state.get("trail") or new_trail, new_trail)
+            else:
+                new_trail = price + atr_now * EMERGENCY_TRAIL_ATR_MULT
+                state["trail"] = min(state.get("trail") or new_trail, new_trail)
+            
+            print(colored(f"🛡️ EMERGENCY: BREAKEVEN + TRAIL SET @ {new_trail:.6f}", "blue"))
+            logging.info(f"EMERGENCY_LAYER: Breakeven + trail set @ {new_trail:.6f}")
+
+        # لو السياسة tp_then_close → اقفل الباقي فورًا
+        if EMERGENCY_POLICY == "tp_then_close":
+            close_market_strict("EMERGENCY: harvest then full close")
+            print(colored(f"🟡 EMERGENCY: TP_THEN_CLOSE POLICY - FULL CLOSE", "yellow"))
+            logging.info(f"EMERGENCY_LAYER: tp_then_close policy - full close")
+            return True
+
+        # لو السياسة tp_then_trail → نسيب الباقي على تريل محكم
+        print(colored(f"🟢 EMERGENCY: TP_THEN_TRAIL POLICY - RIDING THE MOVE", "green"))
+        logging.info(f"EMERGENCY_LAYER: tp_then_trail policy - riding the move")
+
+        # هنرجّع True عشان نُعلم إن إجراء حصل.
+        return True
+
+    except Exception as e:
+        print(colored(f"⚠️ breakout_emergency_protection error: {e}", "yellow"))
+        logging.error(f"breakout_emergency_protection error: {e}")
+        return False
+
 # ------------ Enhanced HUD (rich logs) ------------
 def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     df = df if df is not None else fetch_ohlcv()
@@ -1995,7 +2127,7 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         print(colored(f"   ℹ️ WAIT — reason: {reason}","yellow"))
     print(colored("─"*100,"cyan"))
 
-# ------------ ENHANCED: Decision Loop with Breakout Engine ------------
+# ------------ ENHANCED: Decision Loop with All Protection Layers ------------
 def trade_loop():
     global last_signal_id, state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint
     sync_from_exchange_once()
@@ -2046,8 +2178,15 @@ def trade_loop():
                 time.sleep(compute_next_sleep(df))
                 continue
 
+            # ✅ NEW: SMART EMERGENCY PROTECTION LAYER (Pump/Crash)
+            if state["open"]:
+                if breakout_emergency_protection(ind, prev_ind):
+                    snapshot(bal, info, ind, spread_bps, "EMERGENCY LAYER action", df)
+                    time.sleep(compute_next_sleep(df))
+                    continue
+
             # ------------ [الكود الأصلي يبدأ من هنا] ------------
-            # باقي المنطق الأصلي يعمل فقط عندما لسنا في وضع انفجار
+            # باقي المنطق الأصلي يعمل فقط عندما لسنا في وضع انفجار أو طوارئ
             
             # Smart profit (trend-aware) with Trend Amplifier
             smart_exit_check(info, ind)
@@ -2161,7 +2300,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER"
 
 @app.route("/metrics")
 def metrics():
@@ -2194,10 +2333,15 @@ def metrics():
             "confirm_bars": state.get("fakeout_confirm_bars", 0),
             "started_at": state.get("fakeout_started_at")
         },
-        "breakout_engine": {  # ✅ NEW: Breakout engine status
+        "breakout_engine": {
             "active": state.get("breakout_active", False),
             "direction": state.get("breakout_direction"),
             "entry_price": state.get("breakout_entry_price")
+        },
+        "emergency_protection": {
+            "enabled": EMERGENCY_PROTECTION_ENABLED,
+            "policy": EMERGENCY_POLICY,
+            "harvest_frac": EMERGENCY_HARVEST_FRAC
         },
         "profit_taking": {
             "scalp_targets": SCALP_TARGETS,
@@ -2224,7 +2368,8 @@ def health():
         "profit_targets_achieved": state.get("profit_targets_achieved", 0),
         "waiting_for_signal": wait_for_next_signal_side,
         "fakeout_protection_active": state.get("fakeout_pending", False),
-        "breakout_active": state.get("breakout_active", False)  # ✅ NEW
+        "breakout_active": state.get("breakout_active", False),
+        "emergency_protection_enabled": EMERGENCY_PROTECTION_ENABLED
     }), 200
 
 @app.route("/ping")
@@ -2232,7 +2377,7 @@ def ping(): return "pong", 200
 
 # ------------ Boot Sequence ------------
 if __name__ == "__main__":
-    print("✅ Starting HARDENED Flask server with BREAKOUT ENGINE...")
+    print("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS...")
     
     # HARDENING: Load persisted state
     load_state()
