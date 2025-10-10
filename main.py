@@ -750,7 +750,11 @@ def compute_tv_signals(df: pd.DataFrame):
     hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
     dfilt = filt - filt.shift(1)
     fdir = pd.Series(0.0, index=filt.index).mask(dfilt>0,1).mask(dfilt<0,-1).ffill().fillna(0.0)
-    upward = (fdir==1).astype(int); downward = (fdir == -1).astiatype(int)
+    
+    # ✅ CORRECTION: Fix typo - change 'astiatype' to 'astype'
+    upward = (fdir==1).astype(int)     # كان: .astiatype(int)
+    downward = (fdir == -1).astype(int) # كان: .astiatype(int)
+    
     src_gt_f=(src>filt); src_lt_f=(src<filt); src_gt_p=(src>src.shift(1)); src_lt_p=(src<src.shift(1))
     longCond=(src_gt_f&((src_gt_p)|(src_lt_p))&(upward>0))
     shortCond=(src_lt_f&((src_lt_p)|(src_gt_p))&(downward>0))
