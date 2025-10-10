@@ -51,6 +51,7 @@ Patched:
 - ✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closing
 - ✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets with strict close
 - ✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close
+- ✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -185,6 +186,7 @@ print(colored(f"✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-en
 print(colored(f"✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closing", "green"))
 print(colored(f"✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets", "green"))
 print(colored(f"✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close", "green"))
+print(colored(f"✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -1192,15 +1194,15 @@ def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
                 
                 return "IMPULSE_HARVEST"
         
-        # الذيل الطويل في اتجاه المكسب
-        if side == "long" and lower_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
-            # ذيل طويل في الاتجاه الصاعد ⇒ جني جزئي
-            close_partial(0.25, f"Long lower wick {lower_wick_pct:.1f}%")
+        # ✅ CORRECTED: الذيل الطويل في اتجاه المكسب
+        # للـ LONG: الذيل العلوي الطويل إشارة ضغط بيع عند القمم ⇒ مناسب لجني الأرباح
+        if side == "long" and upper_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
+            close_partial(0.25, f"Upper wick (LONG) {upper_wick_pct:.1f}%")
             return "LONG_WICK_HARVEST"
         
-        if side == "short" and upper_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
-            # ذيل طويل في الاتجاه الهابط ⇒ جني جزئي
-            close_partial(0.25, f"Long upper wick {upper_wick_pct:.1f}%")
+        # للـ SHORT: الذيل السفلي الطويل إشارة ضغط شراء عند القيعان ⇒ مناسب لجني الأرباح
+        if side == "short" and lower_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
+            close_partial(0.25, f"Lower wick (SHORT) {lower_wick_pct:.1f}%")
             return "LONG_WICK_HARVEST"
             
     except Exception as e:
@@ -1318,7 +1320,7 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
         print(colored(f"🎯 TRADE MODE DETECTED: {trade_mode}", "cyan"))
         logging.info(f"Trade mode detected: {trade_mode}")
     
-    # (اختياري) حصاد الشمعة/الذيل كما هو عندك
+    # ✅ CORRECTED: حصاد الشمعة/الذيل المصحح
     impulse_action = handle_impulse_and_long_wicks(df, ind)
     if impulse_action:
         # بعد أي حصاد، لا نغلق فورًا في الترند — نترك trend_profit_taking يحكم
@@ -1967,7 +1969,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING"
 
 @app.route("/metrics")
 def metrics():
