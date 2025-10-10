@@ -49,6 +49,8 @@ Patched:
 - ✅ PATCH: Safety guard to avoid float-None operations after strict close
 - ✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-entry
 - ✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closing
+- ✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets with strict close
+- ✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -102,7 +104,7 @@ TRAIL_ACTIVATE = 0.60
 ATR_MULT_TRAIL = 1.6
 
 # Advanced Position Management
-SCALE_IN_MAX_STEPS = 3
+SCALE_IN_MAX_STEPS = 0                # ⛔ تعطيل التعزيز نهائيًا
 SCALE_IN_STEP_PCT = 0.20
 ADX_STRONG_THRESH = 28
 RSI_TREND_BUY = 55
@@ -120,9 +122,19 @@ RATCHET_LOCK_PCT = 0.60
 # Position mode
 BINGX_POSITION_MODE = "oneway"
 
+# ✅ NEW: Advanced Profit Taking Settings
+# --- Profit targets (بنِسب مئوية: rr محسوبة %)
+SCALP_TARGETS = [0.35, 0.70, 1.20]   # 3 مراحل سكالب: 0.35% ثم 0.70% ثم 1.20%
+SCALP_CLOSE_FRACS = [0.40, 0.30, 0.30]  # يغلق 40% ثم 30% ثم 30% → وبعدها قفل كامل
+
+TREND_TARGETS = [0.50, 1.00, 1.80]   # 3 مراحل للترند (أعلى نسبيًا)
+TREND_CLOSE_FRACS = [0.30, 0.30, 0.20]  # يخفف تدريجيًا ويحتفظ بجزء للركوب
+MIN_TREND_HOLD_ADX = 25              # طالما ADX ≥ 25 يبقى راكب
+END_TREND_ADX_DROP = 5.0             # هبوط ADX بمقدار ≥ 5 يعتبر ضعف
+END_TREND_RSI_NEUTRAL = (45, 55)     # الخروج من مناطق اتجاهية إلى حيادية
+DI_FLIP_BUFFER = 1.0                  # قلب DI مع هامش بسيط يؤكد الانعكاس
+
 # ✅ NEW: Smart Post-Entry Management Settings
-SCALP_PROFIT_TARGETS = [0.30, 0.50, 1.00]  # 30%, 50%, 100% of position
-TREND_PROFIT_TARGETS = [0.20, 0.40, 0.80]  # More conservative for trend riding
 IMPULSE_HARVEST_THRESHOLD = 1.2  # Body >= 1.2x ATR
 LONG_WICK_HARVEST_THRESHOLD = 0.60  # Wick >= 60% of range
 RATCHET_RETRACE_THRESHOLD = 0.40  # Close partial on 40% retrace from high
@@ -144,7 +156,7 @@ CLOSE_VERIFY_WAIT_S    = 2.0        # مدة الانتظار بين كل تحق
 MIN_RESIDUAL_TO_FORCE  = 1.0        # أي بقايا كمية ≥ هذا الرقم نعيد إغلاقها
 
 # === Post-close signal gating ===
-REQUIRE_NEW_BAR_AFTER_CLOSE = True
+REQUIRE_NEW_BAR_AFTER_CLOSE = False  # ✅ PATCH: تعطيل شرط الشمعة الجديدة
 wait_for_next_signal_side = None    # 'buy' أو 'sell' أو None
 last_close_signal_time = None       # time للشمعة التي تم عندها الإغلاق
 
@@ -171,6 +183,8 @@ print(colored(f"✅ PATCH: TP1 fallback when trade_mode not decided", "green"))
 print(colored(f"✅ PATCH: Safety guard to avoid float-None operations after strict close", "green"))
 print(colored(f"✅ PATCH: WAIT FOR NEXT SIGNAL AFTER CLOSE - No immediate re-entry", "green"))
 print(colored(f"✅ NEW: FAKEOUT PROTECTION - Wait for confirmation before closing", "green"))
+print(colored(f"✅ NEW: ADVANCED PROFIT TAKING - 3-stage SCALP/TREND targets", "green"))
+print(colored(f"✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals after close", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -818,19 +832,17 @@ def close_market_strict(reason):
     - يتحقق مرارًا حتى يصبح المركز = 0
     - يعيد المحاولة عند وجود بقايا أو خطأ شبكة
     """
-    global state, compound_pnl
+    global state, compound_pnl, wait_for_next_signal_side, last_close_signal_time
 
-    # لو مفيش مركز محليًا، برضه نتحقق من المنصة (في حال desync)
-    local_open = state.get("open", False)
-    local_side = state.get("side")
-    px_now = price_now() or state.get("entry")
+    # احفظ الجانب الحالي قبل أي تغيير
+    prev_side_local = state.get("side")
 
     # 1) اسحب الحالة الفعلية من المنصة
     exch_qty, exch_side, exch_entry = _read_exchange_position()
     if exch_qty <= 0:
         # لا يوجد مركز على المنصة → صفّر محليًا لو لازال مفتوح
-        if local_open:
-            reset_after_full_close("strict_close_already_zero")
+        if state.get("open"):
+            reset_after_full_close("strict_close_already_zero", prev_side_local)
         return
 
     # 2) حدّد جانب الإغلاق و الكمية
@@ -854,7 +866,7 @@ def close_market_strict(reason):
 
             if left_qty <= 0:
                 # تم الإغلاق على المنصة: احسب PnL واغلق محليًا
-                px = price_now() or px_now or state.get("entry")
+                px = price_now() or state.get("entry")
                 entry_px = state.get("entry") or exch_entry or px
                 side = state.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
                 qty = exch_qty  # الكمية التي أغلقناها
@@ -863,7 +875,7 @@ def close_market_strict(reason):
                 compound_pnl += pnl
                 print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
                 logging.info(f"STRICT_CLOSE {side} pnl={pnl} total={compound_pnl}")
-                reset_after_full_close(reason)
+                reset_after_full_close(reason, prev_side_local)
                 return
 
             # يوجد بقايا → جهّز لمحاولة جديدة بنفس الاتجاه والكمية المتبقية
@@ -896,7 +908,7 @@ def sync_consistency_guard():
     if exch_qty <= 0 and state["open"]:
         print(colored("🛠️  CONSISTENCY GUARD: Exchange shows no position but locally open → resetting", "yellow"))
         logging.warning("Consistency guard: resetting local state (exchange shows no position)")
-        reset_after_full_close("consistency_guard_no_position")
+        reset_after_full_close("consistency_guard_no_position", state.get("side"))
         return
     
     # لو الكمية مختلفة بشكل كبير → نُصلح
@@ -929,6 +941,39 @@ def get_dynamic_tp_params(adx: float) -> tuple:
         return 1.8, 0.8
     else:
         return 1.0, 1.0
+
+# ====== NEW: TREND END DETECTION ======
+def trend_end_confirmed(ind: dict, candle_info: dict, info: dict) -> bool:
+    """
+    نهاية الترند مؤكدة لما يتحقق واحد أو أكثر:
+    - هبوط ADX واضح، أو نزول تحت 20
+    - قلب اتجاه DI ضد مركزنا بهامش
+    - رجوع RSI لمنطقة حيادية
+    - إشارة RF معاكسة (سيتم إغلاقها أصلاً في الـ trade_loop لكن نخلي هنا احتياط)
+    """
+    adx = float(ind.get("adx") or 0.0)
+    adx_prev = float(ind.get("adx_prev") or adx)
+    plus_di = float(ind.get("plus_di") or 0.0)
+    minus_di = float(ind.get("minus_di") or 0.0)
+    rsi = float(ind.get("rsi") or 50.0)
+
+    # هبوط ADX قوي أو تحت 20
+    adx_weak = (adx_prev - adx) >= END_TREND_ADX_DROP or adx < 20
+
+    # قلب DI ضد مركزنا
+    if state.get("side") == "long":
+        di_flip = (minus_di - plus_di) > DI_FLIP_BUFFER
+    else:
+        di_flip = (plus_di - minus_di) > DI_FLIP_BUFFER
+
+    # RSI محايد
+    rsi_neutral = END_TREND_RSI_NEUTRAL[0] <= rsi <= END_TREND_RSI_NEUTRAL[1]
+
+    # إشارة RF معاكسة على الشمعة المغلقة الحالية
+    rf_opposite = (state.get("side") == "long" and info.get("short")) or \
+                  (state.get("side") == "short" and info.get("long"))
+
+    return adx_weak or di_flip or rsi_neutral or rf_opposite
 
 # ====== NEW: TREND CONFIRMATION LOGIC ======
 def check_trend_confirmation(candle_info: dict, ind: dict, current_side: str) -> str:
@@ -990,51 +1035,8 @@ def check_trend_confirmation(candle_info: dict, ind: dict, current_side: str) ->
 
 def should_scale_in(candle_info: dict, ind: dict, current_side: str) -> tuple:
     """Return (should_scale, step_size, reason)"""
-    if state["scale_ins"] >= SCALE_IN_MAX_STEPS:
-        return False, 0.0, "Max scale-in steps reached"
-    
-    # NEW: Trend confirmation check before scale-in
-    trend_signal = check_trend_confirmation(candle_info, ind, current_side)
-    if trend_signal == "CONFIRMED_REVERSAL":
-        return False, 0.0, "Trend reversal confirmed - no scale-in"
-    
-    adx = ind.get("adx", 0)
-    rsi = ind.get("rsi", 50)
-    plus_di = ind.get("plus_di", 0)
-    minus_di = ind.get("minus_di", 0)
-    
-    # Get dynamic step based on ADX
-    step_size, step_reason = get_dynamic_scale_in_step(adx)
-    if step_size <= 0:
-        return False, 0.0, step_reason
-    
-    # RSI direction confirmation
-    if current_side == "long" and rsi < RSI_TREND_BUY:
-        return False, 0.0, f"RSI {rsi:.1f} < {RSI_TREND_BUY}"
-    if current_side == "short" and rsi > RSI_TREND_SELL:
-        return False, 0.0, f"RSI {rsi:.1f} > {RSI_TREND_SELL}"
-    
-    # DI direction confirmation
-    if current_side == "long" and plus_di <= minus_di:
-        return False, 0.0, "+DI <= -DI"
-    if current_side == "short" and minus_di <= plus_di:
-        return False, 0.0, "-DI <= +DI"
-    
-    # Candle pattern strength
-    candle_strength = candle_info.get("strength", 0)
-    if candle_strength < 2:
-        return False, 0.0, f"Weak candle pattern: {candle_info.get('name_en', 'NONE')}"
-    
-    # NEW: Only scale-in with trend confirmation
-    if trend_signal == "CONFIRMED_CONTINUE":
-        return True, step_size, f"Trend confirmed + {step_reason}"
-    
-    # Specific strong patterns for scale-in
-    strong_patterns = ["THREE_WHITE_SOLDIERS", "THREE_BLACK_CROWS", "ENGULF_BULL", "ENGULF_BEAR", "MARUBOZU_BULL", "MARUBOZU_BEAR"]
-    if candle_info.get("pattern") in strong_patterns:
-        return True, step_size, f"Strong {candle_info.get('name_en')} pattern + {step_reason}"
-    
-    return False, 0.0, f"Moderate pattern: {candle_info.get('name_en', 'NONE')}"
+    # ⛔ تعطيل التعزيز نهائيًا
+    return False, 0.0, "Scale-in disabled"
 
 def should_scale_out(candle_info: dict, ind: dict, current_side: str) -> tuple:
     """Return (should_scale_out, reason)"""
@@ -1235,69 +1237,71 @@ def ratchet_protection(ind: dict):
     
     return None
 
-def scalp_profit_taking(ind: dict):
+# ====== NEW: ADVANCED PROFIT TAKING ======
+def scalp_profit_taking(ind: dict, info: dict):
     """
-    جني الأرباح في نمط السكالب
+    سكالب: 3 مراحل جني أرباح ثم إغلاق صارم كامل.
     """
     if not state["open"] or state["qty"] <= 0:
         return None
-    
-    current_price = ind.get("price") or price_now() or state["entry"]
-    entry = state["entry"]
-    side = state["side"]
-    
-    # حساب الربح النسبي
-    rr = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
-    
-    # أهداف الربح للسكالب
-    targets = SCALP_PROFIT_TARGETS
-    achieved = state.get("profit_targets_achieved", 0)
-    
-    if achieved < len(targets) and rr >= targets[achieved]:
-        # جني الربح حسب الهدف
-        close_frac = 0.3 if achieved == 0 else 0.5  # 30% ثم 50% ثم الباقي
-        close_partial(close_frac, f"Scalp target {targets[achieved]}%")
-        
-        state["profit_targets_achieved"] = achieved + 1
-        
-        # ✅ PATCH: إذا تم تحقيق جميع الأهداف ⇒ إغلاق كامل صارم
+
+    price = ind.get("price") or price_now() or state["entry"]
+    entry = state["entry"]; side = state["side"]
+    rr = (price - entry) / entry * 100 * (1 if side == "long" else -1)
+
+    targets = SCALP_TARGETS
+    fracs = SCALP_CLOSE_FRACS
+    k = int(state.get("profit_targets_achieved", 0))
+
+    if k < len(targets) and rr >= targets[k]:
+        close_partial(fracs[k], f"SCALP TP{k+1}@{targets[k]:.2f}%")
+        state["profit_targets_achieved"] = k + 1
+
+        # بعد آخر مرحلة → قفل صارم كامل
         if state["profit_targets_achieved"] >= len(targets):
-            close_market_strict("Scalp targets achieved")
+            close_market_strict("SCALP sequence complete")
             return "SCALP_COMPLETE"
-        
-        return "SCALP_TARGET"
-    
+
+        return f"SCALP_TP{k+1}"
+
     return None
 
-def trend_profit_taking(ind: dict):
+def trend_profit_taking(ind: dict, info: dict):
     """
-    جني الأرباح في نمط الترند
+    ترند قوي: 3 مراحل جني أرباح تدريجي (لا نغلق كليًا)،
+    ونستمر حتى نهاية الترند المؤكدة → قفل صارم كامل.
     """
     if not state["open"] or state["qty"] <= 0:
         return None
-    
-    current_price = ind.get("price") or price_now() or state["entry"]
-    entry = state["entry"]
-    side = state["side"]
-    
-    # حساب الربح النسبي
-    rr = (current_price - entry) / entry * 100 * (1 if side == "long" else -1)
-    
-    # أهداف الربح للترند (أكثر تحفظًا)
-    targets = TREND_PROFIT_TARGETS
-    achieved = state.get("profit_targets_achieved", 0)
-    
-    if achieved < len(targets) and rr >= targets[achieved]:
-        # جني جزئي للترند
-        close_frac = 0.2  # 20% لكل هدف
-        close_partial(close_frac, f"Trend target {targets[achieved]}%")
-        
-        state["profit_targets_achieved"] = achieved + 1
-        return "TREND_TARGET"
-    
+
+    price = ind.get("price") or price_now() or state["entry"]
+    entry = state["entry"]; side = state["side"]
+    rr = (price - entry) / entry * 100 * (1 if side == "long" else -1)
+
+    adx = float(ind.get("adx") or 0.0)
+
+    # 1) مراحل الجني
+    targets = TREND_TARGETS
+    fracs = TREND_CLOSE_FRACS
+    k = int(state.get("profit_targets_achieved", 0))
+
+    if k < len(targets) and rr >= targets[k]:
+        close_partial(fracs[k], f"TREND TP{k+1}@{targets[k]:.2f}%")
+        state["profit_targets_achieved"] = k + 1
+        return f"TREND_TP{k+1}"
+
+    # 2) طالما ADX قوي ابقى راكب
+    if adx >= MIN_TREND_HOLD_ADX:
+        return None
+
+    # 3) بعد إتمام المراحل أو ضعف الترند → تحقّق نهاية الترند
+    if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(fetch_ohlcv()), info):
+        close_market_strict("TREND finished — full exit")
+        return "TREND_COMPLETE"
+
     return None
 
-def smart_post_entry_manager(df: pd.DataFrame, ind: dict):
+def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     """
     المدير الذكي للصفقة بعد الدخول
     """
@@ -1314,27 +1318,22 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict):
         print(colored(f"🎯 TRADE MODE DETECTED: {trade_mode}", "cyan"))
         logging.info(f"Trade mode detected: {trade_mode}")
     
-    # معالجة الشموع الانفجارية والذيل الطويل
+    # (اختياري) حصاد الشمعة/الذيل كما هو عندك
     impulse_action = handle_impulse_and_long_wicks(df, ind)
     if impulse_action:
+        # بعد أي حصاد، لا نغلق فورًا في الترند — نترك trend_profit_taking يحكم
         return impulse_action
-    
-    # حماية المكاسب
+
+    # حماية الراتشيت كما هي
     ratchet_action = ratchet_protection(ind)
     if ratchet_action:
         return ratchet_action
-    
-    # جني الأربح حسب نمط الصفقة
+
+    # جني الأرباح وفق النمط
     if state["trade_mode"] == "SCALP":
-        scalp_action = scalp_profit_taking(ind)
-        if scalp_action:
-            return scalp_action
-    else:  # TREND
-        trend_action = trend_profit_taking(ind)
-        if trend_action:
-            return trend_action
-    
-    return None
+        return scalp_profit_taking(ind, info)
+    else:
+        return trend_profit_taking(ind, info)
 
 # ------------ Orders ------------
 def open_market(side, qty, price):
@@ -1445,10 +1444,15 @@ def close_partial(frac, reason):
     else:
         save_state()
 
-def reset_after_full_close(reason):
-    global state, post_close_cooldown
+def reset_after_full_close(reason, prev_side=None):
+    global state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time
     print(colored(f"🔚 CLOSE {reason} totalCompounded now={fmt(compound_pnl)}","magenta"))
     logging.info(f"FULL_CLOSE {reason} total_compounded={compound_pnl}")
+    
+    # احفظ الجانب السابق قبل المسح
+    if prev_side is None:
+        prev_side = state.get("side")
+    
     state.update({
         "open": False, "side": None, "entry": None, "qty": 0.0, 
         "pnl": 0.0, "bars": 0, "trail": None, "tp1_done": False, 
@@ -1464,12 +1468,26 @@ def reset_after_full_close(reason):
         "fakeout_confirm_bars": 0,
         "fakeout_started_at": None
     })
+    
+    # ✅ PATCH: ضع الانتظار للإشارة المعاكسة
+    if prev_side == "long":
+        wait_for_next_signal_side = "sell"
+    elif prev_side == "short":
+        wait_for_next_signal_side = "buy"
+    else:
+        wait_for_next_signal_side = None
+        
+    last_close_signal_time = None
     post_close_cooldown = COOLDOWN_AFTER_CLOSE_BARS
     save_state()
 
 def close_market(reason):
-    global state, compound_pnl
+    global state, compound_pnl, wait_for_next_signal_side, last_close_signal_time
     if not state["open"]: return
+    
+    # ✅ PATCH: احفظ الجانب الحالي
+    prev_side_local = state.get("side")
+    
     px=price_now() or state["entry"]; qty=state["qty"]
     side="sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
@@ -1482,7 +1500,9 @@ def close_market(reason):
     compound_pnl+=pnl
     print(colored(f"🔚 CLOSE {state['side']} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
     logging.info(f"CLOSE_MARKET {state['side']} reason={reason} pnl={pnl} total={compound_pnl}")
-    reset_after_full_close(reason)
+    
+    # ✅ PATCH: استدعِ النسخة المعدلة مع الجانب السابق
+    reset_after_full_close(reason, prev_side_local)
 
 # ------------ Advanced Position Management Check ------------
 def advanced_position_management(candle_info: dict, ind: dict):
@@ -1551,7 +1571,7 @@ def smart_exit_check(info, ind):
 
     # ✅ NEW: Smart Post-Entry Management
     df = fetch_ohlcv()
-    post_entry_action = smart_post_entry_manager(df, ind)
+    post_entry_action = smart_post_entry_manager(df, ind, info)
     if post_entry_action:
         print(colored(f"🎯 POST-ENTRY: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}", "cyan"))
         logging.info(f"POST_ENTRY_ACTION: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}")
@@ -1703,7 +1723,7 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     
     # ✅ NEW: Display waiting status
     if not state["open"] and wait_for_next_signal_side:
-        print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal on CLOSED candle", "cyan"))
+        print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal from TradingView Range Filter", "cyan"))
     
     # ✅ NEW: Display fakeout protection status
     if state["open"] and state["fakeout_pending"]:
@@ -1768,13 +1788,26 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         trail_type = "STRONG" if trail_mult == TRAIL_MULT_STRONG else "MED" if trail_mult == TRAIL_MULT_MED else "CHOP"
         print(f"   🛡️ Trail Multiplier: {trail_mult} ({trail_type})")
         
-        # ✅ NEW: Smart Post-Entry Management Status
+        # ✅ NEW: Advanced Profit Taking Status
         trade_mode = state.get('trade_mode')
         if trade_mode:
-            targets = SCALP_PROFIT_TARGETS if trade_mode == "SCALP" else TREND_PROFIT_TARGETS
+            if trade_mode == "SCALP":
+                targets = SCALP_TARGETS
+                fracs = SCALP_CLOSE_FRACS
+                mode_name = "SCALP"
+            else:
+                targets = TREND_TARGETS
+                fracs = TREND_CLOSE_FRACS
+                mode_name = "TREND"
+            
             achieved = state.get('profit_targets_achieved', 0)
             remaining_targets = len(targets) - achieved
-            print(colored(f"   🧠 SMART MANAGEMENT: {trade_mode} mode • {achieved}/{len(targets)} targets • {remaining_targets} remaining", "magenta"))
+            if achieved < len(targets):
+                next_target = targets[achieved]
+                next_frac = fracs[achieved] * 100
+                print(colored(f"   🎯 {mode_name} MODE: {achieved}/{len(targets)} targets • Next: TP{achieved+1}@{next_target:.2f}% ({next_frac:.0f}%)", "magenta"))
+            else:
+                print(colored(f"   ✅ {mode_name} MODE: All targets achieved • Riding trend", "green"))
     else:
         print("   🔄 Waiting for trading signals...")
     print()
@@ -1790,7 +1823,7 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
 
 # ------------ Decision Loop ------------
 def trade_loop():
-    global last_signal_id, state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time
+    global last_signal_id, state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint
     sync_from_exchange_once()
     loop_counter = 0
     
@@ -1844,17 +1877,15 @@ def trade_loop():
 
             # ✅ PATCH: Open only when allowed (respect wait_for_next_signal_side & next bar)
             if not state["open"] and (reason is None) and sig:
-                # لو في انتظار لاتجاه محدد بعد إغلاق، طبّق الشرط
+                # ✅ PATCH: الانتظار للإشارة المعاكسة فقط
                 if wait_for_next_signal_side:
                     if sig != wait_for_next_signal_side:
-                        reason = f"waiting opposite signal: need {wait_for_next_signal_side}"
-                    elif REQUIRE_NEW_BAR_AFTER_CLOSE and last_close_signal_time is not None and info["time"] == last_close_signal_time:
-                        reason = "waiting next closed candle after close"
+                        reason = f"waiting opposite signal from Range Filter: need {wait_for_next_signal_side}"
                     else:
+                        # ✅ PATCH: الإشارة المطلوبة وصلت - افتح فورًا
                         qty = compute_size(bal, px or info["price"])
                         if qty > 0:
                             open_market(sig, qty, px or info["price"])
-                            # امسح حالة الانتظار
                             wait_for_next_signal_side = None
                             last_close_signal_time = None
                             last_open_fingerprint = None
@@ -1862,7 +1893,7 @@ def trade_loop():
                         else:
                             reason = "qty<=0"
                 else:
-                    # الحالة العادية بدون انتظار خاص
+                    # ✅ الحالة العادية (بدون انتظار)
                     qty = compute_size(bal, px or info["price"])
                     if qty > 0:
                         open_market(sig, qty, px or info["price"])
@@ -1936,7 +1967,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING"
 
 @app.route("/metrics")
 def metrics():
@@ -1968,6 +1999,11 @@ def metrics():
             "need_side": state.get("fakeout_need_side"),
             "confirm_bars": state.get("fakeout_confirm_bars", 0),
             "started_at": state.get("fakeout_started_at")
+        },
+        "profit_taking": {  # ✅ NEW
+            "scalp_targets": SCALP_TARGETS,
+            "trend_targets": TREND_TARGETS,
+            "scale_in_disabled": True
         }
     })
 
