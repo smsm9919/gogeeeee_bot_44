@@ -42,6 +42,13 @@ RF Futures Bot — Smart Pro (BingX Perp, CCXT) - HARDENED EDITION
 - Against: Immediate full close to minimize loss
 - Independent layer with configurable policies
 
+✅ SMART ALPHA PACK ADDED:
+- Breakout Voting: Multi-factor confirmation for explosive moves
+- TP0 Quick Cash: Fast partial profit taking at 0.2%
+- Thrust Lock: Advanced trend riding with Chandelier exit
+- Adaptive Trailing: Dynamic stop loss based on market strength
+- Enhanced metrics and logging
+
 Patched:
 - BingX position mode support (oneway|hedge) with correct positionSide
 - Safe state updates (no local open if exchange order failed)
@@ -67,6 +74,7 @@ Patched:
 - ✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT
 - ✅ NEW: BREAKOUT ENGINE - Independent explosive move detection & trading
 - ✅ NEW: EMERGENCY PROTECTION LAYER - Smart Pump/Crash response system
+- ✅ NEW: SMART ALPHA PACK - Breakout voting, TP0, Thrust Lock, Adaptive trailing
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -183,6 +191,33 @@ EMERGENCY_FULL_CLOSE_PROFIT = 1.0  # % لو الربح ≥ القيمة دي →
 # تريل طارئ (أقوى من العادي)
 EMERGENCY_TRAIL_ATR_MULT = 1.2     # أترايل أضيق عشان نحافظ على المكسب
 
+# =============================================================================
+# ✅ SMART ALPHA PACK SETTINGS
+# =============================================================================
+
+# Breakout Voting System
+BREAKOUT_CONFIRM_BARS = 1           # شموع تأكيد الانفجار
+BREAKOUT_HARD_ATR_SPIKE = 1.8       # انفجار قوي في ATR
+BREAKOUT_SOFT_ATR_SPIKE = 1.4       # انفجار متوسط في ATR
+BREAKOUT_VOLUME_SPIKE = 1.3         # حجم أعلى من المتوسط
+BREAKOUT_VOLUME_MED = 1.1           # حجم فوق المتوسط
+
+# TP0 Quick Cash
+TP0_PROFIT_PCT = 0.2                # جني سريع عند 0.2% ربح
+TP0_CLOSE_FRAC = 0.10               # نسبة الإغلاق (بحد أقصى 10%)
+TP0_MAX_USDT = 1.0                  # أقصى قيمة للإغلاق (1 USDT)
+
+# Thrust Lock Settings  
+THRUST_ATR_BARS = 3                 # عدد الشموع لاتجاه ATR
+THRUST_VOLUME_FACTOR = 1.3          # عامل حجم الترس
+CHANDELIER_ATR_MULT = 3.0           # مضروب ATR للتريل المتقدم
+CHANDELIER_LOOKBACK = 20            # شموع النظر للتريل
+
+# Adaptive Trailing
+TRAIL_MULT_STRONG_ALPHA = 2.4       # تريل قوي للترند القوي
+TRAIL_MULT_CAUTIOUS_ALPHA = 2.0     # تريل حذر
+TRAIL_MULT_SCALP_ALPHA = 1.6        # تريل سكالب
+
 # pacing / keepalive
 ADAPTIVE_PACING = True
 BASE_SLEEP = 10        # نوم عادي بعيدًا عن الإغلاق
@@ -232,6 +267,7 @@ print(colored(f"✅ NEW: OPPOSITE SIGNAL WAITING - Only open opposite RF signals
 print(colored(f"✅ NEW: CORRECTED WICK HARVESTING - Upper wick for LONG, Lower wick for SHORT", "green"))
 print(colored(f"✅ NEW: BREAKOUT ENGINE - Independent explosive move detection & trading", "green"))
 print(colored(f"✅ NEW: EMERGENCY PROTECTION LAYER - Smart Pump/Crash response system", "green"))
+print(colored(f"✅ NEW: SMART ALPHA PACK - Breakout voting, TP0, Thrust Lock, Adaptive trailing", "green"))
 print(colored(f"KEEPALIVE: url={'SET' if SELF_URL else 'NOT SET'} • every {KEEPALIVE_SECONDS}s", "yellow"))
 print(colored(f"BINGX_POSITION_MODE={BINGX_POSITION_MODE}", "yellow"))
 print(colored(f"✅ HARDENING PACK: State persistence, logging, watchdog, network guard ENABLED", "green"))
@@ -794,7 +830,13 @@ state={
     # ✅ NEW: BREAKOUT ENGINE STATE
     "breakout_active": False,          # هل نحن في وضع انفجار نشط؟
     "breakout_direction": None,        # 'bull' أو 'bear'
-    "breakout_entry_price": None       # سعر الدخول أثناء الانفجار
+    "breakout_entry_price": None,      # سعر الدخول أثناء الانفجار
+    # ✅ SMART ALPHA PACK STATE FIELDS
+    "_tp0_done": False,                # TP0 quick cash executed
+    "thrust_locked": False,            # Thrust Lock active
+    "breakout_score": 0.0,             # Breakout voting score
+    "breakout_votes_detail": {},       # Detailed breakout factors
+    "opened_by_breakout": False        # Position opened by breakout engine
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -839,7 +881,13 @@ def sync_from_exchange_once():
                 # ✅ NEW: Reset breakout state on sync
                 "breakout_active": False,
                 "breakout_direction": None,
-                "breakout_entry_price": None
+                "breakout_entry_price": None,
+                # ✅ SMART ALPHA PACK: Reset on sync
+                "_tp0_done": False,
+                "thrust_locked": False,
+                "breakout_score": 0.0,
+                "breakout_votes_detail": {},
+                "opened_by_breakout": False
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -1142,6 +1190,269 @@ def get_trail_multiplier(ind: dict) -> float:
     else:
         return TRAIL_MULT_CHOP    # Choppy market
 
+# =============================================================================
+# ✅ SMART ALPHA PACK FUNCTIONS
+# =============================================================================
+
+def breakout_votes(df: pd.DataFrame, ind: dict, prev_ind: dict) -> tuple:
+    """
+    نظام تصويت الانفجار: يحسب درجة ثقة الانفجار من 0-5
+    Returns: (score, vote_details)
+    """
+    votes = 0.0
+    vote_details = {}
+    
+    try:
+        if len(df) < max(BREAKOUT_LOOKBACK_BARS, 20) + 2:
+            return 0.0, {"error": "Insufficient data"}
+            
+        current_idx = -1
+        price = float(df["close"].iloc[current_idx])
+        
+        # 1. ATR Spike Vote
+        atr_now = float(ind.get("atr") or 0.0)
+        atr_prev = float(prev_ind.get("atr") or atr_now)
+        
+        if atr_prev > 0:
+            atr_ratio = atr_now / atr_prev
+            if atr_ratio >= BREAKOUT_HARD_ATR_SPIKE:
+                votes += 1.0
+                vote_details["atr_spike"] = f"Hard ({atr_ratio:.2f}x)"
+            elif atr_ratio >= BREAKOUT_SOFT_ATR_SPIKE:
+                votes += 0.5
+                vote_details["atr_spike"] = f"Soft ({atr_ratio:.2f}x)"
+            else:
+                vote_details["atr_spike"] = f"Normal ({atr_ratio:.2f}x)"
+        
+        # 2. ADX Momentum Vote
+        adx = float(ind.get("adx") or 0.0)
+        adx_prev = float(prev_ind.get("adx") or adx)
+        
+        if adx >= BREAKOUT_ADX_THRESHOLD:
+            votes += 1.0
+            vote_details["adx"] = f"Strong ({adx:.1f})"
+        elif adx >= 18 and adx > adx_prev:
+            votes += 0.5
+            vote_details["adx"] = f"Building ({adx:.1f})"
+        else:
+            vote_details["adx"] = f"Weak ({adx:.1f})"
+        
+        # 3. Volume Spike Vote
+        if len(df) >= 21:
+            current_volume = float(df["volume"].iloc[current_idx])
+            volume_ma = df["volume"].iloc[-21:-1].astype(float).mean()
+            
+            if volume_ma > 0:
+                volume_ratio = current_volume / volume_ma
+                if volume_ratio >= BREAKOUT_VOLUME_SPIKE:
+                    votes += 1.0
+                    vote_details["volume"] = f"Spike ({volume_ratio:.2f}x)"
+                elif volume_ratio >= BREAKOUT_VOLUME_MED:
+                    votes += 0.5
+                    vote_details["volume"] = f"High ({volume_ratio:.2f}x)"
+                else:
+                    vote_details["volume"] = f"Normal ({volume_ratio:.2f}x)"
+        
+        # 4. Price Breakout Vote
+        recent_highs = df["high"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
+        recent_lows = df["low"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
+        
+        if len(recent_highs) > 0 and len(recent_lows) > 0:
+            highest_high = recent_highs.max()
+            lowest_low = recent_lows.min()
+            
+            if price > highest_high:
+                votes += 1.0
+                vote_details["price_break"] = f"New High (>{highest_high:.6f})"
+            elif price > recent_highs.iloc[-10:].max() if len(recent_highs) >= 10 else price > highest_high:
+                votes += 0.5
+                vote_details["price_break"] = f"Near High"
+            elif price < lowest_low:
+                votes += 1.0
+                vote_details["price_break"] = f"New Low (<{lowest_low:.6f})"
+            elif price < recent_lows.iloc[-10:].min() if len(recent_lows) >= 10 else price < lowest_low:
+                votes += 0.5
+                vote_details["price_break"] = f"Near Low"
+            else:
+                vote_details["price_break"] = "Within Range"
+        
+        # 5. RSI Directional Vote
+        rsi = float(ind.get("rsi") or 50.0)
+        if rsi >= 60:  # Overbought but strong
+            votes += 0.5
+            vote_details["rsi"] = f"Strong Bull ({rsi:.1f})"
+        elif rsi <= 40:  # Oversold but strong
+            votes += 0.5
+            vote_details["rsi"] = f"Strong Bear ({rsi:.1f})"
+        else:
+            vote_details["rsi"] = f"Neutral ({rsi:.1f})"
+            
+        vote_details["total_score"] = f"{votes:.1f}/5.0"
+        
+    except Exception as e:
+        print(colored(f"⚠️ breakout_votes error: {e}", "yellow"))
+        logging.error(f"breakout_votes error: {e}")
+        vote_details["error"] = str(e)
+    
+    return votes, vote_details
+
+def tp0_quick_cash(ind: dict) -> bool:
+    """
+    TP0: جني سريع عند 0.2% ربح
+    يُنفّذ مرة واحدة فقط لكل صفقة
+    """
+    if not state["open"] or state["qty"] <= 0 or state.get("_tp0_done", False):
+        return False
+        
+    try:
+        price = ind.get("price") or price_now() or state["entry"]
+        entry = state["entry"]
+        side = state["side"]
+        
+        if not (price and entry):
+            return False
+            
+        # حساب الربح النسبي
+        rr = (price - entry) / entry * 100 * (1 if side == "long" else -1)
+        
+        if rr >= TP0_PROFIT_PCT:
+            # حساب كمية الإغلاق (بحد أقصى 10% أو 1 USDT)
+            usdt_value = state["qty"] * price
+            close_frac = min(TP0_CLOSE_FRAC, TP0_MAX_USDT / usdt_value) if usdt_value > 0 else TP0_CLOSE_FRAC
+            
+            if close_frac > 0:
+                close_partial(close_frac, f"TP0 Quick Cash @ {rr:.2f}%")
+                state["_tp0_done"] = True
+                print(colored(f"💰 TP0: Quick cash taken at {rr:.2f}% profit", "cyan"))
+                logging.info(f"TP0_QUICK_CASH: {rr:.2f}% profit, closed {close_frac*100:.1f}%")
+                return True
+                
+    except Exception as e:
+        print(colored(f"⚠️ tp0_quick_cash error: {e}", "yellow"))
+        logging.error(f"tp0_quick_cash error: {e}")
+        
+    return False
+
+def thrust_lock(df: pd.DataFrame, ind: dict) -> bool:
+    """
+    Thrust Lock: كشف الترند القوي وركوبه
+    يرجع True إذا تم تفعيل القفل
+    """
+    if not state["open"] or state["qty"] <= 0 or state.get("thrust_locked", False):
+        return False
+        
+    try:
+        if len(df) < THRUST_ATR_BARS + 20:
+            return False
+            
+        # 1. تحقق من اتجاه ATR (يجب أن يرتفع لـ 3 شموع متتالية)
+        atr_values = []
+        for i in range(1, THRUST_ATR_BARS + 1):
+            if len(df) >= i + 1:
+                atr_val = float(compute_indicators(df.iloc[:-i]).get("atr", 0))
+                atr_values.append(atr_val)
+        
+        atr_rising = len(atr_values) >= THRUST_ATR_BARS
+        for i in range(1, len(atr_values)):
+            if atr_values[i] >= atr_values[i-1]:
+                atr_rising = False
+                break
+        
+        # 2. تحقق من حجم الترس (يجب أن يكون أعلى من المتوسط)
+        current_volume = float(df["volume"].iloc[-1])
+        volume_ma = df["volume"].iloc[-21:-1].astype(float).mean()
+        volume_spike = current_volume > volume_ma * THRUST_VOLUME_FACTOR if volume_ma > 0 else False
+        
+        if atr_rising and volume_spike and state.get("trade_mode") == "TREND":
+            # تفعيل Thrust Lock
+            state["thrust_locked"] = True
+            
+            # ضبط بريك إيفن
+            state["breakeven"] = state["entry"]
+            
+            # حساب تريل شانديلييه
+            price = ind.get("price") or float(df["close"].iloc[-1])
+            atr = ind.get("atr", 0)
+            
+            if state["side"] == "long":
+                lookback_lows = df["low"].iloc[-CHANDELIER_LOOKBACK:].astype(float)
+                chandelier_stop = lookback_lows.min() - atr * CHANDELIER_ATR_MULT
+                state["trail"] = max(state.get("trail") or chandelier_stop, chandelier_stop)
+            else:
+                lookback_highs = df["high"].iloc[-CHANDELIER_LOOKBACK:].astype(float)
+                chandelier_stop = lookback_highs.max() + atr * CHANDELIER_ATR_MULT
+                state["trail"] = min(state.get("trail") or chandelier_stop, chandelier_stop)
+            
+            print(colored(f"🔒 THRUST LOCK: Activated with Chandelier exit", "green"))
+            logging.info(f"THRUST_LOCK: Activated - ATR rising & volume spike")
+            return True
+            
+    except Exception as e:
+        print(colored(f"⚠️ thrust_lock error: {e}", "yellow"))
+        logging.error(f"thrust_lock error: {e}")
+        
+    return False
+
+def get_adaptive_trail_multiplier(breakout_score: float, trade_mode: str) -> float:
+    """
+    تريل متكيّف بناءً على قوة الانفجار ونمط التداول
+    """
+    if breakout_score >= 3.0:
+        return TRAIL_MULT_STRONG_ALPHA  # ترند قوي
+    elif breakout_score >= 2.0:
+        return TRAIL_MULT_CAUTIOUS_ALPHA  # ترند حذر
+    elif trade_mode == "SCALP":
+        return TRAIL_MULT_SCALP_ALPHA  # سكالب
+    else:
+        return ATR_MULT_TRAIL  # الإعداد الأساسي
+
+def smart_alpha_features(df: pd.DataFrame, ind: dict, prev_ind: dict, info: dict) -> str:
+    """
+    مدير الميزات الذكية - يُستدعى من smart_post_entry_manager
+    Returns: action_type إذا تم تنفيذ إجراء
+    """
+    if not state["open"] or state["qty"] <= 0:
+        return None
+        
+    action = None
+    
+    try:
+        # 1. TP0 Quick Cash (الأولوية الأولى)
+        if tp0_quick_cash(ind):
+            action = "TP0_QUICK_CASH"
+            
+        # 2. Breakout Voting (لتحديث النقاط فقط)
+        breakout_score, vote_details = breakout_votes(df, ind, prev_ind)
+        state["breakout_score"] = breakout_score
+        state["breakout_votes_detail"] = vote_details
+        
+        # 3. Thrust Lock (للترند القوي)
+        if state.get("trade_mode") == "TREND" and not state.get("thrust_locked"):
+            if thrust_lock(df, ind):
+                action = "THRUST_LOCK_ACTIVATED"
+                
+        # 4. Adaptive Trailing (تحديث المضروب فقط)
+        if state.get("breakout_active") or state.get("thrust_locked"):
+            adaptive_mult = get_adaptive_trail_multiplier(
+                breakout_score, 
+                state.get("trade_mode", "SCALP")
+            )
+            # تخزين المضروب للتريل المتكيف (سيُستخدم في المنطق الرئيسي)
+            state["_adaptive_trail_mult"] = adaptive_mult
+            
+        # تسجيل النقاط إذا كانت عالية
+        if breakout_score >= 3.0:
+            print(colored(f"🎯 BREAKOUT SCORE: {breakout_score:.1f}/5.0 - Strong momentum", "cyan"))
+            for factor, detail in vote_details.items():
+                if factor != "total_score":
+                    print(colored(f"   📊 {factor}: {detail}", "blue"))
+                    
+    except Exception as e:
+        print(colored(f"⚠️ smart_alpha_features error: {e}", "yellow"))
+        logging.error(f"smart_alpha_features error: {e}")
+        
+    return action
+
 # ====== NEW: SMART POST-ENTRY MANAGEMENT ======
 def determine_trade_mode(df: pd.DataFrame, ind: dict) -> str:
     """
@@ -1367,6 +1678,12 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if not state["open"] or state["qty"] <= 0:
         return None
     
+    # ✅ SMART ALPHA PACK: تشغيل الميزات الذكية أولاً
+    prev_ind = compute_indicators(df.iloc[:-1]) if len(df) >= 2 else ind
+    alpha_action = smart_alpha_features(df, ind, prev_ind, info)
+    if alpha_action:
+        return alpha_action
+    
     # تحديد نمط الصفقة إذا لم يكن محددًا
     if state.get("trade_mode") is None:
         trade_mode = determine_trade_mode(df, ind)
@@ -1432,7 +1749,14 @@ def open_market(side, qty, price):
         # ✅ NEW: Reset breakout state on new position
         "breakout_active": False,
         "breakout_direction": None,
-        "breakout_entry_price": None
+        "breakout_entry_price": None,
+        # ✅ SMART ALPHA PACK: Reset on new position
+        "_tp0_done": False,
+        "thrust_locked": False,
+        "breakout_score": 0.0,
+        "breakout_votes_detail": {},
+        "opened_by_breakout": False,
+        "_adaptive_trail_mult": None
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1533,7 +1857,14 @@ def reset_after_full_close(reason, prev_side=None):
         # ✅ NEW: Reset breakout state on full close
         "breakout_active": False,
         "breakout_direction": None,
-        "breakout_entry_price": None
+        "breakout_entry_price": None,
+        # ✅ SMART ALPHA PACK: Reset on full close
+        "_tp0_done": False,
+        "thrust_locked": False,
+        "breakout_score": 0.0,
+        "breakout_votes_detail": {},
+        "opened_by_breakout": False,
+        "_adaptive_trail_mult": None
     })
     
     # ✅ PATCH: ضع الانتظار للإشارة المعاكسة
@@ -1708,6 +2039,9 @@ def smart_exit_check(info, ind):
     current_tp1_pct_pct = current_tp1_pct * 100.0
     current_trail_activate_pct = current_trail_activate * 100.0
 
+    # ✅ SMART ALPHA PACK: استخدام التريل المتكيف إذا متوفر
+    trail_mult_to_use = state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL
+
     # ✅ PATCH: TP1 fallback if trade_mode not decided yet
     if state.get("trade_mode") is None:
         if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
@@ -1748,15 +2082,15 @@ def smart_exit_check(info, ind):
         return None
 
     # Trailing ATR
-    if rr >= current_trail_activate_pct and atr and ATR_MULT_TRAIL > 0:
-        gap = atr * ATR_MULT_TRAIL
+    if rr >= current_trail_activate_pct and atr and trail_mult_to_use > 0:
+        gap = atr * trail_mult_to_use
         if side == "long":
             new_trail = px - gap
             state["trail"] = max(state["trail"] or new_trail, new_trail)
             if state["breakeven"] is not None:
                 state["trail"] = max(state["trail"], state["breakeven"])
             if px < state["trail"]:
-                close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                close_market_strict(f"TRAIL_ATR({trail_mult_to_use}x)")
                 return True
         else:
             new_trail = px + gap
@@ -1764,7 +2098,7 @@ def smart_exit_check(info, ind):
             if state["breakeven"] is not None:
                 state["trail"] = min(state["trail"], state["breakeven"])
             if px > state["trail"]:
-                close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
+                close_market_strict(f"TRAIL_ATR({trail_mult_to_use}x)")
                 return True
     return None
 
@@ -1824,6 +2158,15 @@ def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: fl
     
     price = ind.get("price") or float(df["close"].iloc[-1])
     
+    # ✅ SMART ALPHA PACK: استخدام نظام التصويت للانفجارات
+    breakout_score, vote_details = breakout_votes(df, ind, prev_ind)
+    
+    # فلتر بناءً على نقاط التصويت
+    if breakout_score < 3.0:
+        print(colored(f"⛔ BREAKOUT: Score too low ({breakout_score:.1f}/5.0) - skipping", "yellow"))
+        logging.warning(f"BREAKOUT_ENGINE: Score filter blocked - {breakout_score:.1f}/5.0")
+        return False
+    
     # ✅ ENHANCED 2: فلتر السيولة للانفجارات
     if spread_bps is not None and spread_bps > SPREAD_GUARD_BPS:
         print(colored(f"⛔ BREAKOUT: Spread too high ({fmt(spread_bps,2)}bps) - skipping entry", "yellow"))
@@ -1849,8 +2192,11 @@ def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: fl
         state["breakout_active"] = True
         state["breakout_direction"] = "bull"
         state["breakout_entry_price"] = price
-        print(colored(f"⚡ BREAKOUT ENGINE: BULLISH EXPLOSION - ENTERING LONG", "green"))
-        logging.info(f"BREAKOUT_ENGINE: Bullish explosion - LONG {qty} @ {price}")
+        state["opened_by_breakout"] = True
+        state["breakout_score"] = breakout_score
+        state["breakout_votes_detail"] = vote_details
+        print(colored(f"⚡ BREAKOUT ENGINE: BULLISH EXPLOSION - ENTERING LONG (Score: {breakout_score:.1f}/5.0)", "green"))
+        logging.info(f"BREAKOUT_ENGINE: Bullish explosion - LONG {qty} @ {price} - Score: {breakout_score:.1f}")
         return True
         
     elif breakout_signal == "BEAR_BREAKOUT":
@@ -1858,8 +2204,11 @@ def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: fl
         state["breakout_active"] = True  
         state["breakout_direction"] = "bear"
         state["breakout_entry_price"] = price
-        print(colored(f"⚡ BREAKOUT ENGINE: BEARISH CRASH - ENTERING SHORT", "red"))
-        logging.info(f"BREAKOUT_ENGINE: Bearish crash - SHORT {qty} @ {price}")
+        state["opened_by_breakout"] = True
+        state["breakout_score"] = breakout_score
+        state["breakout_votes_detail"] = vote_details
+        print(colored(f"⚡ BREAKOUT ENGINE: BEARISH CRASH - ENTERING SHORT (Score: {breakout_score:.1f}/5.0)", "red"))
+        logging.info(f"BREAKOUT_ENGINE: Bearish crash - SHORT {qty} @ {price} - Score: {breakout_score:.1f}")
         return True
     
     return False
@@ -1900,6 +2249,7 @@ def handle_breakout_exits(df: pd.DataFrame, ind: dict, prev_ind: dict) -> bool:
         state["breakout_active"] = False
         state["breakout_direction"] = None  
         state["breakout_entry_price"] = None
+        state["opened_by_breakout"] = False
         
         return True
         
@@ -2039,6 +2389,10 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     if state["breakout_active"]:
         print(colored(f"   ⚡ BREAKOUT MODE ACTIVE: {state['breakout_direction'].upper()} - Monitoring volatility...", "cyan"))
     
+    # ✅ SMART ALPHA PACK: Display breakout score if available
+    if state.get("breakout_score", 0) >= 3.0:
+        print(colored(f"   🎯 BREAKOUT SCORE: {state['breakout_score']:.1f}/5.0", "cyan"))
+    
     print(f"   ⏱️ Candle closes in ~ {left_s}s")
     print()
 
@@ -2054,6 +2408,15 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         print(f"   🎯 Management: Scale-ins={state['scale_ins']}/{SCALE_IN_MAX_STEPS}  Scale-outs={state['scale_outs']}  Trail={fmt(state['trail'])}")
         print(f"   📊 TP1_done={state['tp1_done']}  Breakeven={fmt(state['breakeven'])}  HighestProfit={fmt(state['highest_profit_pct'],2)}%")
         print(f"   🔧 Trade Mode: {trade_mode_display}  Targets Achieved: {targets_achieved}")
+        
+        # ✅ SMART ALPHA PACK: Display additional features
+        if state.get("_tp0_done"):
+            print(colored(f"   💰 TP0: Quick cash taken", "green"))
+        if state.get("thrust_locked"):
+            print(colored(f"   🔒 THRUST LOCK: Active", "cyan"))
+        if state.get("opened_by_breakout"):
+            print(colored(f"   ⚡ OPENED BY BREAKOUT", "magenta"))
+            
         if state['last_action']:
             print(f"   🔄 Last Action: {state['last_action']} - {state['action_reason']}")
     else:
@@ -2097,6 +2460,11 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         trail_mult = get_trail_multiplier({**ind, "price": info.get("price")})
         trail_type = "STRONG" if trail_mult == TRAIL_MULT_STRONG else "MED" if trail_mult == TRAIL_MULT_MED else "CHOP"
         print(f"   🛡️ Trail Multiplier: {trail_mult} ({trail_type})")
+        
+        # ✅ SMART ALPHA PACK: Adaptive trailing info
+        if state.get("_adaptive_trail_mult"):
+            adaptive_type = "STRONG" if state["_adaptive_trail_mult"] == TRAIL_MULT_STRONG_ALPHA else "CAUTIOUS" if state["_adaptive_trail_mult"] == TRAIL_MULT_CAUTIOUS_ALPHA else "SCALP"
+            print(colored(f"   🎯 ADAPTIVE TRAIL: {state['_adaptive_trail_mult']} ({adaptive_type})", "magenta"))
         
         # ✅ NEW: Advanced Profit Taking Status
         trade_mode = state.get('trade_mode')
@@ -2304,7 +2672,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER — SMART ALPHA PACK"
 
 @app.route("/metrics")
 def metrics():
@@ -2327,7 +2695,13 @@ def metrics():
             "action_reason": state.get("action_reason"),
             "highest_profit_pct": state.get("highest_profit_pct", 0),
             "trade_mode": state.get("trade_mode"),
-            "profit_targets_achieved": state.get("profit_targets_achieved", 0)
+            "profit_targets_achieved": state.get("profit_targets_achieved", 0),
+            # ✅ SMART ALPHA PACK METRICS
+            "breakout_score": state.get("breakout_score", 0),
+            "breakout_votes_detail": state.get("breakout_votes_detail", {}),
+            "opened_by_breakout": state.get("opened_by_breakout", False),
+            "tp0_done": state.get("_tp0_done", False),
+            "thrust_locked": state.get("thrust_locked", False)
         },
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
         "waiting_for_signal": wait_for_next_signal_side,
@@ -2351,6 +2725,12 @@ def metrics():
             "scalp_targets": SCALP_TARGETS,
             "trend_targets": TREND_TARGETS,
             "scale_in_disabled": True
+        },
+        "smart_alpha_pack": {
+            "tp0_profit_pct": TP0_PROFIT_PCT,
+            "tp0_close_frac": TP0_CLOSE_FRAC,
+            "thrust_atr_bars": THRUST_ATR_BARS,
+            "adaptive_trail_enabled": True
         }
     })
 
@@ -2373,7 +2753,12 @@ def health():
         "waiting_for_signal": wait_for_next_signal_side,
         "fakeout_protection_active": state.get("fakeout_pending", False),
         "breakout_active": state.get("breakout_active", False),
-        "emergency_protection_enabled": EMERGENCY_PROTECTION_ENABLED
+        "emergency_protection_enabled": EMERGENCY_PROTECTION_ENABLED,
+        # ✅ SMART ALPHA PACK HEALTH
+        "breakout_score": state.get("breakout_score", 0),
+        "tp0_done": state.get("_tp0_done", False),
+        "thrust_locked": state.get("thrust_locked", False),
+        "smart_alpha_features": True
     }), 200
 
 @app.route("/ping")
@@ -2381,7 +2766,7 @@ def ping(): return "pong", 200
 
 # ------------ Boot Sequence ------------
 if __name__ == "__main__":
-    print("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS...")
+    print("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS & SMART ALPHA PACK...")
     
     # HARDENING: Load persisted state
     load_state()
