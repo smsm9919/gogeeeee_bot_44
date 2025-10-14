@@ -149,12 +149,22 @@ REV_ADX_DROP          = globals().get("REV_ADX_DROP", 3.0)
 REV_RSI_LEVEL         = globals().get("REV_RSI_LEVEL", 50)
 REV_RF_CROSS          = globals().get("REV_RF_CROSS", True)
 
+# ---- Exit Protection Layer ----
+MIN_HOLD_BARS        = 3        # أقل عدد شموع لازم يفضل فيها قبل أي إغلاق "اختياري"
+MIN_HOLD_SECONDS     = 120      # أو زمن حد أدنى (احتياطي)
+TRAIL_ONLY_AFTER_TP1 = True     # فعل التريل بعد TP1 فقط (إلا لو ضرب Chand/Thrust)
+RF_HYSTERESIS_BPS    = 8        # بوفر للهسترة لما يحصل عكس مؤقت مع Range Filter
+NO_FULL_CLOSE_BEFORE_TP1 = True # ممنوع قفل كامل قبل TP1 (يسمح بجزئي فقط)
+WICK_MAX_BEFORE_TP1  = 0.25     # أقصى إغلاق جزئي مسموح من حصاد الذيل قبل TP1
+
 # Optional debug flags (no change to existing logs)
 DEBUG_PATIENCE = globals().get("DEBUG_PATIENCE", False)
 DEBUG_HARVEST  = globals().get("DEBUG_HARVEST", False)
+DEBUG_EXIT_GUARD = globals().get("DEBUG_EXIT_GUARD", False)
 
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
+print(colored(f"EXIT PROTECTION: MIN_HOLD={MIN_HOLD_BARS} bars, {MIN_HOLD_SECONDS}s • RF_HYSTERESIS={RF_HYSTERESIS_BPS}bps", "cyan"))
 
 # ------------ File Logging with Rotation (IDEMPOTENT) ------------
 def setup_file_logging():
@@ -532,7 +542,9 @@ state={
     "thrust_locked": False,
     "breakout_score": 0.0,
     "breakout_votes_detail": {},
-    "opened_by_breakout": False
+    "opened_by_breakout": False,
+    "opened_at": None,
+    "_exit_soft_block": False
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -578,7 +590,9 @@ def sync_from_exchange_once():
                 "thrust_locked": False,
                 "breakout_score": 0.0,
                 "breakout_votes_detail": {},
-                "opened_by_breakout": False
+                "opened_by_breakout": False,
+                "opened_at": time.time(),
+                "_exit_soft_block": False
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -937,6 +951,12 @@ def determine_trade_mode(df: pd.DataFrame, ind: dict) -> str:
 def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
     if not state["open"] or state["qty"] <= 0:
         return None
+        
+    # Early exit protection context
+    now_ts = time.time()
+    opened_at = state.get("opened_at") or now_ts
+    elapsed_bar = int(state.get("bars", 0))
+    
     try:
         idx = -1
         o0 = float(df["open"].iloc[idx]); h0 = float(df["high"].iloc[idx])
@@ -952,6 +972,8 @@ def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
         upper_wick_pct = (upper_wick / candle_range) * 100 if candle_range > 0 else 0
         lower_wick_pct = (lower_wick / candle_range) * 100 if candle_range > 0 else 0
         atr = ind.get("atr", 0)
+        
+        # Use guarded close for impulse harvesting
         if atr > 0 and body >= IMPULSE_HARVEST_THRESHOLD * atr:
             candle_direction = 1 if c0 > o0 else -1
             trade_direction = 1 if side == "long" else -1
@@ -960,9 +982,17 @@ def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
                     harvest_frac = 0.50; reason = f"Strong Impulse x{body/atr:.2f} ATR"
                 else:
                     harvest_frac = 0.33; reason = f"Impulse x{body/atr:.2f} ATR"
+                
+                # Apply early exit protection
+                if elapsed_bar < MIN_HOLD_BARS and not state.get("_tp1_done"):
+                    harvest_frac = min(harvest_frac, WICK_MAX_BEFORE_TP1)
+                    reason += " (early guard reduced)"
+                    
                 close_partial(harvest_frac, reason)
+                
                 if not state["breakeven"] and rr >= BREAKEVEN_AFTER * 100:
                     state["breakeven"] = entry
+                    
                 if atr and ATR_MULT_TRAIL > 0:
                     gap = atr * ATR_MULT_TRAIL
                     if side == "long":
@@ -970,12 +1000,26 @@ def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
                     else:
                         state["trail"] = min(state.get("trail") or (current_price + gap), current_price + gap)
                 return "IMPULSE_HARVEST"
+                
+        # Use guarded close for wick harvesting  
         if side == "long" and upper_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
-            close_partial(0.25, f"Upper wick (LONG) {upper_wick_pct:.1f}%")
+            harvest_frac = 0.25
+            if elapsed_bar < MIN_HOLD_BARS and not state.get("_tp1_done"):
+                harvest_frac = min(harvest_frac, WICK_MAX_BEFORE_TP1)
+                if DEBUG_EXIT_GUARD:
+                    logging.info(f"EXIT_GUARD: Reduced wick harvest to {harvest_frac*100:.1f}% (early bars)")
+            close_partial(harvest_frac, f"Upper wick (LONG) {upper_wick_pct:.1f}%")
             return "LONG_WICK_HARVEST"
+            
         if side == "short" and lower_wick_pct >= LONG_WICK_HARVEST_THRESHOLD * 100:
-            close_partial(0.25, f"Lower wick (SHORT) {lower_wick_pct:.1f}%")
+            harvest_frac = 0.25
+            if elapsed_bar < MIN_HOLD_BARS and not state.get("_tp1_done"):
+                harvest_frac = min(harvest_frac, WICK_MAX_BEFORE_TP1)
+                if DEBUG_EXIT_GUARD:
+                    logging.info(f"EXIT_GUARD: Reduced wick harvest to {harvest_frac*100:.1f}% (early bars)")
+            close_partial(harvest_frac, f"Lower wick (SHORT) {lower_wick_pct:.1f}%")
             return "LONG_WICK_HARVEST"
+            
     except Exception as e:
         print(colored(f"⚠️ handle_impulse_and_long_wicks error: {e}", "yellow"))
         logging.error(f"handle_impulse_and_long_wicks error: {e}")
@@ -1078,6 +1122,20 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if not state["open"] or state["qty"] <= 0:
         return None
 
+    # ---- Early exit protection setup ----
+    now_ts = info.get("time") or time.time()
+    opened_at = state.get("opened_at") or now_ts
+    state.setdefault("opened_at", opened_at)
+    elapsed_s = max(0, now_ts - state["opened_at"])
+    elapsed_bar = int(state.get("bars", 0))
+
+    # TP0 guard - limit early closes
+    def _tp0_guard_close(frac, label):
+        max_frac = WICK_MAX_BEFORE_TP1 if not state.get("_tp1_done") else frac
+        frac = min(frac, max_frac)
+        if frac > 0:
+            close_partial(frac, label)
+
     # ---- Smart alpha pack first ----
     prev_ind = compute_indicators(df.iloc[:-1]) if len(df) >= 2 else ind
     alpha_action = smart_alpha_features(df, ind, prev_ind, info)
@@ -1100,15 +1158,11 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if ratchet_action:
         return ratchet_action
 
-    # ---- Smart Harvest v2 helpers (local only) ----
-    def _adaptive_trail_mult(_ind: dict) -> float:
-        adx = float(_ind.get("adx") or 0.0)
-        rsi = float(_ind.get("rsi") or 50.0)
-        side = state.get("side")
-        strong = (adx >= 30 and ((side == "long" and rsi >= 55) or (side == "short" and rsi <= 45)))
-        weak   = (adx < 20)
-        return 2.4 if strong else (1.6 if weak else 2.0)
+    # Delay trail activation until TP1 if configured
+    if TRAIL_ONLY_AFTER_TP1 and not state.get("_tp1_done"):
+        state["_adaptive_trail_mult"] = 0.0  # Disable regular ATR trail until TP1
 
+    # ---- Smart Harvest v2 with protection ----
     def smart_harvest(_df: pd.DataFrame, _ind: dict, _info: dict):
         if not state.get("open") or state.get("qty", 0) <= 0:
             return
@@ -1121,37 +1175,37 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
         atr = float(_ind.get("atr") or 0.0)
 
         if not state.get("_tp1_done") and rr >= TP1_PCT_SCALED * 100.0:
-            close_partial(TP1_FRAC, f"TP1 @{TP1_PCT_SCALED*100:.2f}%")
+            _tp0_guard_close(TP1_FRAC, f"TP1 @{TP1_PCT_SCALED*100:.2f}%")
             state["_tp1_done"] = True
             state["breakeven"] = e
 
         if not state.get("_tp2_done") and rr >= TP2_PCT_SCALED * 100.0:
-            close_partial(TP2_FRAC, f"TP2 @{TP2_PCT_SCALED*100:.2f}%")
+            _tp0_guard_close(TP2_FRAC, f"TP2 @{TP2_PCT_SCALED*100:.2f}%")
             state["_tp2_done"] = True
 
         if rr > state.get("highest_profit_pct", 0.0):
             state["highest_profit_pct"] = rr
         hp = state.get("highest_profit_pct", 0.0)
         if hp and rr < hp * RATCHET_LOCK_PCT:
-            close_partial(0.50, f"Ratchet lock {hp:.2f}%→{rr:.2f}%")
+            _tp0_guard_close(0.50, f"Ratchet lock {hp:.2f}%→{rr:.2f}%")
             state["highest_profit_pct"] = rr
 
+        # Trail management with protection
         if atr and rr >= (TP1_PCT_SCALED * 100.0):
             mult = _adaptive_trail_mult(_ind)
             if side == "long":
                 new_trail = px - atr * mult
                 state["trail"] = max(state.get("trail") or new_trail, new_trail, state.get("breakeven") or new_trail)
                 if px < state["trail"]:
-                    close_market_strict(f"TRAIL_ATR({mult}x)")
+                    _safe_full_close(f"TRAIL_ATR({mult}x)")
             else:
                 new_trail = px + atr * mult
                 state["trail"] = min(state.get("trail") or new_trail, new_trail, state.get("breakeven") or new_trail)
                 if px > state["trail"]:
-                    close_market_strict(f"TRAIL_ATR({mult}x)")
+                    _safe_full_close(f"TRAIL_ATR({mult}x)")
             if DEBUG_HARVEST:
                 logging.info(f"HARV rr={rr:.2f}% trail_mult={mult} hp={state.get('highest_profit_pct',0):.2f}")
 
-    # ---- invoke Smart Harvest v2 (non-intrusive) ----
     smart_harvest(df, ind, info)
 
     if state["trade_mode"] == "SCALP":
@@ -1199,7 +1253,9 @@ def open_market(side, qty, price):
         "opened_by_breakout": False,
         "_adaptive_trail_mult": None,
         "_tp1_done": state.get("_tp1_done", False),
-        "_tp2_done": state.get("_tp2_done", False)
+        "_tp2_done": state.get("_tp2_done", False),
+        "opened_at": time.time(),
+        "_exit_soft_block": False
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1290,7 +1346,9 @@ def reset_after_full_close(reason, prev_side=None):
         "opened_by_breakout": False,
         "_adaptive_trail_mult": None,
         "_tp1_done": False,
-        "_tp2_done": False
+        "_tp2_done": False,
+        "opened_at": None,
+        "_exit_soft_block": False
     })
     if prev_side == "long":
         wait_for_next_signal_side = "sell"
@@ -1363,82 +1421,112 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     if not (STRATEGY=="smart" and USE_SMART_EXIT and state["open"]):
         return None
 
-    # ---- Patience Guard helpers (local only) ----
-    def _reverse_consensus(_df: pd.DataFrame, _ind: dict, _side: str):
-        votes = 0
-        hints = []
-        rsi = float(_ind.get("rsi") or 50.0)
-        adx = float(_ind.get("adx") or 0.0)
-        adx_prev = float(_ind.get("adx_prev") or adx)
-        if _side == "long" and rsi < REV_RSI_LEVEL:
-            votes += 1; hints.append("RSI<50")
-        if _side == "short" and rsi > (100-REV_RSI_LEVEL):
-            votes += 1; hints.append("RSI>50")
-        if adx_prev and (adx_prev - adx) >= REV_ADX_DROP:
-            votes += 1; hints.append(f"ADX↓{adx_prev:.1f}->{adx:.1f}")
-        if REV_RF_CROSS:
-            px   = _ind.get("price")
-            rf   = _ind.get("rfilt") or _ind.get("rf")
-            ma20 = _ind.get("ma20")
-            try:
-                if px is not None and rf is not None:
-                    if (_side == "long" and px < rf) or (_side == "short" and px > rf):
-                        votes += 1; hints.append("RF cross")
-                elif px is not None and ma20 is not None:
-                    if (_side == "long" and px < ma20) or (_side == "short" and px > ma20):
-                        votes += 1; hints.append("MA cross")
-            except Exception:
-                pass
-        return votes, (", ".join(hints) if hints else "—")
-
-    def _patience_guard(_df: pd.DataFrame, _ind: dict, _info: dict) -> bool:
-        if not state.get("open"):
-            return False
-        if int(state.get("bars", 0)) < int(PATIENCE_MIN_BARS):
-            if DEBUG_PATIENCE: logging.info("PAT: early-bars block")
-            return True
-        side = state.get("side")
-        votes, why = _reverse_consensus(_df, _ind, side)
-        if votes < PATIENCE_NEED_CONSENSUS:
-            if DEBUG_PATIENCE: logging.info(f"PAT: consensus={votes}/{PATIENCE_NEED_CONSENSUS} ({why})")
-            return True
-        try:
-            closes = _df["close"].astype(float)
-            opens  = _df["open"].astype(float)
-            last2_red   = (closes.iloc[-1] < opens.iloc[-1]) and (closes.iloc[-2] < opens.iloc[-2])
-            last2_green = (closes.iloc[-1] > opens.iloc[-1]) and (closes.iloc[-2] > opens.iloc[-2])
-            if (side == "long" and not last2_red) or (side == "short" and not last2_green):
-                if DEBUG_PATIENCE: logging.info("PAT: candle-confirm not met")
-                return True
-        except Exception:
-            if DEBUG_PATIENCE: logging.info("PAT: candle-confirm read error → hold")
-            return True
-        if DEBUG_PATIENCE: logging.info(f"PAT: allow close (consensus={votes}, {why})")
-        return False
-
-    # ---- cached df/prev_ind usage ----
     df_local = df_cached if df_cached is not None else fetch_ohlcv()
+    
+    # ---- Early exit protection calculations ----
+    now_ts = info.get("time") or time.time()
+    opened_at = state.get("opened_at") or now_ts
+    elapsed_s = max(0, now_ts - opened_at)
+    elapsed_bar = int(state.get("bars", 0))
+
+    def _allow_full_close(reason: str) -> bool:
+        """Prevent early full closes unless hard conditions met"""
+        if elapsed_bar >= MIN_HOLD_BARS or elapsed_s >= MIN_HOLD_SECONDS:
+            return True
+        # Early close allowed only for these hard reasons
+        hard_reasons = ("TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT", "FORCE", "STOP", "EMERGENCY")
+        return any(tag in reason.upper() for tag in hard_reasons)
+
+    # ---- Enhanced Patience Guard ----
+    side = state.get("side")
+    rsi = float(ind.get("rsi") or 50.0)
+    adx = float(ind.get("adx") or 0.0)
+    adx_prev = float(ind.get("adx_prev") or adx)
+    rf = info.get("filter")
+    px = ind.get("price") or info.get("price")
+
+    reverse_votes = 0
+    vote_details = []
+
+    # RSI vote
+    if side == "long" and rsi < REV_RSI_LEVEL:
+        reverse_votes += 1
+        vote_details.append("RSI<50")
+    if side == "short" and rsi > (100-REV_RSI_LEVEL):
+        reverse_votes += 1  
+        vote_details.append("RSI>50")
+
+    # ADX vote
+    if adx_prev and (adx_prev - adx) >= REV_ADX_DROP:
+        reverse_votes += 1
+        vote_details.append(f"ADX↓{adx_prev:.1f}->{adx:.1f}")
+
+    # RF hysteresis vote
+    if REV_RF_CROSS and px is not None and rf is not None:
+        try:
+            bps_diff = abs((px - rf) / rf) * 10000
+            if (side == "long" and px < rf - (RF_HYSTERESIS_BPS/10000.0)*rf) or \
+               (side == "short" and px > rf + (RF_HYSTERESIS_BPS/10000.0)*rf):
+                reverse_votes += 1
+                vote_details.append("RF cross")
+        except Exception:
+            pass
+
+    # Candle confirmation
+    try:
+        closes = df_local["close"].astype(float)
+        opens = df_local["open"].astype(float)
+        last2_red = (closes.iloc[-1] < opens.iloc[-1]) and (closes.iloc[-2] < opens.iloc[-2])
+        last2_green = (closes.iloc[-1] > opens.iloc[-1]) and (closes.iloc[-2] > opens.iloc[-2])
+        candle_ok = (side == "long" and last2_red) or (side == "short" and last2_green)
+    except Exception:
+        candle_ok = False
+
+    # Set exit block flag
+    if (elapsed_bar < MIN_HOLD_BARS or elapsed_s < MIN_HOLD_SECONDS) and (reverse_votes < PATIENCE_NEED_CONSENSUS or not candle_ok):
+        state["_exit_soft_block"] = True
+        if DEBUG_PATIENCE:
+            logging.info(f"PATIENCE: Blocking soft exits (bars:{elapsed_bar}, votes:{reverse_votes}, candle_ok:{candle_ok})")
+    else:
+        state["_exit_soft_block"] = False
+
+    # Safe close functions
+    def _safe_close_partial(frac, reason):
+        if state.get("_exit_soft_block") and not state.get("_tp1_done"):
+            frac = min(frac, WICK_MAX_BEFORE_TP1)
+            if DEBUG_EXIT_GUARD:
+                logging.info(f"EXIT_GUARD: Reduced partial close to {frac*100:.1f}% for: {reason}")
+        close_partial(frac, reason)
+
+    def _safe_full_close(reason):
+        if NO_FULL_CLOSE_BEFORE_TP1 and not state.get("_tp1_done"):
+            if not _allow_full_close(reason):
+                if DEBUG_EXIT_GUARD:
+                    logging.info(f"EXIT_BLOCKED (early): {reason} - bars:{elapsed_bar}, secs:{elapsed_s:.0f}")
+                return False
+                
+        if state.get("_exit_soft_block") and not _allow_full_close(reason):
+            if DEBUG_EXIT_GUARD:
+                logging.info(f"EXIT_BLOCKED (patience): {reason} - votes:{reverse_votes}/{PATIENCE_NEED_CONSENSUS}")
+            return False
+            
+        close_market_strict(reason)
+        return True
+
+    # ---- Rest of existing smart_exit_check logic with safe closes ----
     candle_info = detect_candle_pattern(df_local)
     management_action = advanced_position_management(candle_info, ind)
     if management_action:
         print(colored(f"🎯 MANAGEMENT: {management_action} - {state['action_reason']}", "yellow"))
         logging.info(f"MANAGEMENT_ACTION: {management_action} - {state['action_reason']}")
 
-    # Smart alpha post-entry
     df = df_local
     post_entry_action = smart_post_entry_manager(df_local, ind, info)
     if post_entry_action:
         print(colored(f"🎯 POST-ENTRY: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}", "cyan"))
         logging.info(f"POST_ENTRY_ACTION: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}")
 
-    # Patience guard BEFORE any final close decisions
-    if ENABLE_PATIENCE and _patience_guard(df_local, ind, info):
-        return None
-
-    px = info["price"]; e = state["entry"]; side = state["side"]
-    if e is None or px is None or side is None or e == 0:
-        return None
-
+    # Existing trend/fakeout logic...
     trend_signal = check_trend_confirmation(candle_info, ind, state["side"])
     if state["open"]:
         if (trend_signal == "POSSIBLE_FAKEOUT" and 
@@ -1446,678 +1534,4 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
             state["fakeout_confirm_bars"] == 0):
             state["fakeout_pending"] = True
             state["fakeout_confirm_bars"] = 2
-            state["fakeout_need_side"] = "short" if state["side"] == "long" else "long"
-            state["fakeout_started_at"] = info["time"]
-            print(colored("🕒 WAITING — possible fake reversal detected, holding position...", "yellow"))
-            logging.info("FAKEOUT PROTECTION: Possible fake reversal detected, waiting for confirmation")
-            return None
-        elif state["fakeout_pending"]:
-            if (trend_signal == "CONFIRMED_REVERSAL" and 
-                state["fakeout_need_side"] == ("short" if state["side"] == "long" else "long")):
-                state["fakeout_confirm_bars"] -= 1
-                print(colored(f"🕒 FAKEOUT CONFIRMATION — {state['fakeout_confirm_bars']} bars left", "yellow"))
-                if state["fakeout_confirm_bars"] <= 0:
-                    print(colored("⚠️ CONFIRMED REVERSAL — closing position", "red"))
-                    logging.info("FAKEOUT PROTECTION: Confirmed reversal after fakeout delay")
-                    close_market_strict("CONFIRMED REVERSAL after fakeout delay")
-                    state["fakeout_pending"] = False
-                    state["fakeout_need_side"] = None
-                    state["fakeout_confirm_bars"] = 0
-                    state["fakeout_started_at"] = None
-                    return True
-            elif trend_signal == "CONFIRMED_CONTINUE":
-                state["fakeout_pending"] = False
-                state["fakeout_need_side"] = None
-                state["fakeout_confirm_bars"] = 0
-                state["fakeout_started_at"] = None
-                print(colored("✅ CONTINUE — fakeout ignored, staying in trade", "green"))
-                logging.info("FAKEOUT PROTECTION: Fakeout ignored, continuing in trade")
-
-    rr = (px - e)/e * 100.0 * (1 if side=="long" else -1)
-    atr = ind.get("atr") or 0.0
-    adx = ind.get("adx") or 0.0
-    rsi = ind.get("rsi") or 50.0
-    tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
-    current_tp1_pct = TP1_PCT * tp_multiplier
-    current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
-    current_tp1_pct_pct = current_tp1_pct * 100.0
-    current_trail_activate_pct = current_trail_activate * 100.0
-    trail_mult_to_use = state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL
-
-    if state.get("trade_mode") is None:
-        if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
-            close_partial(TP1_CLOSE_FRAC, f"TP1@{current_tp1_pct_pct:.2f}%")
-            state["tp1_done"] = True
-
-    if side == "long" and adx >= 30 and rsi >= RSI_TREND_BUY:
-        print(colored("💎 HOLD-TP: strong uptrend continues, delaying TP", "cyan"))
-    elif side == "short" and adx >= 30 and rsi <= RSI_TREND_SELL:
-        print(colored("💎 HOLD-TP: strong downtrend continues, delaying TP", "cyan"))
-
-    if state["bars"] < 2:
-        return None
-
-    if rr > state["highest_profit_pct"]:
-        state["highest_profit_pct"] = rr
-        if tp_multiplier > 1.0:
-            print(colored(f"🎯 TREND AMPLIFIER: New high {rr:.2f}% • TP={current_tp1_pct_pct:.2f}% • TrailActivate={current_trail_activate_pct:.2f}%", "green"))
-            logging.info(f"TREND_AMPLIFIER new_high={rr:.2f}% TP={current_tp1_pct_pct:.2f}%")
-
-    if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
-        close_partial(TP1_CLOSE_FRAC, f"TP1@{current_tp1_pct_pct:.2f}%")
-        state["tp1_done"] = True
-        if rr >= BREAKEVEN_AFTER * 100.0:
-            state["breakeven"] = e
-
-    if (state["highest_profit_pct"] >= current_trail_activate_pct and
-        rr < state["highest_profit_pct"] * RATCHET_LOCK_PCT):
-        close_partial(0.5, f"Ratchet Lock @ {state['highest_profit_pct']:.2f}%")
-        state["highest_profit_pct"] = rr
-        return None
-
-    if rr >= current_trail_activate_pct and atr and trail_mult_to_use > 0:
-        gap = atr * trail_mult_to_use
-        if side == "long":
-            new_trail = px - gap
-            state["trail"] = max(state["trail"] or new_trail, new_trail)
-            if state["breakeven"] is not None:
-                state["trail"] = max(state["trail"], state["breakeven"])
-            if px < state["trail"]:
-                close_market_strict(f"TRAIL_ATR({trail_mult_to_use}x)")
-                return True
-        else:
-            new_trail = px + gap
-            state["trail"] = min(state["trail"] or new_trail, new_trail)
-            if state["breakeven"] is not None:
-                state["trail"] = min(state["trail"], state["breakeven"])
-            if px > state["trail"]:
-                close_market_strict(f"TRAIL_ATR({trail_mult_to_use}x)")
-                return True
-    return None
-
-# ------------ BREAKOUT ENGINE (unchanged behavior) ------------
-def detect_breakout(df: pd.DataFrame, ind: dict, prev_ind: dict) -> str:
-    try:
-        if len(df) < BREAKOUT_LOOKBACK_BARS + 2:
-            return None
-        current_idx = -1
-        adx = float(ind.get("adx") or 0.0)
-        atr_now = float(ind.get("atr") or 0.0)
-        atr_prev = float(prev_ind.get("atr") or atr_now)
-        price = float(df["close"].iloc[current_idx])
-        atr_spike = atr_now > atr_prev * BREAKOUT_ATR_SPIKE
-        strong_trend = adx >= BREAKOUT_ADX_THRESHOLD
-        if not (atr_spike and strong_trend):
-            return None
-        recent_highs = df["high"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
-        new_high = price > recent_highs.max() if len(recent_highs) > 0 else False
-        recent_lows = df["low"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
-        new_low = price < recent_lows.min() if len(recent_lows) > 0 else False
-        if new_high: return "BULL_BREAKOUT"
-        elif new_low: return "BEAR_BREAKOUT"
-    except Exception as e:
-        print(colored(f"⚠️ detect_breakout error: {e}", "yellow"))
-        logging.error(f"detect_breakout error: {e}")
-    return None
-
-def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: float, spread_bps: float) -> bool:
-    global state
-    breakout_signal = detect_breakout(df, ind, prev_ind)
-    if not breakout_signal or state["breakout_active"]:
-        return False
-    price = ind.get("price") or float(df["close"].iloc[-1])
-    breakout_score, vote_details = breakout_votes(df, ind, prev_ind)
-    if breakout_score < 3.0:
-        print(colored(f"⛔ BREAKOUT: Score too low ({breakout_score:.1f}/5.0) - skipping", "yellow"))
-        logging.warning(f"BREAKOUT_ENGINE: Score filter blocked - {breakout_score:.1f}/5.0")
-        return False
-    if spread_bps is not None and spread_bps > SPREAD_GUARD_BPS:
-        print(colored(f"⛔ BREAKOUT: Spread too high ({fmt(spread_bps,2)}bps) - skipping entry", "yellow"))
-        logging.warning(f"BREAKOUT_ENGINE: Spread filter blocked entry - {spread_bps}bps")
-        return False
-    qty = compute_size(bal, price)
-    if qty < (LOT_MIN or 1):
-        print(colored(f"⛔ BREAKOUT: Quantity too small ({fmt(qty,4)} < {LOT_MIN or 1}) - skipping", "yellow"))
-        logging.warning(f"BREAKOUT_ENGINE: Quantity below minimum - {qty} < {LOT_MIN or 1}")
-        return False
-    if not can_open(breakout_signal, price):
-        print(colored("⛔ BREAKOUT: Idempotency guard blocked duplicate entry", "yellow"))
-        logging.warning("BREAKOUT_ENGINE: Idempotency guard blocked entry")
-        return False
-    if breakout_signal == "BULL_BREAKOUT":
-        open_market("buy", qty, price)
-        state["breakout_active"] = True
-        state["breakout_direction"] = "bull"
-        state["breakout_entry_price"] = price
-        state["opened_by_breakout"] = True
-        state["breakout_score"] = breakout_score
-        state["breakout_votes_detail"] = vote_details
-        print(colored(f"⚡ BREAKOUT ENGINE: BULLISH EXPLOSION - ENTERING LONG (Score: {breakout_score:.1f}/5.0)", "green"))
-        logging.info(f"BREAKOUT_ENGINE: Bullish explosion - LONG {qty} @ {price} - Score: {breakout_score:.1f}")
-        return True
-    elif breakout_signal == "BEAR_BREAKOUT":
-        open_market("sell", qty, price)
-        state["breakout_active"] = True  
-        state["breakout_direction"] = "bear"
-        state["breakout_entry_price"] = price
-        state["opened_by_breakout"] = True
-        state["breakout_score"] = breakout_score
-        state["breakout_votes_detail"] = vote_details
-        print(colored(f"⚡ BREAKOUT ENGINE: BEARISH CRASH - ENTERING SHORT (Score: {breakout_score:.1f}/5.0)", "red"))
-        logging.info(f"BREAKOUT_ENGINE: Bearish crash - SHORT {qty} @ {price} - Score: {breakout_score:.1f}")
-        return True
-    return False
-
-def handle_breakout_exits(df: pd.DataFrame, ind: dict, prev_ind: dict) -> bool:
-    global state
-    if not state["breakout_active"] or not state["open"]:
-        return False
-    current_idx = -1
-    atr_now = float(ind.get("atr") or 0.0)
-    atr_prev = float(prev_ind.get("atr") or atr_now)
-    volatility_calm = atr_now < atr_prev * BREAKOUT_CALM_THRESHOLD
-    if volatility_calm:
-        direction = state["breakout_direction"]
-        entry_price = state["breakout_entry_price"]
-        current_price = ind.get("price") or float(df["close"].iloc[current_idx])
-        pnl_pct = ((current_price - entry_price) / entry_price * 100 * 
-                  (1 if direction == "bull" else -1))
-        close_market_strict(f"Breakout ended - {pnl_pct:.2f}% PnL")
-        print(colored(f"✅ BREAKOUT ENGINE: {direction.upper()} breakout ended - {pnl_pct:.2f}% PnL", "magenta"))
-        logging.info(f"BREAKOUT_ENGINE: {direction} breakout ended - PnL: {pnl_pct:.2f}%")
-        state["breakout_active"] = False
-        state["breakout_direction"] = None  
-        state["breakout_entry_price"] = None
-        state["opened_by_breakout"] = False
-        return True
-    return False
-
-def breakout_emergency_protection(ind: dict, prev_ind: dict) -> bool:
-    if not (EMERGENCY_PROTECTION_ENABLED and state.get("open")):
-        return False
-    try:
-        adx = float(ind.get("adx") or 0.0)
-        rsi = float(ind.get("rsi") or 50.0)
-        atr_now  = float(ind.get("atr") or 0.0)
-        atr_prev = float(prev_ind.get("atr") or atr_now)
-        price = ind.get("price") or price_now() or state.get("entry")
-        atr_spike = atr_now > atr_prev * EMERGENCY_ATR_SPIKE_RATIO
-        strong_trend = adx >= EMERGENCY_ADX_MIN
-        if not (atr_spike and strong_trend):
-            return False
-        pump  = rsi >= EMERGENCY_RSI_PUMP
-        crash = rsi <= EMERGENCY_RSI_CRASH
-        if not (pump or crash):
-            return False
-        side  = state.get("side")
-        entry = state.get("entry") or price
-        if not (side and entry and price):
-            return False
-        rr_pct = (price - entry) / entry * 100.0 * (1 if side == "long" else -1)
-        print(colored(f"🛡️ EMERGENCY LAYER DETECTED: {side.upper()} | RSI={rsi:.1f} | ADX={adx:.1f} | ATR Spike={atr_now/atr_prev:.2f}x | PnL={rr_pct:.2f}%", "yellow"))
-        logging.info(f"EMERGENCY_LAYER: {side} RSI={rsi} ADX={adx} ATR_ratio={atr_now/atr_prev:.2f} PnL={rr_pct:.2f}%")
-        if (pump and side == "short") or (crash and side == "long"):
-            close_market_strict("EMERGENCY opposite pump/crash — close now")
-            print(colored(f"🛑 EMERGENCY: AGAINST POSITION - FULL CLOSE", "red"))
-            logging.warning(f"EMERGENCY_LAYER: Against position - full close")
-            return True
-        if EMERGENCY_POLICY == "close_always":
-            close_market_strict("EMERGENCY favorable pump/crash — close all")
-            print(colored(f"🟡 EMERGENCY: FAVORABLE - POLICY CLOSE ALL", "yellow"))
-            logging.info(f"EMERGENCY_LAYER: Favorable - policy close all")
-            return True
-        if rr_pct >= EMERGENCY_FULL_CLOSE_PROFIT:
-            close_market_strict(f"EMERGENCY full close @ {rr_pct:.2f}%")
-            print(colored(f"🟢 EMERGENCY: PROFIT TARGET HIT - FULL CLOSE @ {rr_pct:.2f}%", "green"))
-            logging.info(f"EMERGENCY_LAYER: Profit target hit - full close @ {rr_pct:.2f}%")
-            return True
-        harvest = max(0.0, min(1.0, EMERGENCY_HARVEST_FRAC))
-        if harvest > 0:
-            close_partial(harvest, f"EMERGENCY {'PUMP' if pump else 'CRASH'} harvest {harvest*100:.0f}%")
-            print(colored(f"💰 EMERGENCY: HARVEST {harvest*100:.0f}% - PnL={rr_pct:.2f}%", "cyan"))
-            logging.info(f"EMERGENCY_LAYER: Harvest {harvest*100:.0f}% - PnL={rr_pct:.2f}%")
-        state["breakeven"] = entry
-        if atr_now > 0:
-            if side == "long":
-                new_trail = price - atr_now * EMERGENCY_TRAIL_ATR_MULT
-                state["trail"] = max(state.get("trail") or new_trail, new_trail)
-            else:
-                new_trail = price + atr_now * EMERGENCY_TRAIL_ATR_MULT
-                state["trail"] = min(state.get("trail") or new_trail, new_trail)
-            print(colored(f"🛡️ EMERGENCY: BREAKEVEN + TRAIL SET @ {new_trail:.6f}", "blue"))
-            logging.info(f"EMERGENCY_LAYER: Breakeven + trail set @ {new_trail:.6f}")
-        if EMERGENCY_POLICY == "tp_then_close":
-            close_market_strict("EMERGENCY: harvest then full close")
-            print(colored(f"🟡 EMERGENCY: TP_THEN_CLOSE POLICY - FULL CLOSE", "yellow"))
-            logging.info(f"EMERGENCY_LAYER: tp_then_close policy - full close")
-            return True
-        print(colored(f"🟢 EMERGENCY: TP_THEN_TRAIL POLICY - RIDING THE MOVE", "green"))
-        logging.info(f"EMERGENCY_LAYER: tp_then_trail policy - riding the move")
-        return True
-    except Exception as e:
-        print(colored(f"⚠️ breakout_emergency_protection error: {e}", "yellow"))
-        logging.error(f"breakout_emergency_protection error: {e}")
-        return False
-
-# ------------ HUD / snapshot (unchanged) ------------
-def detect_candle_pattern(df: pd.DataFrame):
-    if len(df) < 3:
-        return {"pattern": "NONE", "name_ar": "لا شيء", "name_en": "NONE", "strength": 0}
-    idx = -1
-    o2, h2, l2, c2 = map(float, (df["open"].iloc[idx-2], df["high"].iloc[idx-2], df["low"].iloc[idx-2], df["close"].iloc[idx-2]))
-    o1, h1, l1, c1 = map(float, (df["open"].iloc[idx-1], df["high"].iloc[idx-1], df["low"].iloc[idx-1], df["close"].iloc[idx-1]))
-    o0, h0, l0, c0 = map(float, (df["open"].iloc[idx], df["high"].iloc[idx], df["low"].iloc[idx], df["close"].iloc[idx]))
-    def _candle_stats(o, c, h, l):
-        rng = max(h - l, 1e-12); body = abs(c - o); upper = h - max(o, c); lower = min(o, c) - l
-        return {"range": rng,"body": body,"body_pct": (body / rng) * 100.0,"upper_pct": (upper / rng) * 100.0,"lower_pct": (lower / rng) * 100.0,"bull": c > o,"bear": c < o}
-    s2 = _candle_stats(o2, c2, h2, l2); s1 = _candle_stats(o1, c1, h1, l1); s0 = _candle_stats(o0, c0, h0, l0)
-    if (s2["bear"] and s2["body_pct"] >= 60 and s1["body_pct"] <= 25 and l1 > l2 and s0["bull"] and s0["body_pct"] >= 50 and c0 > (o1 + c1)/2):
-        return {"pattern": "MORNING_STAR", "name_ar": "نجمة الصباح", "name_en": "Morning Star", "strength": 4}
-    if (s2["bull"] and s2["body_pct"] >= 60 and s1["body_pct"] <= 25 and h1 < h2 and s0["bear"] and s0["body_pct"] >= 50 and c0 < (o1 + c1)/2):
-        return {"pattern": "EVENING_STAR", "name_ar": "نجمة المساء", "name_en": "Evening Star", "strength": 4}
-    if (s2["bull"] and s1["bull"] and s0["bull"] and c2 > o2 and c1 > o1 and c0 > o0 and c1 > c2 and c0 > c1 and s0["body_pct"] >= 50 and s1["body_pct"] >= 50 and s2["body_pct"] >= 50):
-        return {"pattern": "THREE_WHITE_SOLDIERS", "name_ar": "الجنود الثلاث البيض", "name_en": "Three White Soldiers", "strength": 4}
-    if (s2["bear"] and s1["bear"] and s0["bear"] and c2 < o2 and c1 < o1 and c0 < o0 and c1 < c2 and c0 < c1 and s0["body_pct"] >= 50 and s1["body_pct"] >= 50 and s2["body_pct"] >= 50):
-        return {"pattern": "THREE_BLACK_CROWS", "name_ar": "الغربان الثلاث السود", "name_en": "Three Black Crows", "strength": 4}
-    if (s1["bear"] and s0["bull"] and o0 <= c1 and c0 >= o1 and s0["body"] > s1["body"]):
-        return {"pattern": "ENGULF_BULL", "name_ar": "الابتلاع الشرائي", "name_en": "Bullish Engulfing", "strength": 3}
-    if (s1["bull"] and s0["bear"] and o0 >= c1 and c0 <= o1 and s0["body"] > s1["body"]):
-        return {"pattern": "ENGULF_BEAR", "name_ar": "الابتلاع البيعي", "name_en": "Bearish Engulfing", "strength": 3}
-    if (s0["body_pct"] <= 30 and s0["lower_pct"] >= 60 and s0["upper_pct"] <= 10 and s0["bull"]):
-        return {"pattern": "HAMMER", "name_ar": "المطرقة", "name_en": "Hammer", "strength": 2}
-    if (s0["body_pct"] <= 30 and s0["upper_pct"] >= 60 and s0["lower_pct"] <= 10 and s0["bear"]):
-        return {"pattern": "SHOOTING_STAR", "name_ar": "النجمة الهاوية", "name_en": "Shooting Star", "strength": 2}
-    if s0["body_pct"] <= 10:
-        return {"pattern": "DOJI", "name_ar": "دوجي", "name_en": "Doji", "strength": 1}
-    if s0["body_pct"] >= 85 and s0["upper_pct"] <= 7 and s0["lower_pct"] <= 7:
-        direction = "BULL" if s0["bull"] else "BEAR"
-        name_ar = "المربوزو الصاعد" if s0["bull"] else "المربوزو الهابط"
-        name_en = f"Marubozu {direction}"
-        return {"pattern": f"MARUBOZU_{direction}", "name_ar": name_ar, "name_en": name_en, "strength": 3}
-    return {"pattern": "NONE", "name_ar": "لا شيء", "name_en": "NONE", "strength": 0}
-
-def get_candle_emoji(pattern):
-    emoji_map = {
-        "MORNING_STAR": "🌅", "EVENING_STAR": "🌇",
-        "THREE_WHITE_SOLDIERS": "💂‍♂️", "THREE_BLACK_CROWS": "🐦‍⬛",
-        "ENGULF_BULL": "🟩", "ENGULF_BEAR": "🟥",
-        "HAMMER": "🔨", "SHOOTING_STAR": "☄️",
-        "DOJI": "➕", "MARUBOZU_BULL": "🚀", "MARUBOZU_BEAR": "💥",
-        "NONE": "—"
-    }
-    return emoji_map.get(pattern, "—")
-
-def build_log_insights(df: pd.DataFrame, ind: dict, price: float):
-    adx = float(ind.get("adx") or 0.0)
-    plus_di = float(ind.get("plus_di") or 0.0)
-    minus_di = float(ind.get("minus_di") or 0.0)
-    atr = float(ind.get("atr") or 0.0)
-    rsi = float(ind.get("rsi") or 0.0)
-    bias = "UP" if plus_di > minus_di else ("DOWN" if minus_di > plus_di else "NEUTRAL")
-    regime = "TREND" if adx >= 20 else "RANGE"
-    bias_emoji = "🟢" if bias=="UP" else ("🔴" if bias=="DOWN" else "⚪")
-    regime_emoji = "📡" if regime=="TREND" else "〰️"
-    atr_pct = (atr / max(price or 1e-9, 1e-9)) * 100.0
-    if rsi >= 70: rsi_zone = "RSI🔥 Overbought"
-    elif rsi <= 30: rsi_zone = "RSI❄️ Oversold"
-    else: rsi_zone = "RSI⚖️ Neutral"
-    candle_info = detect_candle_pattern(df)
-    candle_emoji = get_candle_emoji(candle_info["pattern"])
-    return {
-        "regime": regime, "regime_emoji": regime_emoji,
-        "bias": bias, "bias_emoji": bias_emoji,
-        "atr_pct": atr_pct, "rsi_zone": rsi_zone,
-        "candle": candle_info, "candle_emoji": candle_emoji
-    }
-
-def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
-    df = df if df is not None else fetch_ohlcv()
-    left_s = time_to_candle_close(df, USE_TV_BAR)
-    insights = build_log_insights(df, ind, info.get("price"))
-    print(colored("─"*100,"cyan"))
-    print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
-    print(colored("─"*100,"cyan"))
-    print("📈 INDICATORS & CANDLES")
-    print(f"   💲 Price {fmt(info.get('price'))}  |  RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))}  lo={fmt(info.get('lo'))}")
-    print(f"   🧮 RSI({RSI_LEN})={fmt(ind['rsi'])}   +DI={fmt(ind['plus_di'])}   -DI={fmt(ind['minus_di'])}   DX={fmt(ind['dx'])}   ADX({ADX_LEN})={fmt(ind['adx'])}   ATR={fmt(ind['atr'])} (~{fmt(insights['atr_pct'],2)}%)")
-    print(f"   🎯 Signal  ✅ BUY={info['long']}   ❌ SELL={info['short']}   |   🧮 spread_bps={fmt(spread_bps,2)}")
-    print(f"   {insights['regime_emoji']} Regime={insights['regime']}   {insights['bias_emoji']} Bias={insights['bias']}   |   {insights['rsi_zone']}")
-    candle_info = insights['candle']
-    print(f"   🕯️ Candles = {insights['candle_emoji']} {candle_info['name_ar']} / {candle_info['name_en']} (Strength: {candle_info['strength']}/4)")
-    if not state["open"] and wait_for_next_signal_side:
-        print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal from TradingView Range Filter", "cyan"))
-    if state["open"] and state["fakeout_pending"]:
-        print(colored(f"   🛡️ FAKEOUT PROTECTION — waiting {state['fakeout_confirm_bars']} bars for confirmation", "yellow"))
-    if state["breakout_active"]:
-        print(colored(f"   ⚡ BREAKOUT MODE ACTIVE: {state['breakout_direction'].upper()} - Monitoring volatility...", "cyan"))
-    if state.get("breakout_score", 0) >= 3.0:
-        print(colored(f"   🎯 BREAKOUT SCORE: {state['breakout_score']:.1f}/5.0", "cyan"))
-    print(f"   ⏱️ Candle closes in ~ {left_s}s")
-    print()
-    print("🧭 POSITION & MANAGEMENT")
-    print(f"   💰 Balance {fmt(bal,2)} USDT   Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x   PostCloseCooldown={post_close_cooldown}")
-    if state["open"]:
-        lamp = '🟩 LONG' if state['side']=='long' else '🟥 SHORT'
-        trade_mode_display = state.get('trade_mode', 'DETECTING')
-        targets_achieved = state.get('profit_targets_achieved', 0)
-        print(f"   📌 {lamp}  Entry={fmt(state['entry'])}  Qty={fmt(state['qty'],4)}  Bars={state['bars']}  PnL={fmt(state['pnl'])}")
-        print(f"   🎯 Management: Scale-ins={state['scale_ins']}/{SCALE_IN_MAX_STEPS}  Scale-outs={state['scale_outs']}  Trail={fmt(state['trail'])}")
-        print(f"   📊 TP1_done={state['tp1_done']}  Breakeven={fmt(state['breakeven'])}  HighestProfit={fmt(state['highest_profit_pct'],2)}%")
-        print(f"   🔧 Trade Mode: {trade_mode_display}  Targets Achieved: {targets_achieved}")
-        if state.get("_tp0_done"):
-            print(colored(f"   💰 TP0: Quick cash taken", "green"))
-        if state.get("thrust_locked"):
-            print(colored(f"   🔒 THRUST LOCK: Active", "cyan"))
-        if state.get("opened_by_breakout"):
-            print(colored(f"   ⚡ OPENED BY BREAKOUT", "magenta"))
-        if state['last_action']:
-            print(f"   🔄 Last Action: {state['last_action']} - {state['action_reason']}")
-    else:
-        print("   ⚪ FLAT")
-    print()
-    print("💡 ACTION INSIGHTS")
-    if state["open"] and STRATEGY == "smart":
-        current_side = state["side"]
-        should_scale, step_size, scale_reason = should_scale_in(candle_info, ind, current_side)
-        do_scale_out, scale_out_reason = should_scale_out(candle_info, ind, current_side)
-        trend_signal = check_trend_confirmation(candle_info, ind, current_side)
-        if trend_signal == "CONFIRMED_CONTINUE":
-            print(colored(f"   📈 اتجاه مؤكد: استمرار في الترند", "green"))
-        elif trend_signal == "POSSIBLE_FAKEOUT":
-            print(colored(f"   🕒 اشتباه انعكاس وهمي: في انتظار التأكيد", "yellow"))
-        elif trend_signal == "CONFIRMED_REVERSAL":
-            print(colored(f"   ⚠️ انعكاس مؤكد: خروج جزئي", "red"))
-        else:
-            print(colored(f"   ℹ️ لا إشارة اتجاه واضحة", "blue"))
-        if should_scale:
-            print(colored(f"   ✅ SCALE-IN READY: {scale_reason}", "green"))
-        elif do_scale_out:
-            print(colored(f"   ⚠️ SCALE-OUT ADVISED: {scale_out_reason}", "yellow"))
-        else:
-            print(colored(f"   ℹ️ HOLD POSITION: {scale_reason}", "blue"))
-        adx = ind.get("adx", 0)
-        tp_multiplier, trail_multiplier = get_dynamic_tp_params(adx)
-        if tp_multiplier > 1.0:
-            current_tp1_pct = TP1_PCT * tp_multiplier * 100.0
-            current_trail_activate = TRAIL_ACTIVATE * trail_multiplier * 100.0
-            print(colored(f"   🚀 TREND AMPLIFIER ACTIVE: TP={current_tp1_pct:.2f}% • TrailActivate={current_trail_activate:.2f}%", "cyan"))
-        trail_mult = get_trail_multiplier({**ind, "price": info.get("price")})
-        trail_type = "STRONG" if trail_mult == TRAIL_MULT_STRONG else "MED" if trail_mult == TRAIL_MULT_MED else "CHOP"
-        print(f"   🛡️ Trail Multiplier: {trail_mult} ({trail_type})")
-        if state.get("_adaptive_trail_mult"):
-            adaptive_type = "STRONG" if state["_adaptive_trail_mult"] == TRAIL_MULT_STRONG_ALPHA else "CAUTIOUS" if state["_adaptive_trail_mult"] == TRAIL_MULT_CAUTIOUS_ALPHA else "SCALP"
-            print(colored(f"   🎯 ADAPTIVE TRAIL: {state['_adaptive_trail_mult']} ({adaptive_type})", "magenta"))
-        trade_mode = state.get('trade_mode')
-        if trade_mode:
-            if trade_mode == "SCALP":
-                targets = SCALP_TARGETS; fracs = SCALP_CLOSE_FRACS; mode_name = "SCALP"
-            else:
-                targets = TREND_TARGETS; fracs = TREND_CLOSE_FRACS; mode_name = "TREND"
-            achieved = state.get('profit_targets_achieved', 0)
-            if achieved < len(targets):
-                next_target = targets[achieved]; next_frac = fracs[achieved] * 100
-                print(colored(f"   🎯 {mode_name} MODE: {achieved}/{len(targets)} targets • Next: TP{achieved+1}@{next_target:.2f}% ({next_frac:.0f}%)", "magenta"))
-            else:
-                print(colored(f"   ✅ {mode_name} MODE: All targets achieved • Riding trend", "green"))
-    else:
-        print("   🔄 Waiting for trading signals...")
-    print()
-    print("📦 RESULTS")
-    eff_eq = (bal or 0.0) + compound_pnl
-    print(f"   🧮 CompoundPnL {fmt(compound_pnl)}   🚀 EffectiveEq {fmt(eff_eq)} USDT")
-    if reason:
-        print(colored(f"   ℹ️ WAIT — reason: {reason}","yellow"))
-    print(colored("─"*100,"cyan"))
-
-# ------------ Real bar counter ------------
-_last_bar_ts = None
-def update_bar_counters(df: pd.DataFrame):
-    global _last_bar_ts
-    if len(df) == 0: return False
-    last_ts = int(df["time"].iloc[-1])
-    if _last_bar_ts is None:
-        _last_bar_ts = last_ts
-        return False
-    if last_ts != _last_bar_ts:
-        _last_bar_ts = last_ts
-        if state["open"]:
-            state["bars"] += 1
-        return True
-    return False
-
-# ------------ Decision Loop ------------
-def trade_loop():
-    global last_signal_id, state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint
-    sync_from_exchange_once()
-    loop_counter = 0
-    while True:
-        try:
-            loop_heartbeat()
-            loop_counter += 1
-            bal = balance_usdt()
-            px = price_now()
-            df = fetch_ohlcv()
-            new_bar = update_bar_counters(df)
-            sanity_check_bar_clock(df)
-            info = compute_tv_signals(df)
-            ind = compute_indicators(df)
-            spread_bps = orderbook_spread_bps()
-            prev_ind = compute_indicators(df.iloc[:-1]) if len(df) >= 2 else ind
-            if state["open"] and px:
-                state["pnl"] = (px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
-            breakout_exited = handle_breakout_exits(df, ind, prev_ind)
-            breakout_entered = False
-            if not state["open"] and not breakout_exited:
-                breakout_entered = handle_breakout_entries(df, ind, prev_ind, bal, spread_bps)
-            if breakout_entered:
-                snapshot(bal, info, ind, spread_bps, "BREAKOUT ENTRY - skipping normal logic", df)
-                time.sleep(compute_next_sleep(df))
-                continue
-            if state["breakout_active"]:
-                snapshot(bal, info, ind, spread_bps, "BREAKOUT ACTIVE - monitoring exit", df)
-                time.sleep(compute_next_sleep(df))
-                continue
-            if state["open"]:
-                if breakout_emergency_protection(ind, prev_ind):
-                    snapshot(bal, info, ind, spread_bps, "EMERGENCY LAYER action", df)
-                    time.sleep(compute_next_sleep(df))
-                    continue
-
-            smart_exit_check(info, ind, df_cached=df, prev_ind_cached=prev_ind)
-
-            sig = "buy" if info["long"] else ("sell" if info["short"] else None)
-            reason = None
-            if not sig:
-                reason = "no signal"
-            elif spread_bps is not None and spread_bps > SPREAD_GUARD_BPS:
-                reason = f"spread too high ({fmt(spread_bps,2)}bps > {SPREAD_GUARD_BPS})"
-            elif post_close_cooldown > 0:
-                reason = f"cooldown {post_close_cooldown} bars"
-
-            if state["open"] and sig and (reason is None):
-                desired = "long" if sig == "buy" else "short"
-                if state["side"] != desired:
-                    prev_side = state["side"]
-                    close_market_strict("opposite_signal")
-                    wait_for_next_signal_side = "sell" if prev_side == "long" else "buy"
-                    last_close_signal_time = info["time"]
-                    snapshot(bal, info, ind, spread_bps, "waiting next opposite signal", df)
-                    time.sleep(compute_next_sleep(df))
-                    continue
-
-            if not state["open"] and (reason is None) and sig:
-                if wait_for_next_signal_side:
-                    if sig != wait_for_next_signal_side:
-                        reason = f"waiting opposite signal from Range Filter: need {wait_for_next_signal_side}"
-                    else:
-                        qty = compute_size(bal, px or info["price"])
-                        if qty > 0:
-                            open_market(sig, qty, px or info["price"])
-                            wait_for_next_signal_side = None
-                            last_close_signal_time = None
-                            last_open_fingerprint = None
-                            last_signal_id = f"{info['time']}:{sig}"
-                        else:
-                            reason = "qty<=0"
-                else:
-                    qty = compute_size(bal, px or info["price"])
-                    if qty > 0:
-                        open_market(sig, qty, px or info["price"])
-                        last_open_fingerprint = None
-                        last_signal_id = f"{info['time']}:{sig}"
-                    else:
-                        reason = "qty<=0"
-
-            snapshot(bal, info, ind, spread_bps, reason, df)
-
-            if post_close_cooldown > 0 and not state["open"]:
-                post_close_cooldown -= 1
-
-            if loop_counter % 5 == 0:
-                save_state()
-
-            sync_consistency_guard()
-            sleep_s = compute_next_sleep(df)
-            time.sleep(sleep_s)
-
-        except Exception as e:
-            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}", "red"))
-            logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(BASE_SLEEP)
-
-# ------------ Keepalive + API ------------
-def keepalive_loop():
-    url = (SELF_URL or "").strip().rstrip("/")
-    if not url:
-        print(colored("⛔ keepalive: SELF_URL/RENDER_EXTERNAL_URL not set — skipping.", "yellow"))
-        return
-    sess = requests.Session()
-    sess.headers.update({"User-Agent":"rf-pro-bot/keepalive"})
-    print(colored(f"KEEPALIVE start → every {KEEPALIVE_SECONDS}s → {url}", "cyan"))
-    first_result_printed = False
-    while True:
-        try:
-            r = sess.get(url, timeout=8)
-            if not first_result_printed:
-                if r.status_code == 200:
-                    print(colored("KEEPALIVE ok (first 200)", "green"))
-                else:
-                    print(colored(f"KEEPALIVE first status={r.status_code}", "yellow"))
-                first_result_printed = True
-        except Exception as e:
-            if not first_result_printed:
-                print(colored(f"KEEPALIVE first error: {e}", "red"))
-                first_result_printed = True
-        time.sleep(max(KEEPALIVE_SECONDS,15))
-
-app = Flask(__name__)
-import logging as flask_logging
-log = flask_logging.getLogger('werkzeug')
-log.setLevel(flask_logging.ERROR)
-root_logged = False
-
-@app.route("/")
-def home():
-    global root_logged
-    if not root_logged:
-        print("GET / HTTP/1.1 200")
-        root_logged = True
-    mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER — SMART ALPHA PACK"
-
-@app.route("/metrics")
-def metrics():
-    return jsonify({
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "mode": "live" if MODE_LIVE else "paper",
-        "leverage": LEVERAGE,
-        "risk_alloc": RISK_ALLOC,
-        "price": price_now(),
-        "position": state,
-        "compound_pnl": compound_pnl,
-        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "strategy": STRATEGY,
-        "bingx_mode": BINGX_POSITION_MODE,
-        "advanced_features": {
-            "scale_in_steps": state.get("scale_ins", 0),
-            "scale_outs": state.get("scale_outs", 0),
-            "last_action": state.get("last_action"),
-            "action_reason": state.get("action_reason"),
-            "highest_profit_pct": state.get("highest_profit_pct", 0),
-            "trade_mode": state.get("trade_mode"),
-            "profit_targets_achieved": state.get("profit_targets_achieved", 0),
-            "breakout_score": state.get("breakout_score", 0),
-            "breakout_votes_detail": state.get("breakout_votes_detail", {}),
-            "opened_by_breakout": state.get("opened_by_breakout", False),
-            "tp0_done": state.get("_tp0_done", False),
-            "thrust_locked": state.get("thrust_locked", False)
-        },
-        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "waiting_for_signal": wait_for_next_signal_side,
-        "fakeout_protection": {
-            "pending": state.get("fakeout_pending", False),
-            "need_side": state.get("fakeout_need_side"),
-            "confirm_bars": state.get("fakeout_confirm_bars", 0),
-            "started_at": state.get("fakeout_started_at")
-        },
-        "breakout_engine": {
-            "active": state.get("breakout_active", False),
-            "direction": state.get("breakout_direction"),
-            "entry_price": state.get("breakout_entry_price")
-        },
-        "emergency_protection": {
-            "enabled": EMERGENCY_PROTECTION_ENABLED,
-            "policy": EMERGENCY_POLICY,
-            "harvest_frac": EMERGENCY_HARVEST_FRAC
-        },
-        "profit_taking": {
-            "scalp_targets": SCALP_TARGETS,
-            "trend_targets": TREND_TARGETS,
-            "scale_in_disabled": True
-        },
-        "smart_alpha_pack": {
-            "tp0_profit_pct": TP0_PROFIT_PCT,
-            "tp0_close_frac": TP0_CLOSE_FRAC,
-            "thrust_atr_bars": THRUST_ATR_BARS,
-            "adaptive_trail_enabled": True
-        }
-    })
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "ok": True,
-        "loop_stall_s": time.time() - last_loop_ts,
-        "mode": "live" if MODE_LIVE else "paper",
-        "open": state["open"],
-        "side": state["side"],
-        "qty": state["qty"],
-        "compound_pnl": compound_pnl,
-        "consecutive_errors": _consec_err,
-        "timestamp": datetime.utcnow().isoformat(),
-        "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "trade_mode": state.get("trade_mode"),
-        "profit_targets_achieved": state.get("profit_targets_achieved", 0),
-        "waiting_for_signal": wait_for_next_signal_side,
-        "fakeout_protection_active": state.get("fakeout_pending", False),
-        "breakout_active": state.get("breakout_active", False),
-        "emergency_protection_enabled": EMERGENCY_PROTECTION_ENABLED,
-        "breakout_score": state.get("breakout_score", 0),
-        "tp0_done": state.get("_tp0_done", False),
-        "thrust_locked": state.get("thrust_locked", False),
-        "smart_alpha_features": True
-    }), 200
-
-@app.route("/ping")
-def ping(): return "pong", 200
-
-# ------------ Boot ------------
-if __name__ == "__main__":
-    print("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS & SMART ALPHA PACK...")
-    load_state()
-    threading.Thread(target=watchdog_check, daemon=True).start()
-    print("🦮 Watchdog started")
-    threading.Thread(target=trade_loop, daemon=True).start()
-    threading.Thread(target=keepalive_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+            state["fakeout_need_
