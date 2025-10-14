@@ -161,6 +161,13 @@ REV_RF_CROSS          = True
 DEBUG_PATIENCE = False
 DEBUG_HARVEST  = False
 
+# --- Fearless Hold (TCI + Chop) ---
+HOLD_TCI = 65                # بوابة HOLD العادية
+HOLD_STRONG_TCI = 75         # بوابة Strong HOLD
+CHOP_MAX_FOR_HOLD = 0.35     # أقصى تذبذب مسموح لتفعيل HOLD
+HOLD_MAX_PARTIAL_FRAC = 0.25 # أقصى إغلاق جزئي أثناء HOLD
+HOLD_RATCHET_LOCK_PCT_ON_HOLD = 0.80  # شدّ قفل الارتداد أثناء HOLD
+
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
 
@@ -444,7 +451,7 @@ def wilder_ema(s: pd.Series, n: int): return s.ewm(alpha=1/n, adjust=False).mean
 def compute_indicators(df: pd.DataFrame):
     if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 2:
         return {"rsi": 50.0, "plus_di": 0.0, "minus_di": 0.0, "dx": 0.0,
-                "adx": 0.0, "atr": 0.0, "adx_prev": 0.0}
+                "adx": 0.0, "atr": 0.0, "adx_prev": 0.0, "chop": 50.0, "st": None, "st_dir": 0}
     c, h, l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
     tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
     atr = wilder_ema(tr, ATR_LEN)
@@ -464,11 +471,60 @@ def compute_indicators(df: pd.DataFrame):
 
     i = len(df)-1
     prev_i = max(0, i-1)
+    
+    # --- Choppiness Index (0..100) ---
+    # CHOP = 100 * log10( sum(TR)/ (maxHigh-minLow) ) / log10(n)
+    try:
+        n = 14  # CHOP_LEN
+        tr_sum = tr.rolling(n).sum()
+        hh = h.rolling(n).max()
+        ll = l.rolling(n).min()
+        chop = 100.0 * ( (tr_sum / (hh - ll).replace(0,1e-12)).apply(lambda x: math.log10(x+1e-12)) / math.log10(n) )
+        chop = chop.fillna(50.0)
+    except Exception:
+        chop = pd.Series([50.0]*len(df), index=df.index)
+
+    # --- Supertrend (قيمة وخط اتجاه 1/-1) ---
+    try:
+        st_period = 10  # ST_PERIOD
+        st_mult   = 3.0  # ST_MULTIPLIER
+        hl2 = (h + l) / 2.0
+        atr_st = wilder_ema(pd.concat([(h - l).abs(), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1), st_period)
+        upperband = hl2 + st_mult * atr_st
+        lowerband = hl2 - st_mult * atr_st
+        st = [float('nan')]
+        dirv = [0]
+        for i in range(1, len(df)):
+            prev_st = st[-1]
+            prev_dir = dirv[-1]
+            cur = float(c.iloc[i]); ub = float(upperband.iloc[i]); lb = float(lowerband.iloc[i])
+            if math.isnan(prev_st):
+                st.append(lb if cur > lb else ub)
+                dirv.append(1 if cur > lb else -1)
+                continue
+            if prev_dir == 1:
+                ub = min(ub, prev_st)
+                st_val = lb if cur > ub else ub
+                dir_now = 1 if cur > ub else -1
+            else:
+                lb = max(lb, prev_st)
+                st_val = ub if cur < lb else lb
+                dir_now = -1 if cur < lb else 1
+            st.append(st_val); dirv.append(dir_now)
+        st_series = pd.Series(st[1:], index=df.index[1:])
+        st_series = st_series.reindex(df.index, method='pad')
+        dir_series = pd.Series(dirv[1:], index=df.index[1:]).reindex(df.index, method='pad').fillna(0)
+        st_val = float(st_series.iloc[-1]); st_dir = int(dir_series.iloc[-1])
+    except Exception:
+        st_val, st_dir = None, 0
+
     return {
         "rsi": float(rsi.iloc[i]), "plus_di": float(plus_di.iloc[i]),
         "minus_di": float(minus_di.iloc[i]), "dx": float(dx.iloc[i]),
         "adx": float(adx.iloc[i]), "atr": float(atr.iloc[i]),
-        "adx_prev": float(adx.iloc[prev_i])
+        "adx_prev": float(adx.iloc[prev_i]),
+        "chop": float(chop.iloc[i]) if len(chop) else 50.0,
+        "st": st_val, "st_dir": st_dir
     }
 
 # ------------ Range Filter (EXACT) ------------
@@ -519,7 +575,51 @@ def compute_tv_signals(df: pd.DataFrame):
         "fdir": float(fdir.iloc[i])
     }
 
-# ------------ State & Sync ------------
+# -------- Trend Conviction & Chop (التصحيح B) --------
+def _clamp01(x):
+    try:
+        x = float(x); 
+        return 0.0 if x < 0 else 1.0 if x > 1 else x
+    except Exception:
+        return 0.0
+
+def _slope(series, k=4):
+    s = pd.Series(series).astype(float)
+    if len(s) < k+1: return 0.0
+    base = abs(s.iloc[-1-k]) or 1e-12
+    return (s.iloc[-1] - s.iloc[-1-k]) / base
+
+def compute_tci_and_chop(df: pd.DataFrame, ind: dict, side: str):
+    src = df[RF_SOURCE].astype(float)
+    _, _, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
+    adx = float(ind.get("adx") or 0.0)
+    plus_di = float(ind.get("plus_di") or 0.0)
+    minus_di = float(ind.get("minus_di") or 0.0)
+    rsi = float(ind.get("rsi") or 50.0)
+    price = float(df["close"].iloc[-1])
+    atr = float(ind.get("atr") or 0.0)
+
+    s_adx  = _clamp01((adx - 18.0) / 22.0)  # ~40 يدي 1.0
+    s_di   = _clamp01(((plus_di - minus_di) if side == "long" else (minus_di - plus_di)) / 30.0)
+    s_rsi  = _clamp01(((rsi - 50.0) if side == "long" else (50.0 - rsi)) / 20.0)
+    s_slope= _clamp01(_slope(filt, 4) / ( (price or 1e-9) * 0.004 ))  # ~0.4% خلال 4 شموع
+    tci = 100.0 * (0.40*s_adx + 0.30*s_di + 0.20*s_rsi + 0.10*s_slope)
+
+    # Chop: كثافة تقاطعات RF + ADX ضعيف + ATR% منخفض
+    N = 8; crosses = 0; sgn_prev = None
+    for i in range(max(1, len(src)-N), len(src)):
+        sgn = 1 if src.iloc[i] >= filt.iloc[i] else -1
+        if sgn_prev is not None and sgn != sgn_prev: crosses += 1
+        sgn_prev = sgn
+    atr_pct = (atr / max(price, 1e-9)) * 100.0
+    chop = min(1.0, (crosses / max(N-1,1)) * 0.6 + (1.0 if adx < 20 else 0.0) * 0.3 + (1.0 if atr_pct < 0.7 else 0.0) * 0.1)
+    
+    # B) إعادة تسمية قيمة التذبذب إلى chop01 (0..1) لتجنب اللبس مع Choppiness 0..100
+    return {"tci": float(tci), "chop01": float(chop),
+            "hold_mode": (tci >= HOLD_TCI and chop <= CHOP_MAX_FOR_HOLD),
+            "strong_hold": (tci >= HOLD_STRONG_TCI and chop <= CHOP_MAX_FOR_HOLD*1.1)}
+
+# ------------ State & Sync (التصحيح A و B) ------------
 state={
     "open": False, "side": None, "entry": None, "qty": 0.0, 
     "pnl": 0.0, "bars": 0, "trail": None, "tp1_done": False, 
@@ -540,7 +640,14 @@ state={
     "thrust_locked": False,
     "breakout_score": 0.0,
     "breakout_votes_detail": {},
-    "opened_by_breakout": False
+    "opened_by_breakout": False,
+    "_hold_trend": False,
+    # A) توحيد أعلام TP
+    "tp1_done": False,
+    "tp2_done": False,
+    "tci": None,
+    # B) استخدام chop01 بدلاً من chop
+    "chop01": None
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -586,7 +693,14 @@ def sync_from_exchange_once():
                 "thrust_locked": False,
                 "breakout_score": 0.0,
                 "breakout_votes_detail": {},
-                "opened_by_breakout": False
+                "opened_by_breakout": False,
+                "_hold_trend": False,
+                # A) توحيد أعلام TP
+                "tp1_done": False,
+                "tp2_done": False,
+                "tci": None,
+                # B) استخدام chop01 بدلاً من chop
+                "chop01": None
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -969,7 +1083,7 @@ def handle_impulse_and_long_wicks(df: pd.DataFrame, ind: dict):
                 else:
                     harvest_frac = 0.33; reason = f"Impulse x{body/atr:.2f} ATR"
                 close_partial(harvest_frac, reason)
-                if not state["breakeven"] and rr >= BREAKEVEN_AFTER * 100:
+                if not state["breakeven"] and rr >= BREAKEVEN_AFTER:
                     state["breakeven"] = entry
                 if atr and ATR_MULT_TRAIL > 0:
                     gap = atr * ATR_MULT_TRAIL
@@ -1021,7 +1135,8 @@ def scalp_profit_taking(ind: dict, info: dict):
         return f"SCALP_TP{k+1}"
     return None
 
-def trend_profit_taking(ind: dict, info: dict):
+# ------------ Trend Profit Taking (التصحيح C) ------------
+def trend_profit_taking(ind: dict, info: dict, df_cached: pd.DataFrame):  # إضافة df_cached
     if not state["open"] or state["qty"] <= 0:
         return None
     price = ind.get("price") or price_now() or state["entry"]
@@ -1036,7 +1151,8 @@ def trend_profit_taking(ind: dict, info: dict):
         return f"TREND_TP{k+1}"
     if adx >= MIN_TREND_HOLD_ADX:
         return None
-    if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(fetch_ohlcv()), info):
+    # C) استخدام df_cached بدلاً من fetch_ohlcv()
+    if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(df_cached), info):
         close_market_strict("TREND finished — full exit")
         return "TREND_COMPLETE"
     return None
@@ -1081,7 +1197,7 @@ def smart_alpha_features(df: pd.DataFrame, ind: dict, prev_ind: dict, info: dict
         logging.error(f"smart_alpha_features error: {e}")
     return action
 
-# ------------ NEW: SMART HARVEST v2 integrated in smart_post_entry_manager ------------
+# ------------ NEW: SMART HARVEST v2 integrated in smart_post_entry_manager (التصحيح A و B و C) ------------
 def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if not state["open"] or state["qty"] <= 0:
         return None
@@ -1093,15 +1209,25 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     elapsed_s = max(0, now_ts - state["opened_at"])
     elapsed_bar = int(state.get("bars", 0))
 
-    # TP0 guard: limit partial closes before TP1
+    # B) تحديث حالة chop01
+    hold = compute_tci_and_chop(df, ind, state.get("side"))
+    state["_hold_trend"] = bool(hold["hold_mode"])
+    state["tci"] = hold["tci"]; state["chop01"] = hold["chop01"]
+    if hold["strong_hold"]:
+        state["_adaptive_trail_mult"] = max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, TRAIL_MULT_STRONG_ALPHA)
+
+    # TP0 guard: limit partial closes قبل TP1 + تقليص أثناء HOLD
     def _tp0_guard_close(frac, label):
-        max_frac = WICK_MAX_BEFORE_TP1 if not state.get("_tp1_done") else frac
+        max_frac = WICK_MAX_BEFORE_TP1 if not state.get("tp1_done") else frac
+        if state.get("_hold_trend"):
+            max_frac = min(max_frac, HOLD_MAX_PARTIAL_FRAC)
         frac = min(frac, max_frac)
         if frac > 0:
             close_partial(frac, label)
 
     # Trail management: disable normal trail until TP1 (except Thrust/Chandelier)
-    if TRAIL_ONLY_AFTER_TP1 and not state.get("_tp1_done"):
+    # A) استخدام العلم الموحد
+    if TRAIL_ONLY_AFTER_TP1 and not state.get("tp1_done"):
         state["_adaptive_trail_mult"] = 0.0  # Disable normal ATR trail
 
     # ---- Smart alpha pack first ----
@@ -1147,14 +1273,16 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
         rr = (px - e) / e * 100.0 * (1 if side == "long" else -1)
         atr = float(_ind.get("atr") or 0.0)
 
-        if not state.get("_tp1_done") and rr >= TP1_PCT_SCALED * 100.0:
+        # A) استخدام الأعلام الموحدة
+        if not state.get("tp1_done") and rr >= TP1_PCT_SCALED * 100.0:
             _tp0_guard_close(TP1_FRAC, f"TP1 @{TP1_PCT_SCALED*100:.2f}%")
-            state["_tp1_done"] = True
+            state["tp1_done"] = True
             state["breakeven"] = e
 
-        if not state.get("_tp2_done") and rr >= TP2_PCT_SCALED * 100.0:
+        # A) استخدام الأعلام الموحدة
+        if not state.get("tp2_done") and rr >= TP2_PCT_SCALED * 100.0:
             _tp0_guard_close(TP2_FRAC, f"TP2 @{TP2_PCT_SCALED*100:.2f}%")
-            state["_tp2_done"] = True
+            state["tp2_done"] = True
 
         if rr > state.get("highest_profit_pct", 0.0):
             state["highest_profit_pct"] = rr
@@ -1181,10 +1309,11 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     # ---- invoke Smart Harvest v2 (non-intrusive) ----
     smart_harvest(df, ind, info)
 
+    # C) تمرير df المخزن بدل fetch_ohlcv إضافي
     if state["trade_mode"] == "SCALP":
         return scalp_profit_taking(ind, info)
     else:
-        return trend_profit_taking(ind, info)
+        return trend_profit_taking(ind, info, df)  # تمرير df هنا
 
 # ------------ Orders ------------
 def open_market(side, qty, price):
@@ -1225,9 +1354,14 @@ def open_market(side, qty, price):
         "breakout_votes_detail": {},
         "opened_by_breakout": False,
         "_adaptive_trail_mult": None,
-        "_tp1_done": state.get("_tp1_done", False),
-        "_tp2_done": state.get("_tp2_done", False),
-        "opened_at": time.time()  # Track position opening time
+        # A) توحيد أعلام TP
+        "tp1_done": False,
+        "tp2_done": False,
+        "opened_at": time.time(),  # Track position opening time
+        "_hold_trend": False,
+        "tci": None,
+        # B) استخدام chop01 بدلاً من chop
+        "chop01": None
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1317,9 +1451,14 @@ def reset_after_full_close(reason, prev_side=None):
         "breakout_votes_detail": {},
         "opened_by_breakout": False,
         "_adaptive_trail_mult": None,
-        "_tp1_done": False,
-        "_tp2_done": False,
-        "opened_at": None
+        # A) أعلام TP الموحّدة
+        "tp1_done": False,
+        "tp2_done": False,
+        "opened_at": None,
+        "_hold_trend": False,
+        "tci": None,
+        # B) استخدام chop01 بدلاً من chop
+        "chop01": None
     })
     if prev_side == "long":
         wait_for_next_signal_side = "sell"
@@ -1406,13 +1545,36 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
         hard_reasons = ("TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT", "FORCE", "STOP", "EMERGENCY")
         return any(tag in reason for tag in hard_reasons)
 
+    def _safe_close_partial(frac, reason):
+        # A) استخدام العلم الموحد
+        if state.get("_exit_soft_block") and not state.get("tp1_done"):
+            frac = min(frac, WICK_MAX_BEFORE_TP1)
+        if state.get("_hold_trend"):
+            frac = min(frac, HOLD_MAX_PARTIAL_FRAC)
+        close_partial(frac, reason)
+
+    def _safe_full_close(reason):
+        # A) استخدام العلم الموحد
+        if NO_FULL_CLOSE_BEFORE_TP1 and not state.get("tp1_done"):
+            if not _allow_full_close(reason):
+                logging.info(f"EXIT_BLOCKED (early): {reason}")
+                return False
+        if state.get("_exit_soft_block") and not _allow_full_close(reason):
+            logging.info(f"EXIT_BLOCKED (patience): {reason}")
+            return False
+        close_market_strict(reason)
+        return True
+
     # Enhanced Patience Guard: Reverse consensus check
     side = state.get("side")
     rsi = float(ind.get("rsi") or 50.0)
     adx = float(ind.get("adx") or 0.0)
     adx_prev = float(ind.get("adx_prev") or adx)
-    rf = ind.get("rfilt") or ind.get("rf")
+    rf = ind.get("rfilt") or ind.get("rf") or info.get("filter")
     px = ind.get("price") or info.get("price")
+    chop = float(ind.get("chop") or 50.0)
+    st_val = ind.get("st")
+    st_dir = int(ind.get("st_dir") or 0)
 
     reverse_votes = 0
     vote_details = []
@@ -1461,23 +1623,6 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
         state["_exit_soft_block"] = False
         if DEBUG_PATIENCE and reverse_votes >= PATIENCE_NEED_CONSENSUS:
             logging.info(f"PAT: consensus={reverse_votes}/{PATIENCE_NEED_CONSENSUS} ({', '.join(vote_details)})")
-
-    # Protected close functions
-    def _safe_close_partial(frac, reason):
-        if state.get("_exit_soft_block") and not state.get("_tp1_done"):
-            frac = min(frac, WICK_MAX_BEFORE_TP1)
-        close_partial(frac, reason)
-
-    def _safe_full_close(reason):
-        if NO_FULL_CLOSE_BEFORE_TP1 and not state.get("_tp1_done"):
-            if not _allow_full_close(reason):
-                logging.info(f"EXIT_BLOCKED (early): {reason}")
-                return False
-        if state.get("_exit_soft_block") and not _allow_full_close(reason):
-            logging.info(f"EXIT_BLOCKED (patience): {reason}")
-            return False
-        close_market_strict(reason)
-        return True
 
     # ---- cached df/prev_ind usage ----
     df_local = df_cached if df_cached is not None else fetch_ohlcv()
@@ -1548,7 +1693,8 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     trail_mult_to_use = state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL
 
     if state.get("trade_mode") is None:
-        if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
+        # A) استخدام العلم الموحد
+        if (not state.get("tp1_done")) and rr >= current_tp1_pct_pct:
             _safe_close_partial(TP1_CLOSE_FRAC, f"TP1@{current_tp1_pct_pct:.2f}%")
             state["tp1_done"] = True
 
@@ -1563,17 +1709,19 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     if rr > state["highest_profit_pct"]:
         state["highest_profit_pct"] = rr
         if tp_multiplier > 1.0:
-            print(colored(f"🎯 TREND AMPLIFIER: New high {rr:.2f}% • TP={current_tp1_pct_pct:.2f}% • TrailActivate={current_trail_activate_pct:.2f}%", "green"))
+            print(colored(f"🎯 TREND AMPLIFIER ACTIVE: New high {rr:.2f}% • TP={current_tp1_pct_pct:.2f}% • TrailActivate={current_trail_activate_pct:.2f}%", "green"))
             logging.info(f"TREND_AMPLIFIER new_high={rr:.2f}% TP={current_tp1_pct_pct:.2f}%")
 
-    if (not state["tp1_done"]) and rr >= current_tp1_pct_pct:
+    # A) استخدام العلم الموحد
+    if (not state.get("tp1_done")) and rr >= current_tp1_pct_pct:
         _safe_close_partial(TP1_CLOSE_FRAC, f"TP1@{current_tp1_pct_pct:.2f}%")
         state["tp1_done"] = True
-        if rr >= BREAKEVEN_AFTER * 100.0:
+        if rr >= BREAKEVEN_AFTER:
             state["breakeven"] = e
 
+    ratchet_lock_pct = RATCHET_LOCK_PCT if not state.get("_hold_trend") else HOLD_RATCHET_LOCK_PCT_ON_HOLD
     if (state["highest_profit_pct"] >= current_trail_activate_pct and
-        rr < state["highest_profit_pct"] * RATCHET_LOCK_PCT):
+        rr < state["highest_profit_pct"] * ratchet_lock_pct):
         _safe_close_partial(0.5, f"Ratchet Lock @ {state['highest_profit_pct']:.2f}%")
         state["highest_profit_pct"] = rr
         return None
@@ -1762,7 +1910,7 @@ def breakout_emergency_protection(ind: dict, prev_ind: dict) -> bool:
         logging.error(f"breakout_emergency_protection error: {e}")
         return False
 
-# ------------ HUD / snapshot (unchanged) ------------
+# ------------ HUD / snapshot (التصحيح B) ------------
 def detect_candle_pattern(df: pd.DataFrame):
     if len(df) < 3:
         return {"pattern": "NONE", "name_ar": "لا شيء", "name_en": "NONE", "strength": 0}
@@ -1847,6 +1995,13 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     print(f"   {insights['regime_emoji']} Regime={insights['regime']}   {insights['bias_emoji']} Bias={insights['bias']}   |   {insights['rsi_zone']}")
     candle_info = insights['candle']
     print(f"   🕯️ Candles = {insights['candle_emoji']} {candle_info['name_ar']} / {candle_info['name_en']} (Strength: {candle_info['strength']}/4)")
+    
+    # B) عرض chop01 بدلاً من chop
+    if state.get("tci") is not None:
+        hold_msg = "ما تخافش — الترند قوي" if state.get("_hold_trend") and state.get("side")=="long" else \
+                   ("ما تخافيش — الهبوط قوي" if state.get("_hold_trend") and state.get("side")=="short" else "إدارة عادية")
+        print(colored(f"   🧭 TCI={state['tci']:.0f}/100 • Chop01={state.get('chop01',0):.2f} → {hold_msg}", "cyan" if state.get("_hold_trend") else "blue"))
+    
     if not state["open"] and wait_for_next_signal_side:
         print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal from TradingView Range Filter", "cyan"))
     if state["open"] and state["fakeout_pending"]:
@@ -2048,7 +2203,7 @@ def trade_loop():
             logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
-# ------------ Keepalive + API ------------
+# ------------ Keepalive + API (التصحيح B) ------------
 def keepalive_loop():
     url = (SELF_URL or "").strip().rstrip("/")
     if not url:
@@ -2086,7 +2241,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER — SMART ALPHA PACK"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER — SMART ALPHA PACK — FEARLESS HOLD PACK"
 
 @app.route("/metrics")
 def metrics():
@@ -2114,7 +2269,11 @@ def metrics():
             "breakout_votes_detail": state.get("breakout_votes_detail", {}),
             "opened_by_breakout": state.get("opened_by_breakout", False),
             "tp0_done": state.get("_tp0_done", False),
-            "thrust_locked": state.get("thrust_locked", False)
+            "thrust_locked": state.get("thrust_locked", False),
+            "tci": state.get("tci"),
+            # B) استخدام chop01 بدلاً من chop
+            "chop01": state.get("chop01"),
+            "hold_mode": state.get("_hold_trend", False)
         },
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
         "waiting_for_signal": wait_for_next_signal_side,
@@ -2144,6 +2303,14 @@ def metrics():
             "tp0_close_frac": TP0_CLOSE_FRAC,
             "thrust_atr_bars": THRUST_ATR_BARS,
             "adaptive_trail_enabled": True
+        },
+        "fearless_hold_pack": {
+            "tci": state.get("tci"),
+            # B) استخدام chop01 بدلاً من chop
+            "chop01": state.get("chop01"),
+            "hold_mode": state.get("_hold_trend", False),
+            "hold_tci_threshold": HOLD_TCI,
+            "strong_hold_tci_threshold": HOLD_STRONG_TCI
         }
     })
 
@@ -2169,7 +2336,13 @@ def health():
         "breakout_score": state.get("breakout_score", 0),
         "tp0_done": state.get("_tp0_done", False),
         "thrust_locked": state.get("thrust_locked", False),
-        "smart_alpha_features": True
+        "smart_alpha_features": True,
+        "fearless_hold": {
+            "tci": state.get("tci"),
+            # B) استخدام chop01 بدلاً من chop
+            "chop01": state.get("chop01"),
+            "hold_mode": state.get("_hold_trend", False)
+        }
     }), 200
 
 @app.route("/ping")
@@ -2190,7 +2363,7 @@ if __name__ == "__main__":
     setup_file_logging()
     _validate_market_specs()
 
-    print(colored("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS & SMART ALPHA PACK...", "green"))
+    print(colored("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS & SMART ALPHA PACK & FEARLESS HOLD...", "green"))
 
     load_state()
 
