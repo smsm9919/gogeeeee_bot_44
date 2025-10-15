@@ -157,6 +157,14 @@ REV_ADX_DROP          = 3.0
 REV_RSI_LEVEL         = 50
 REV_RF_CROSS          = True
 
+# === Dynamic TP & ST proximity ===
+HOLD_SCORE = 3.0
+STRONG_HOLD_SCORE = 4.0
+DEFER_TP_UNTIL_IDX = 2
+
+ST_NEAR_ATR = 0.6   # مسافة قريبة من خط ST (بالـ ATR)
+ST_FAR_ATR  = 1.5   # مسافة آمنة لركوب الترند
+
 # Optional debug flags
 DEBUG_PATIENCE = False
 DEBUG_HARVEST  = False
@@ -167,12 +175,6 @@ HOLD_STRONG_TCI = 75         # بوابة Strong HOLD
 CHOP_MAX_FOR_HOLD = 0.35     # أقصى تذبذب مسموح لتفعيل HOLD
 HOLD_MAX_PARTIAL_FRAC = 0.25 # أقصى إغلاق جزئي أثناء HOLD
 HOLD_RATCHET_LOCK_PCT_ON_HOLD = 0.80  # شدّ قفل الارتداد أثناء HOLD
-
-# ====== Dynamic Profit-Taking (consensus-driven) ======
-# نقاط الإجماع (كل ما زاد كل ما زاد احتمالية استمرار الحركة)
-HOLD_SCORE            = 3.0   # إجماع جيد → نخفف جني الربح
-STRONG_HOLD_SCORE     = 4.0   # إجماع قوي جدًا → نؤجل TP ونركب الترند
-DEFER_TP_UNTIL_IDX    = 2     # مع إجماع قوي جدًا نؤجل حتى هدف رقم 2 كحد أدنى
 
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
@@ -581,6 +583,41 @@ def compute_tv_signals(df: pd.DataFrame):
         "fdir": float(fdir.iloc[i])
     }
 
+# -------- Dynamic TP Helper Functions --------
+def _indicator_consensus(info: dict, ind: dict, side: str) -> float:
+    score = 0.0
+    try:
+        st_dir = int(ind.get("st_dir") or 0)
+        adx    = float(ind.get("adx") or 0.0)
+        rsi    = float(ind.get("rsi") or 50.0)
+        pdi    = float(ind.get("plus_di") or 0.0)
+        mdi    = float(ind.get("minus_di") or 0.0)
+        rf     = info.get("filter"); px = info.get("price")
+        if (side == "long" and st_dir == 1) or (side == "short" and st_dir == -1): score += 1.0
+        if (side == "long" and pdi > mdi) or (side == "short" and mdi > pdi):      score += 1.0
+        if (side == "long" and rsi >= RSI_TREND_BUY) or (side == "short" and rsi <= RSI_TREND_SELL): score += 1.0
+        if adx >= 28: score += 1.0
+        elif adx >= 20: score += 0.5
+        if px is not None and rf is not None:
+            if (side == "long" and px > rf) or (side == "short" and px < rf): score += 0.5
+        chop01 = state.get("chop01", None)
+        if chop01 is not None and chop01 <= CHOP_MAX_FOR_HOLD: score += 0.5
+    except Exception:
+        pass
+    return float(score)
+
+def _build_tp_ladder(info: dict, ind: dict, side: str):
+    px = info.get("price") or state.get("entry")
+    atr = float(ind.get("atr") or 0.0)
+    atr_pct = (atr / max(float(px or 0.0), 1e-9)) * 100.0 if px else 0.5
+    score = _indicator_consensus(info, ind, side)
+    if score >= STRONG_HOLD_SCORE: mults = [1.8, 3.2, 5.0]
+    elif score >= HOLD_SCORE:      mults = [1.6, 2.8, 4.5]
+    else:                          mults = [1.2, 2.4, 4.0]
+    targets = [round(m * atr_pct, 2) for m in mults]
+    close_fracs = [0.25, 0.30, 0.45]
+    return targets, close_fracs, atr_pct, score
+
 # -------- Trend Conviction & Chop (التصحيح B) --------
 def _clamp01(x):
     try:
@@ -624,58 +661,6 @@ def compute_tci_and_chop(df: pd.DataFrame, ind: dict, side: str):
     return {"tci": float(tci), "chop01": float(chop),
             "hold_mode": (tci >= HOLD_TCI and chop <= CHOP_MAX_FOR_HOLD),
             "strong_hold": (tci >= HOLD_STRONG_TCI and chop <= CHOP_MAX_FOR_HOLD*1.1)}
-
-# -------- NEW: مؤشر إجماع + سلّم أهداف ديناميكي حسب ATR --------
-def _indicator_consensus(info: dict, ind: dict, side: str) -> float:
-    """درجة 0..5 تقريبًا: Supertrend، DI، RSI، ADX، RF-cross، Chop"""
-    score = 0.0
-    try:
-        st_dir = int(ind.get("st_dir") or 0)
-        adx    = float(ind.get("adx") or 0.0)
-        rsi    = float(ind.get("rsi") or 50.0)
-        pdi    = float(ind.get("plus_di") or 0.0)
-        mdi    = float(ind.get("minus_di") or 0.0)
-        rf     = info.get("filter")
-        px     = info.get("price")
-        # Supertrend
-        if (side == "long" and st_dir == 1) or (side == "short" and st_dir == -1): score += 1.0
-        # DI
-        if (side == "long" and pdi > mdi) or (side == "short" and mdi > pdi):      score += 1.0
-        # RSI
-        if (side == "long" and rsi >= RSI_TREND_BUY) or (side == "short" and rsi <= RSI_TREND_SELL): score += 1.0
-        # ADX (قوة الترند)
-        if adx >= 28: score += 1.0
-        elif adx >= 20: score += 0.5
-        # RF cross بهسترة بسيطة
-        try:
-            if px is not None and rf is not None:
-                if (side == "long" and px > rf) or (side == "short" and px < rf): score += 0.5
-        except Exception:
-            pass
-        # قلة التشويش
-        chop01 = state.get("chop01", None)
-        if chop01 is not None and chop01 <= CHOP_MAX_FOR_HOLD: score += 0.5
-    except Exception:
-        pass
-    return float(score)
-
-def _build_tp_ladder(info: dict, ind: dict, side: str):
-    """يعيد ([أهداف%...], [نِسَب الإغلاق…], atr_pct, score)"""
-    px = info.get("price") or state.get("entry")
-    atr = float(ind.get("atr") or 0.0)
-    atr_pct = (atr / max(float(px or 0.0), 1e-9)) * 100.0 if px else 0.5
-    score = _indicator_consensus(info, ind, side)
-    # مضاعِفات ATR حسب الإجماع
-    if score >= STRONG_HOLD_SCORE:
-        mults = [1.8, 3.2, 5.0]
-    elif score >= HOLD_SCORE:
-        mults = [1.6, 2.8, 4.5]
-    else:
-        mults = [1.2, 2.4, 4.0]
-    targets = [round(m * atr_pct, 2) for m in mults]
-    # نسب الإغلاق (محافظة أولاً، ثم تزيد)
-    close_fracs = [0.25, 0.30, 0.45]
-    return targets, close_fracs, atr_pct, score
 
 # ------------ State & Sync (التصحيح A و B) ------------
 state={
@@ -1291,6 +1276,18 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if hold["strong_hold"]:
         state["_adaptive_trail_mult"] = max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, TRAIL_MULT_STRONG_ALPHA)
 
+    # إجبار وضع TREND مرة واحدة عند أول استدعاء
+    if state.get("trade_mode") is None:
+        state["trade_mode"] = "TREND"
+        state["profit_targets_achieved"] = 0
+
+    # تحديث سلّم الأهداف الديناميكي في كل دورة
+    tp_list, tp_fracs, atr_pct, cscore = _build_tp_ladder(info, ind, state.get("side"))
+    state["_tp_ladder"] = tp_list
+    state["_tp_fracs"]  = tp_fracs
+    state["_consensus_score"] = cscore
+    state["_atr_pct"] = atr_pct
+
     # TP0 guard: limit partial closes قبل TP1 + تقليص أثناء HOLD
     def _tp0_guard_close(frac, label):
         max_frac = WICK_MAX_BEFORE_TP1 if not state.get("tp1_done") else frac
@@ -1310,25 +1307,6 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     alpha_action = smart_alpha_features(df, ind, prev_ind, info)
     if alpha_action:
         return alpha_action
-
-    # 🔥 CRITICAL FIX: Always use TREND mode for dynamic profit-taking
-    if state.get("trade_mode") is None:
-        trade_mode = "TREND"  # Force TREND mode for better profits
-        state["trade_mode"] = trade_mode
-        state["profit_targets_achieved"] = 0
-        state["entry_time"] = time.time()
-        print(colored(f"🎯 TRADE MODE SET: {trade_mode} (Dynamic Profit-Taking Enabled)", "cyan"))
-        logging.info(f"Trade mode set: {trade_mode}")
-
-    # 🔥 NEW: Update dynamic TP ladder
-    try:
-        tp_list, tp_fracs, atr_pct, cscore = _build_tp_ladder(info, ind, state.get("side"))
-        state["_tp_ladder"] = tp_list
-        state["_tp_fracs"]  = tp_fracs
-        state["_consensus_score"] = cscore
-        state["_atr_pct"] = atr_pct
-    except Exception as e:
-        print(colored(f"⚠️ Dynamic TP ladder error: {e}", "yellow"))
 
     # Use protected close for wick/impulse harvest
     impulse_action = handle_impulse_and_long_wicks(df, ind)
@@ -1355,7 +1333,7 @@ def open_market(side, qty, price):
             except Exception as e: print(colored(f"⚠️ set_leverage: {e}", "yellow"))
             ex.create_order(SYMBOL, "market", side, qty, None, params)
         except Exception as e:
-            print(colored(f"❌ open: {e}", "red"))
+            print(colored(f"❌ open: {e}","red"))
             logging.error(f"open_market error: {e}")
             return
     state.update({
@@ -1640,6 +1618,26 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
         except Exception:
             pass
 
+    # NEW: Supertrend flip vote
+    try:
+        st_dir = int(ind.get("st_dir") or 0)
+        if (side == "long" and st_dir == -1) or (side == "short" and st_dir == 1):
+            reverse_votes += 1
+            vote_details.append("ST_flip")
+    except Exception:
+        pass
+
+    # NEW: DI flip (strong)
+    try:
+        pdi = float(ind.get("plus_di") or 0.0)
+        mdi = float(ind.get("minus_di") or 0.0)
+        if side == "long" and (mdi - pdi) > DI_FLIP_BUFFER:
+            reverse_votes += 1; vote_details.append("DI_flip")
+        if side == "short" and (pdi - mdi) > DI_FLIP_BUFFER:
+            reverse_votes += 1; vote_details.append("DI_flip")
+    except Exception:
+        pass
+
     # Two confirming candles against position
     try:
         df_local = df_cached if df_cached is not None else fetch_ohlcv()
@@ -1652,14 +1650,15 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
         candle_ok = False
 
     # Set soft block state
-    if (elapsed_bar < MIN_HOLD_BARS or elapsed_s < MIN_HOLD_SECONDS) and (reverse_votes < PATIENCE_NEED_CONSENSUS or not candle_ok):
+    need = max(PATIENCE_NEED_CONSENSUS, 3)  # REVERSE_NEED_VOTES = 3
+    if (elapsed_bar < MIN_HOLD_BARS or elapsed_s < MIN_HOLD_SECONDS) and (reverse_votes < need or not candle_ok):
         state["_exit_soft_block"] = True
-        if DEBUG_PATIENCE:
-            logging.info(f"PAT: early-bars block (bars={elapsed_bar}, votes={reverse_votes}/{PATIENCE_NEED_CONSENSUS})")
     else:
         state["_exit_soft_block"] = False
-        if DEBUG_PATIENCE and reverse_votes >= PATIENCE_NEED_CONSENSUS:
-            logging.info(f"PAT: consensus={reverse_votes}/{PATIENCE_NEED_CONSENSUS} ({', '.join(vote_details)})")
+
+    # أمنع أي إغلاق كامل قبل TP1 إلا إذا كان الانعكاس قوي جدًا (>=4 أصوات)
+    if not state.get("tp1_done") and False and reverse_votes < 4:  # REVERSE_ALLOW_BEFORE_TP1 = False
+        state["_exit_soft_block"] = True
 
     # ---- cached df/prev_ind usage ----
     df_local = df_cached if df_cached is not None else fetch_ohlcv()
@@ -1675,6 +1674,36 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     if post_entry_action:
         print(colored(f"🎯 POST-ENTRY: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}", "cyan"))
         logging.info(f"POST_ENTRY_ACTION: {post_entry_action} - Trade Mode: {state.get('trade_mode', 'N/A')}")
+
+    # NEW: قاعدة "قرب السوبرتريند" قبل أي إغلاق نهائي
+    try:
+        st_val = ind.get("st"); st_dir = int(ind.get("st_dir") or 0)
+        px = info.get("price"); atr = float(ind.get("atr") or 0.0)
+        pdi = float(ind.get("plus_di") or 0.0); mdi = float(ind.get("minus_di") or 0.0)
+        if state["open"] and st_val is not None and px is not None and atr > 0:
+            dist = abs(px - st_val)
+            near = dist <= ST_NEAR_ATR * atr
+            far  = dist >= ST_FAR_ATR  * atr
+            # لو السوبرتريند بعيد والاتجاه قوي → نؤجل جني الأرباح (نركب الترند)
+            if far and state.get("_consensus_score", 0) >= STRONG_HOLD_SCORE:
+                state["_exit_soft_block"] = True  # يمنع إغلاق كامل مبكر
+            # لو السوبرتريند قريب + إشارة ضعف/عكس من DI/ST → تقليل جزئي/تفعيل تريل
+            if near:
+                di_flip = (state["side"] == "long" and mdi > pdi) or (state["side"] == "short" and pdi > mdi)
+                st_flip = (state["side"] == "long" and st_dir == -1) or (state["side"] == "short" and st_dir == 1)
+                if di_flip or st_flip:
+                    # تقليل محافظ لو قبل TP1، وإلا تريل/إغلاق صارم
+                    if not state.get("tp1_done"):
+                        close_partial(min(0.25, HOLD_MAX_PARTIAL_FRAC), "ST proximity warn")
+                        state["tp1_done"] = True
+                    else:
+                        gap = atr * (state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL)
+                        if state["side"] == "long":
+                            state["trail"] = max(state.get("trail") or (px - gap), px - gap)
+                        else:
+                            state["trail"] = min(state.get("trail") or (px + gap), px + gap)
+    except Exception as e:
+        print(colored(f"⚠️ ST proximity check error: {e}", "yellow"))
 
     # Patience guard BEFORE any final close decisions
     if ENABLE_PATIENCE and state.get("_exit_soft_block"):
@@ -2040,10 +2069,8 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         print(colored(f"   🧭 TCI={state['tci']:.0f}/100 • Chop01={state.get('chop01',0):.2f} → {hold_msg}", "cyan" if state.get("_hold_trend") else "blue"))
     
     # NEW: عرض التوقع والهدف القادم (ديناميكي)
-    tp_list = state.get("_tp_ladder")
-    if tp_list and state.get("profit_targets_achieved",0) < len(tp_list):
-        nxt = tp_list[state.get("profit_targets_achieved",0)]
-        pot = sum(tp_list[state.get("profit_targets_achieved",0):])
+    if state.get("_tp_ladder"):
+        nxt = state["_tp_ladder"][state.get("profit_targets_achieved",0)]
         print(colored(f"   🎯 Dynamic TP: next={nxt:.2f}% • ATR%≈{state.get('_atr_pct',0):.2f} • Consensus={state.get('_consensus_score',0):.1f}/5", "magenta"))
     
     if not state["open"] and wait_for_next_signal_side:
