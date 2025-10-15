@@ -1754,8 +1754,8 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
     current_tp1_pct = TP1_PCT * tp_multiplier
     current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
-    current_tp1_pct_pct = current_tp1_pct * 100.0
-    current_trail_activate_pct = current_trail_activate * 100.0
+    current_tp1_pct_pct = current_tp1_pct
+    current_trail_activate_pct = current_trail_activate
     trail_mult_to_use = state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL
 
     if state.get("trade_mode") is None:
@@ -2069,8 +2069,10 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         print(colored(f"   🧭 TCI={state['tci']:.0f}/100 • Chop01={state.get('chop01',0):.2f} → {hold_msg}", "cyan" if state.get("_hold_trend") else "blue"))
     
     # NEW: عرض التوقع والهدف القادم (ديناميكي)
-    if state.get("_tp_ladder"):
-        nxt = state["_tp_ladder"][state.get("profit_targets_achieved",0)]
+    ach = state.get("profit_targets_achieved", 0)
+    lad = state.get("_tp_ladder") or []
+    if ach < len(lad):
+        nxt = lad[ach]
         print(colored(f"   🎯 Dynamic TP: next={nxt:.2f}% • ATR%≈{state.get('_atr_pct',0):.2f} • Consensus={state.get('_consensus_score',0):.1f}/5", "magenta"))
     
     if not state["open"] and wait_for_next_signal_side:
@@ -2127,8 +2129,8 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         adx = ind.get("adx", 0)
         tp_multiplier, trail_multiplier = get_dynamic_tp_params(adx)
         if tp_multiplier > 1.0:
-            current_tp1_pct = TP1_PCT * tp_multiplier * 100.0
-            current_trail_activate = TRAIL_ACTIVATE * trail_multiplier * 100.0
+            current_tp1_pct = TP1_PCT * tp_multiplier
+            current_trail_activate = TRAIL_ACTIVATE * trail_multiplier
             print(colored(f"   🚀 TREND AMPLIFIER ACTIVE: TP={current_tp1_pct:.2f}% • TrailActivate={current_trail_activate:.2f}%", "cyan"))
         trail_mult = get_trail_multiplier({**ind, "price": info.get("price")})
         trail_type = "STRONG" if trail_mult == TRAIL_MULT_STRONG else "MED" if trail_mult == TRAIL_MULT_MED else "CHOP"
