@@ -168,6 +168,12 @@ CHOP_MAX_FOR_HOLD = 0.35     # أقصى تذبذب مسموح لتفعيل HOLD
 HOLD_MAX_PARTIAL_FRAC = 0.25 # أقصى إغلاق جزئي أثناء HOLD
 HOLD_RATCHET_LOCK_PCT_ON_HOLD = 0.80  # شدّ قفل الارتداد أثناء HOLD
 
+# ====== Dynamic Profit-Taking (consensus-driven) ======
+# نقاط الإجماع (كل ما زاد كل ما زاد احتمالية استمرار الحركة)
+HOLD_SCORE            = 3.0   # إجماع جيد → نخفف جني الربح
+STRONG_HOLD_SCORE     = 4.0   # إجماع قوي جدًا → نؤجل TP ونركب الترند
+DEFER_TP_UNTIL_IDX    = 2     # مع إجماع قوي جدًا نؤجل حتى هدف رقم 2 كحد أدنى
+
 print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
 print(colored(f"STRATEGY: {STRATEGY.upper()} • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
 
@@ -619,6 +625,58 @@ def compute_tci_and_chop(df: pd.DataFrame, ind: dict, side: str):
             "hold_mode": (tci >= HOLD_TCI and chop <= CHOP_MAX_FOR_HOLD),
             "strong_hold": (tci >= HOLD_STRONG_TCI and chop <= CHOP_MAX_FOR_HOLD*1.1)}
 
+# -------- NEW: مؤشر إجماع + سلّم أهداف ديناميكي حسب ATR --------
+def _indicator_consensus(info: dict, ind: dict, side: str) -> float:
+    """درجة 0..5 تقريبًا: Supertrend، DI، RSI، ADX، RF-cross، Chop"""
+    score = 0.0
+    try:
+        st_dir = int(ind.get("st_dir") or 0)
+        adx    = float(ind.get("adx") or 0.0)
+        rsi    = float(ind.get("rsi") or 50.0)
+        pdi    = float(ind.get("plus_di") or 0.0)
+        mdi    = float(ind.get("minus_di") or 0.0)
+        rf     = info.get("filter")
+        px     = info.get("price")
+        # Supertrend
+        if (side == "long" and st_dir == 1) or (side == "short" and st_dir == -1): score += 1.0
+        # DI
+        if (side == "long" and pdi > mdi) or (side == "short" and mdi > pdi):      score += 1.0
+        # RSI
+        if (side == "long" and rsi >= RSI_TREND_BUY) or (side == "short" and rsi <= RSI_TREND_SELL): score += 1.0
+        # ADX (قوة الترند)
+        if adx >= 28: score += 1.0
+        elif adx >= 20: score += 0.5
+        # RF cross بهسترة بسيطة
+        try:
+            if px is not None and rf is not None:
+                if (side == "long" and px > rf) or (side == "short" and px < rf): score += 0.5
+        except Exception:
+            pass
+        # قلة التشويش
+        chop01 = state.get("chop01", None)
+        if chop01 is not None and chop01 <= CHOP_MAX_FOR_HOLD: score += 0.5
+    except Exception:
+        pass
+    return float(score)
+
+def _build_tp_ladder(info: dict, ind: dict, side: str):
+    """يعيد ([أهداف%...], [نِسَب الإغلاق…], atr_pct, score)"""
+    px = info.get("price") or state.get("entry")
+    atr = float(ind.get("atr") or 0.0)
+    atr_pct = (atr / max(float(px or 0.0), 1e-9)) * 100.0 if px else 0.5
+    score = _indicator_consensus(info, ind, side)
+    # مضاعِفات ATR حسب الإجماع
+    if score >= STRONG_HOLD_SCORE:
+        mults = [1.8, 3.2, 5.0]
+    elif score >= HOLD_SCORE:
+        mults = [1.6, 2.8, 4.5]
+    else:
+        mults = [1.2, 2.4, 4.0]
+    targets = [round(m * atr_pct, 2) for m in mults]
+    # نسب الإغلاق (محافظة أولاً، ثم تزيد)
+    close_fracs = [0.25, 0.30, 0.45]
+    return targets, close_fracs, atr_pct, score
+
 # ------------ State & Sync (التصحيح A و B) ------------
 state={
     "open": False, "side": None, "entry": None, "qty": 0.0, 
@@ -647,7 +705,12 @@ state={
     "tp2_done": False,
     "tci": None,
     # B) استخدام chop01 بدلاً من chop
-    "chop01": None
+    "chop01": None,
+    # NEW: Dynamic TP ladder
+    "_tp_ladder": None,
+    "_tp_fracs": None,
+    "_consensus_score": None,
+    "_atr_pct": None
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -700,7 +763,12 @@ def sync_from_exchange_once():
                 "tp2_done": False,
                 "tci": None,
                 # B) استخدام chop01 بدلاً من chop
-                "chop01": None
+                "chop01": None,
+                # NEW: Dynamic TP ladder
+                "_tp_ladder": None,
+                "_tp_fracs": None,
+                "_consensus_score": None,
+                "_atr_pct": None
             })
             print(colored(f"✅ Synced position ⇒ {side.upper()} qty={fmt(qty,4)} @ {fmt(entry)}","green"))
             logging.info(f"Position synced: {side} qty={qty} entry={entry}")
@@ -1136,20 +1204,27 @@ def scalp_profit_taking(ind: dict, info: dict):
     return None
 
 # ------------ Trend Profit Taking (التصحيح C) ------------
-def trend_profit_taking(ind: dict, info: dict, df_cached: pd.DataFrame):  # إضافة df_cached
+def trend_profit_taking(ind: dict, info: dict, df_cached: pd.DataFrame):
     if not state["open"] or state["qty"] <= 0:
         return None
     price = ind.get("price") or price_now() or state["entry"]
     entry = state["entry"]; side = state["side"]
     rr = (price - entry) / entry * 100 * (1 if side == "long" else -1)
-    adx = float(ind.get("adx") or 0.0)
-    targets = TREND_TARGETS; fracs = TREND_CLOSE_FRACS
+    # استخدم سلّم الأهداف الديناميكي
+    targets = state.get("_tp_ladder", TREND_TARGETS)
+    fracs   = state.get("_tp_fracs",  TREND_CLOSE_FRACS)
     k = int(state.get("profit_targets_achieved", 0))
+    # إجماع حالي لتأجيل الإغلاق عند القوة العالية
+    cscore = float(state.get("_consensus_score", 0.0))
     if k < len(targets) and rr >= targets[k]:
-        close_partial(fracs[k], f"TREND TP{k+1}@{targets[k]:.2f}%")
+        # مع إجماع قوي جدًا نؤجل TP حتى هدف أعلى (إن أمكن)
+        if cscore >= STRONG_HOLD_SCORE and k < max(DEFER_TP_UNTIL_IDX, len(targets)-1):
+            return None
+        close_partial(fracs[k], f"TP{k+1}@{targets[k]:.2f}% (dyn)")
         state["profit_targets_achieved"] = k + 1
         return f"TREND_TP{k+1}"
-    if adx >= MIN_TREND_HOLD_ADX:
+    # لو الترند قوي لا نستعجل الخروج الكامل
+    if float(ind.get("adx") or 0.0) >= MIN_TREND_HOLD_ADX:
         return None
     # C) استخدام df_cached بدلاً من fetch_ohlcv()
     if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(df_cached), info):
@@ -1236,13 +1311,24 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if alpha_action:
         return alpha_action
 
+    # 🔥 CRITICAL FIX: Always use TREND mode for dynamic profit-taking
     if state.get("trade_mode") is None:
-        trade_mode = determine_trade_mode(df, ind)
+        trade_mode = "TREND"  # Force TREND mode for better profits
         state["trade_mode"] = trade_mode
         state["profit_targets_achieved"] = 0
         state["entry_time"] = time.time()
-        print(colored(f"🎯 TRADE MODE DETECTED: {trade_mode}", "cyan"))
-        logging.info(f"Trade mode detected: {trade_mode}")
+        print(colored(f"🎯 TRADE MODE SET: {trade_mode} (Dynamic Profit-Taking Enabled)", "cyan"))
+        logging.info(f"Trade mode set: {trade_mode}")
+
+    # 🔥 NEW: Update dynamic TP ladder
+    try:
+        tp_list, tp_fracs, atr_pct, cscore = _build_tp_ladder(info, ind, state.get("side"))
+        state["_tp_ladder"] = tp_list
+        state["_tp_fracs"]  = tp_fracs
+        state["_consensus_score"] = cscore
+        state["_atr_pct"] = atr_pct
+    except Exception as e:
+        print(colored(f"⚠️ Dynamic TP ladder error: {e}", "yellow"))
 
     # Use protected close for wick/impulse harvest
     impulse_action = handle_impulse_and_long_wicks(df, ind)
@@ -1253,67 +1339,8 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     if ratchet_action:
         return ratchet_action
 
-    # ---- Smart Harvest v2 helpers (local only) ----
-    def _adaptive_trail_mult(_ind: dict) -> float:
-        adx = float(_ind.get("adx") or 0.0)
-        rsi = float(_ind.get("rsi") or 50.0)
-        side = state.get("side")
-        strong = (adx >= 30 and ((side == "long" and rsi >= 55) or (side == "short" and rsi <= 45)))
-        weak   = (adx < 20)
-        return 2.4 if strong else (1.6 if weak else 2.0)
-
-    def smart_harvest(_df: pd.DataFrame, _ind: dict, _info: dict):
-        if not state.get("open") or state.get("qty", 0) <= 0:
-            return
-        px = float(_ind.get("price") or _info.get("price") or 0.0)
-        e  = float(state.get("entry") or 0.0)
-        side = state.get("side")
-        if not (px and e and side):
-            return
-        rr = (px - e) / e * 100.0 * (1 if side == "long" else -1)
-        atr = float(_ind.get("atr") or 0.0)
-
-        # A) استخدام الأعلام الموحدة
-        if not state.get("tp1_done") and rr >= TP1_PCT_SCALED * 100.0:
-            _tp0_guard_close(TP1_FRAC, f"TP1 @{TP1_PCT_SCALED*100:.2f}%")
-            state["tp1_done"] = True
-            state["breakeven"] = e
-
-        # A) استخدام الأعلام الموحدة
-        if not state.get("tp2_done") and rr >= TP2_PCT_SCALED * 100.0:
-            _tp0_guard_close(TP2_FRAC, f"TP2 @{TP2_PCT_SCALED*100:.2f}%")
-            state["tp2_done"] = True
-
-        if rr > state.get("highest_profit_pct", 0.0):
-            state["highest_profit_pct"] = rr
-        hp = state.get("highest_profit_pct", 0.0)
-        if hp and rr < hp * RATCHET_LOCK_PCT:
-            _tp0_guard_close(0.50, f"Ratchet lock {hp:.2f}%→{rr:.2f}%")
-            state["highest_profit_pct"] = rr
-
-        if atr and rr >= (TP1_PCT_SCALED * 100.0):
-            mult = _adaptive_trail_mult(_ind)
-            if side == "long":
-                new_trail = px - atr * mult
-                state["trail"] = max(state.get("trail") or new_trail, new_trail, state.get("breakeven") or new_trail)
-                if px < state["trail"]:
-                    close_market_strict(f"TRAIL_ATR({mult}x)")
-            else:
-                new_trail = px + atr * mult
-                state["trail"] = min(state.get("trail") or new_trail, new_trail, state.get("breakeven") or new_trail)
-                if px > state["trail"]:
-                    close_market_strict(f"TRAIL_ATR({mult}x)")
-            if DEBUG_HARVEST:
-                logging.info(f"HARV rr={rr:.2f}% trail_mult={mult} hp={state.get('highest_profit_pct',0):.2f}")
-
-    # ---- invoke Smart Harvest v2 (non-intrusive) ----
-    smart_harvest(df, ind, info)
-
-    # C) تمرير df المخزن بدل fetch_ohlcv إضافي
-    if state["trade_mode"] == "SCALP":
-        return scalp_profit_taking(ind, info)
-    else:
-        return trend_profit_taking(ind, info, df)  # تمرير df هنا
+    # Always use trend profit taking with dynamic targets
+    return trend_profit_taking(ind, info, df)
 
 # ------------ Orders ------------
 def open_market(side, qty, price):
@@ -1361,7 +1388,12 @@ def open_market(side, qty, price):
         "_hold_trend": False,
         "tci": None,
         # B) استخدام chop01 بدلاً من chop
-        "chop01": None
+        "chop01": None,
+        # NEW: Dynamic TP ladder
+        "_tp_ladder": None,
+        "_tp_fracs": None,
+        "_consensus_score": None,
+        "_atr_pct": None
     })
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)}","green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -1458,7 +1490,12 @@ def reset_after_full_close(reason, prev_side=None):
         "_hold_trend": False,
         "tci": None,
         # B) استخدام chop01 بدلاً من chop
-        "chop01": None
+        "chop01": None,
+        # NEW: Dynamic TP ladder
+        "_tp_ladder": None,
+        "_tp_fracs": None,
+        "_consensus_score": None,
+        "_atr_pct": None
     })
     if prev_side == "long":
         wait_for_next_signal_side = "sell"
@@ -2002,6 +2039,13 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
                    ("ما تخافيش — الهبوط قوي" if state.get("_hold_trend") and state.get("side")=="short" else "إدارة عادية")
         print(colored(f"   🧭 TCI={state['tci']:.0f}/100 • Chop01={state.get('chop01',0):.2f} → {hold_msg}", "cyan" if state.get("_hold_trend") else "blue"))
     
+    # NEW: عرض التوقع والهدف القادم (ديناميكي)
+    tp_list = state.get("_tp_ladder")
+    if tp_list and state.get("profit_targets_achieved",0) < len(tp_list):
+        nxt = tp_list[state.get("profit_targets_achieved",0)]
+        pot = sum(tp_list[state.get("profit_targets_achieved",0):])
+        print(colored(f"   🎯 Dynamic TP: next={nxt:.2f}% • ATR%≈{state.get('_atr_pct',0):.2f} • Consensus={state.get('_consensus_score',0):.1f}/5", "magenta"))
+    
     if not state["open"] and wait_for_next_signal_side:
         print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} signal from TradingView Range Filter", "cyan"))
     if state["open"] and state["fakeout_pending"]:
@@ -2241,7 +2285,7 @@ def home():
         print("GET / HTTP/1.1 200")
         root_logged = True
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER — SMART ALPHA PACK — FEARLESS HOLD PACK"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — {STRATEGY.upper()} — ADVANCED — TREND AMPLIFIER — HARDENED — TREND CONFIRMATION — INSTANT ENTRY — PURE RANGE FILTER — STRICT EXCHANGE CLOSE — SMART POST-ENTRY MANAGEMENT — CLOSED CANDLE SIGNALS — WAIT FOR NEXT SIGNAL AFTER CLOSE — FAKEOUT PROTECTION — ADVANCED PROFIT TAKING — OPPOSITE SIGNAL WAITING — CORRECTED WICK HARVESTING — BREAKOUT ENGINE — EMERGENCY PROTECTION LAYER — SMART ALPHA PACK — FEARLESS HOLD PACK — DYNAMIC PROFIT TAKING"
 
 @app.route("/metrics")
 def metrics():
@@ -2273,7 +2317,11 @@ def metrics():
             "tci": state.get("tci"),
             # B) استخدام chop01 بدلاً من chop
             "chop01": state.get("chop01"),
-            "hold_mode": state.get("_hold_trend", False)
+            "hold_mode": state.get("_hold_trend", False),
+            # NEW: Dynamic TP features
+            "tp_ladder": state.get("_tp_ladder"),
+            "consensus_score": state.get("_consensus_score"),
+            "atr_pct": state.get("_atr_pct")
         },
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
         "waiting_for_signal": wait_for_next_signal_side,
@@ -2311,6 +2359,11 @@ def metrics():
             "hold_mode": state.get("_hold_trend", False),
             "hold_tci_threshold": HOLD_TCI,
             "strong_hold_tci_threshold": HOLD_STRONG_TCI
+        },
+        "dynamic_profit_taking": {
+            "hold_score": HOLD_SCORE,
+            "strong_hold_score": STRONG_HOLD_SCORE,
+            "defer_tp_until_idx": DEFER_TP_UNTIL_IDX
         }
     })
 
@@ -2342,6 +2395,11 @@ def health():
             # B) استخدام chop01 بدلاً من chop
             "chop01": state.get("chop01"),
             "hold_mode": state.get("_hold_trend", False)
+        },
+        "dynamic_profit_taking": {
+            "consensus_score": state.get("_consensus_score"),
+            "atr_pct": state.get("_atr_pct"),
+            "tp_ladder": state.get("_tp_ladder")
         }
     }), 200
 
@@ -2363,7 +2421,7 @@ if __name__ == "__main__":
     setup_file_logging()
     _validate_market_specs()
 
-    print(colored("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS & SMART ALPHA PACK & FEARLESS HOLD...", "green"))
+    print(colored("✅ Starting HARDENED Flask server with ALL PROTECTION LAYERS & SMART ALPHA PACK & FEARLESS HOLD & DYNAMIC PROFIT TAKING...", "green"))
 
     load_state()
 
