@@ -157,6 +157,41 @@ HOLD_RATCHET_LOCK_PCT_ON_HOLD = 0.80
 # Keepalive
 KEEPALIVE_SECONDS = 50
 
+# === Scout entries (when FLAT) ===
+ONE_IMPULSE_ENABLED        = True   # دخول بعد شمعة اندفاع قوية
+ONE_IMPULSE_BODY_ATR       = 1.30   # جسم ≥ 1.30×ATR
+ONE_IMPULSE_WICK_MAX_PCT   = 0.20   # الذيل العكسي < 20% من المدى
+ONE_IMPULSE_VOL_SPIKE      = 1.50   # حجم ≥ 1.5×MA20
+ONE_IMPULSE_MIN_ADX        = 18
+ONE_IMPULSE_MIN_SCORE      = 3.0
+ONE_IMPULSE_SIZE_FRAC      = 0.65   # دخول جزئي بالحجم
+ONE_IMPULSE_SPREAD_MAX_BPS = 6.0
+
+EXPLOSION_SCOUT_ENABLED    = True   # انفجار مفاجئ
+EXPLOSION_ATR_RATIO        = 1.60   # ATR_now / ATR_prev ≥ 1.6
+EXPLOSION_VOL_SPIKE        = 1.60   # حجم ≥ 1.6×MA20
+EXPLOSION_MIN_ADX          = 20
+EXPLOSION_MIN_SCORE        = 3.0
+EXPLOSION_SIZE_FRAC        = 0.60
+EXPLOSION_SPREAD_MAX_BPS   = 6.0
+
+# Micro-TP & patience for scout trades
+SCOUT_TP1_MULT_ATR_PCT     = 1.0    # الهدف1 ≈ 1×ATR%
+SCOUT_TP2_MULT_ATR_PCT     = 2.0    # الهدف2 ≈ 2×ATR%
+SCOUT_TP_FRACS             = (0.50, 0.50)
+SCOUT_TRAIL_ATR_MULT       = 0.0   # عشان ما فيش تريل أصلاً لسكالب الانفجار
+SCOUT_TIMEOUT_BARS         = 6      # لو مفيش تقدم، نقفل
+SCOUT_MIN_PROGRESS_PCT     = 0.30   # أقل تقدم (٪) قبل منهي المهلة
+
+# === Scout settle exit (no early trail) ===
+SCOUT_USE_SETTLE_EXIT        = True
+SCOUT_DISABLE_TRAIL          = True     # الغِ التريل لصفقات SCOUT/EXPLOSION
+SCOUT_SETTLE_ATR_DROP_RATIO  = 0.78     # ATR يهبط ≤ 78% من الذروة منذ الدخول
+SCOUT_SETTLE_VOL_BACK        = 1.15     # الحجم يرجع ~طبيعي: vol_now / MA20 ≤ 1.15
+SCOUT_SETTLE_SMALL_BARS      = 2        # عدد شموع صغيرة متتالية
+SCOUT_SMALL_BODY_MAX         = 0.35     # الشمعة الصغيرة = جسم ≤ 35% من مدى الشمعة
+SCOUT_EMA9_OPP_CLOSES        = 2        # عدد إغلاقات عكسية عبر EMA9 لتأكيد الهدوء
+
 # =================== LOGGING ===================
 def setup_file_logging():
     logger = logging.getLogger()
@@ -907,6 +942,178 @@ def ema_touch_harvest(info: dict, ind: dict):
             close_market_strict("EMA20 break + slope flip (weak ADX)")
     return acted
 
+# =================== SCOUT SETTLE EXIT ===================
+def scout_settle_exit(df: pd.DataFrame, ind: dict) -> bool:
+    """يغلق صفقات SCOUT/EXPLOSION عند هدوء الانفجار (بدون تريل)."""
+    if not (SCOUT_USE_SETTLE_EXIT and state.get("open") and state.get("trade_mode") in ("SCOUT","EXPLOSION")):
+        return False
+    try:
+        atr = float(ind.get("atr") or 0.0)
+        if atr <= 0: return False
+
+        # ذروة ATR منذ الدخول
+        peak = state.get("scout_peak_atr")
+        if peak is None: 
+            peak = atr
+        else:
+            peak = max(peak, atr)  # نتابع الذروة
+        state["scout_peak_atr"] = peak
+
+        # حجم يعود لطبيعته
+        vol_now = float(df["volume"].iloc[-1])
+        vol_ma = float(df["volume"].iloc[-21:-1].astype(float).mean() if len(df) >= 21 else 0.0)
+        calm_vol = (vol_ma > 0) and (vol_now / vol_ma <= SCOUT_SETTLE_VOL_BACK)
+
+        # شموع صغيرة متتالية
+        small = 0
+        need = int(SCOUT_SETTLE_SMALL_BARS)
+        for i in range(1, need + 1):
+            if len(df) < i + 1: break
+            o = float(df["open"].iloc[-i])
+            h = float(df["high"].iloc[-i])
+            l = float(df["low"].iloc[-i])
+            c = float(df["close"].iloc[-i])
+            rng = max(h - l, 1e-12)
+            body = abs(c - o)
+            if (body / rng) <= SCOUT_SMALL_BODY_MAX:
+                small += 1
+        small_ok = (small >= need)
+
+        # إغلاقات عكسية عبر EMA9
+        ema9 = float(ind.get("ema9") or 0.0)
+        opp = 0
+        for i in range(1, int(SCOUT_EMA9_OPP_CLOSES) + 1):
+            if len(df) < i: break
+            ci = float(df["close"].iloc[-i])
+            if (state["side"] == "long" and ci < ema9) or (state["side"] == "short" and ci > ema9):
+                opp += 1
+        ema_conf = (opp >= int(SCOUT_EMA9_OPP_CLOSES))
+
+        # هبوط تقلب واضح + حجم هادئ + (شموع صغيرة أو تأكيد EMA)
+        atr_drop = (atr <= peak * SCOUT_SETTLE_ATR_DROP_RATIO)
+
+        if atr_drop and calm_vol and (small_ok or ema_conf):
+            close_market_strict("SCOUT settle exit (calm)")
+            return True
+    except Exception as e:
+        logging.error(f"scout_settle_exit error: {e}")
+    return False
+
+# =================== SCOUT ENTRIES ===================
+def _atr_pct_from(ind: dict, price: float) -> float:
+    atr = float(ind.get("atr") or 0.0)
+    return (atr / max(float(price or 0.0), 1e-9)) * 100.0 if (atr and price) else 0.5
+
+def _apply_micro_tp_ladder(ind: dict, price: float, mode: str):
+    atr_pct = _atr_pct_from(ind, price)
+    if mode == "SCOUT":
+        t1 = round(SCOUT_TP1_MULT_ATR_PCT * atr_pct, 2)
+        t2 = round(SCOUT_TP2_MULT_ATR_PCT * atr_pct, 2)
+        fracs = list(SCOUT_TP_FRACS)
+    else:  # EXPLOSION
+        t1 = round(1.2 * atr_pct, 2)
+        t2 = round(2.4 * atr_pct, 2)
+        fracs = [0.40, 0.60]
+    state["_tp_ladder"] = [t1, t2]
+    state["_tp_fracs"]  = fracs
+    state["_consensus_score"] = None
+    state["_atr_pct"] = atr_pct
+    # ⬇️ التعديل هنا - لا تريل لسكالب الانفجار
+    state["_adaptive_trail_mult"] = 0.0 if (SCOUT_DISABLE_TRAIL and mode in ("SCOUT","EXPLOSION")) else SCOUT_TRAIL_ATR_MULT
+    state["profit_targets_achieved"] = 0
+
+def scout_impulse_entry(df_closed: pd.DataFrame, ind: dict, bal: float, spread_bps: float) -> bool:
+    if not ONE_IMPULSE_ENABLED or state["open"]: return False
+    if spread_bps is not None and spread_bps > ONE_IMPULSE_SPREAD_MAX_BPS: return False
+    if len(df_closed) < 21: return False
+
+    atr = float(ind.get("atr") or 0.0)
+    if atr <= 0: return False
+
+    o,h,l,c = [float(df_closed[x].iloc[-1]) for x in ["open","high","low","close"]]
+    rng = max(h-l, 1e-12); body = abs(c-o)
+    upper = h - max(o,c); lower = min(o,c) - l
+    bull = c > o; bear = c < o
+    opp_wick_pct = (lower if bull else upper)/rng
+
+    # حجم
+    vol_now = float(df_closed["volume"].iloc[-1])
+    vol_ma  = float(df_closed["volume"].iloc[-21:-1].astype(float).mean() or 0.0)
+    vol_ok  = (vol_ma>0) and (vol_now/vol_ma >= ONE_IMPULSE_VOL_SPIKE)
+
+    # تقييم
+    score = 0.0
+    if body >= ONE_IMPULSE_BODY_ATR*atr and opp_wick_pct <= ONE_IMPULSE_WICK_MAX_PCT: score += 1.0
+    adx = float(ind.get("adx") or 0.0); pdi=float(ind.get("plus_di") or 0.0); mdi=float(ind.get("minus_di") or 0.0)
+    if adx >= ONE_IMPULSE_MIN_ADX: score += 1.0
+    if (bull and pdi>mdi) or (bear and mdi>pdi): score += 1.0
+    rsi = float(ind.get("rsi") or 50.0)
+    if (bull and rsi>=55) or (bear and rsi<=45): score += 0.5
+    ema9 = float(ind.get("ema9") or 0.0); ema20=float(ind.get("ema20") or 0.0); slope=float(ind.get("ema9_slope") or 0.0)
+    if (bull and ema9>ema20 and slope>0) or (bear and ema9<ema20 and slope<0): score += 0.5
+    hh = float(df_closed["high"].iloc[-20:-1].astype(float).max()); ll = float(df_closed["low"].iloc[-20:-1].astype(float).min())
+    if (bull and h>hh) or (bear and l<ll): score += 0.5
+    if vol_ok: score += 0.5
+
+    # منع إنهاك/سحب سيولة معكوس
+    overbought = (bull and rsi>=70) or (bear and rsi<=30)
+    dist_ema20 = abs(c-ema20)
+    exhaustion = overbought or (dist_ema20 >= 1.8*atr)
+    if exhaustion: return False
+    if score < ONE_IMPULSE_MIN_SCORE: return False
+
+    side = "buy" if bull else "sell"
+    qty  = safe_qty(compute_size(bal, c) * ONE_IMPULSE_SIZE_FRAC)
+    if qty <= 0: return False
+    open_market(side, qty, c)
+    state["trade_mode"] = "SCOUT"
+    state["opened_by_impulse"] = True
+    _apply_micro_tp_ladder(ind, c, "SCOUT")
+    state["scout_started_bar"] = state.get("bars", 0)
+    state["scout_peak_atr"] = float(ind.get("atr") or 0.0)  # حفظ ذروة ATR
+    state["last_action"] = "OPEN"; state["action_reason"] = f"SCOUT-IMPULSE score={score:.1f}"
+    return True
+
+def scout_explosion_entry(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: float, spread_bps: float) -> bool:
+    if not EXPLOSION_SCOUT_ENABLED or state["open"]: return False
+    if spread_bps is not None and spread_bps > EXPLOSION_SPREAD_MAX_BPS: return False
+    if len(df) < 22: return False
+
+    price = float(df["close"].iloc[-1])
+    atr_now = float(ind.get("atr") or 0.0); atr_prev = float(prev_ind.get("atr") or atr_now)
+    if atr_prev <= 0: return False
+    atr_ratio = atr_now/atr_prev
+
+    vol_now = float(df["volume"].iloc[-1]); vol_ma = float(df["volume"].iloc[-21:-1].astype(float).mean() or 0.0)
+    vol_ratio = (vol_now/vol_ma) if vol_ma>0 else 0.0
+
+    adx = float(ind.get("adx") or 0.0); rsi=float(ind.get("rsi") or 50.0)
+    hh = float(df["high"].iloc[-20:-1].astype(float).max()); ll = float(df["low"].iloc[-20:-1].astype(float).min())
+
+    score = 0.0
+    if atr_ratio >= EXPLOSION_ATR_RATIO: score += 1.0
+    if vol_ratio >= EXPLOSION_VOL_SPIKE: score += 1.0
+    if adx >= EXPLOSION_MIN_ADX: score += 1.0
+
+    # اتجاه الانفجار (كسر نطاق)
+    bull = price > hh
+    bear = price < ll
+    if bull or bear: score += 0.5
+
+    if score < EXPLOSION_MIN_SCORE: return False
+
+    side = "buy" if bull else ("sell" if bear else ("buy" if rsi>50 else "sell"))
+    qty  = safe_qty(compute_size(bal, price) * EXPLOSION_SIZE_FRAC)
+    if qty <= 0: return False
+    open_market(side, qty, price)
+    state["trade_mode"] = "EXPLOSION"
+    state["opened_by_explosion"] = True
+    _apply_micro_tp_ladder(ind, price, "EXPLOSION")
+    state["scout_started_bar"] = state.get("bars", 0)
+    state["scout_peak_atr"] = float(ind.get("atr") or 0.0)  # حفظ ذروة ATR
+    state["last_action"] = "OPEN"; state["action_reason"] = f"SCOUT-EXPLOSION score={score:.1f} atrx={atr_ratio:.2f} volx={vol_ratio:.2f}"
+    return True
+
 # =================== EXIT / POST-ENTRY ===================
 def trend_end_confirmed(ind: dict, candle_info: dict, info: dict) -> bool:
     adx = float(ind.get("adx") or 0.0)
@@ -949,6 +1156,12 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     hold = compute_tci_and_chop(df, ind, state.get("side"))
     state["_hold_trend"]=bool(hold["hold_mode"])
     state["tci"]=hold["tci"]; state["chop01"]=hold["chop01"]
+    
+    # خروج هدوء خاص بصفقات الانفجار/الانهيار
+    if state.get("trade_mode") in ("SCOUT", "EXPLOSION"):
+        if scout_settle_exit(df, ind):
+            return "SCOUT_SETTLE_EXIT"
+    
     if hold["strong_hold"]:
         state["_adaptive_trail_mult"]=max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, TRAIL_MULT_STRONG_ALPHA)
     if state.get("trade_mode") is None: state["trade_mode"]="TREND"; state["profit_targets_achieved"]=0
@@ -974,6 +1187,14 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
 
     act = ratchet_protection(ind)
     if act: return act
+    
+    # مهلة صبر قصيرة لصفقات السكالب (لو مفيش تقدم.. نقفل)
+    if state.get("trade_mode") in ("SCOUT","EXPLOSION"):
+        started = state.get("scout_started_bar", state.get("bars",0))
+        if (state.get("bars",0) - started) >= SCOUT_TIMEOUT_BARS and float(state.get("highest_profit_pct",0.0)) < SCOUT_MIN_PROGRESS_PCT:
+            close_market_strict("SCOUT timeout / no progress")
+            return "SCOUT_TIMEOUT"
+            
     return trend_profit_taking(ind, info, df)
 
 def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
@@ -1352,6 +1573,17 @@ def trade_loop():
                 if breakout_emergency_protection(ind, prev_ind):
                     snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "EMERGENCY LAYER action", df)
                     time.sleep(compute_next_sleep(df)); continue
+
+            # === Scout entries (فقط لو فاضي) ===
+            if not state["open"]:
+                if scout_impulse_entry(df_closed, ind, bal, spread_bps):
+                    snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "SCOUT-IMPULSE entry", df)
+                    time.sleep(compute_next_sleep(df)); 
+                    continue
+                if scout_explosion_entry(df, ind, prev_ind, bal, spread_bps):
+                    snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "SCOUT-EXPLOSION entry", df)
+                    time.sleep(compute_next_sleep(df)); 
+                    continue
 
             # Post-entry smart management
             smart_exit_check({**info_closed, "price": px or info_closed["price"]}, ind, df_cached=df, prev_ind_cached=prev_ind)
