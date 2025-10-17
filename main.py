@@ -59,7 +59,7 @@ USE_SMART_EXIT = True
 TP1_PCT = 0.40          # % ربح للهدف الأول (سيتعدل ديناميكيًا)
 TP1_CLOSE_FRAC = 0.50   # نسبة الإغلاق عند TP1
 BREAKEVEN_AFTER = 0.30  # تثبيت التعادل بعد ربح >= 0.30%
-TRAIL_ACTIVATE = 0.60   # تفعيل التريل عند تجاوز هذا الربح
+TRAIL_ACTIVATE = 1.20   # تفعيل التريل عند تجاوز هذا الربح
 ATR_MULT_TRAIL = 1.6    # معامل ATR للتريل الافتراضي
 
 # لا سكالبنج — كل شيء ترند فقط
@@ -72,7 +72,7 @@ DI_FLIP_BUFFER = 1.0
 
 # Impulse/Wick/Ratchet
 IMPULSE_HARVEST_THRESHOLD = 1.2  # body >= 1.2×ATR
-LONG_WICK_HARVEST_THRESHOLD = 0.60  # 60% من مدى الشمعة
+LONG_WICK_HARVEST_THRESHOLD = 0.45  # 45% من مدى الشمعة
 RATCHET_RETRACE_THRESHOLD = 0.40     # إقفال جزئي عند ارتداد 40% من أعلى ربح
 
 # Breakout Engine
@@ -125,8 +125,8 @@ CLOSE_VERIFY_WAIT_S  = 2.0
 MIN_RESIDUAL_TO_FORCE= 1.0
 
 # Exit protection layer
-MIN_HOLD_BARS        = 3
-MIN_HOLD_SECONDS     = 120
+MIN_HOLD_BARS        = 8
+MIN_HOLD_SECONDS     = 3600
 TRAIL_ONLY_AFTER_TP1 = True
 RF_HYSTERESIS_BPS    = 8
 NO_FULL_CLOSE_BEFORE_TP1 = True
@@ -152,10 +152,16 @@ HOLD_TCI = 65
 HOLD_STRONG_TCI = 75
 CHOP_MAX_FOR_HOLD = 0.35
 HOLD_MAX_PARTIAL_FRAC = 0.25
-HOLD_RATCHET_LOCK_PCT_ON_HOLD = 0.80
+HOLD_RATCHET_LOCK_PCT_ON_HOLD = 0.85
 
 # Keepalive
 KEEPALIVE_SECONDS = 50
+
+# ——— وضع المتداول الصبور ———
+PATIENT_TRADER_MODE = True  # يفعل الصبر
+PATIENT_HOLD_BARS = 8       # يمسك على الأقل 8 شموع (≈ ساعتين على فريم 15م)
+PATIENT_HOLD_SECONDS = 3600 # أو ساعة زمنياً أيهما أسبق
+EXIT_ONLY_ON_OPPOSITE_RF = True  # لا إغلاق كامل إلا بإشارة RF عكسية/طوارئ
 
 # =================== LOGGING ===================
 def setup_file_logging():
@@ -901,10 +907,13 @@ def ema_touch_harvest(info: dict, ind: dict):
             else:
                 state["trail"] = min(state.get("trail") or (px+gap), px+gap)
         acted = (acted or "") + "+EMA20_BREAK"
-        # لو الميل انقلب وADX ضعيف → إغلاق نهائي
+        # ⚠️ إزالة الإغلاق الكامل واستبداله بتثبيت التعادل فقط
         if ((side=="long" and (ind.get("ema9_slope",0.0) <= 0)) or
             (side=="short" and (ind.get("ema9_slope",0.0) >= 0))) and (ind.get("adx",0.0) < 20):
-            close_market_strict("EMA20 break + slope flip (weak ADX)")
+            # في وضع الصبر: لا إغلاق، اكتفِ بتثبيت التعادل
+            state["breakeven"] = state.get("breakeven") or state["entry"]
+            logging.info("EMA20 break + slope flip (weak ADX) → Breakeven set (no full close in patient mode)")
+    
     return acted
 
 # =================== EXIT / POST-ENTRY ===================
@@ -982,17 +991,26 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     opened_at = state.get("opened_at") or now_ts
     elapsed_s = max(0, now_ts - opened_at)
     elapsed_bar = int(state.get("bars", 0))
+    
+    # ✅ تطبيق حدود الصبر
+    if PATIENT_TRADER_MODE:
+        MIN_HOLD_BARS = PATIENT_HOLD_BARS
+        MIN_HOLD_SECONDS = PATIENT_HOLD_SECONDS
 
     def _allow_full_close(reason: str) -> bool:
-        if elapsed_bar >= MIN_HOLD_BARS or elapsed_s >= MIN_HOLD_SECONDS: return True
-        hard_reasons=("TRAIL","TRAIL_ATR","CHANDELIER","STRICT","FORCE","STOP","EMERGENCY")
-        return any(tag in reason for tag in hard_reasons)
+        if PATIENT_TRADER_MODE:
+            # نسمح بالإغلاق الكامل فقط في الحالات الصلبة
+            HARD = ("TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT", "FORCE", "STOP", "EMERGENCY", "OPPOSITE_RF")
+            return (elapsed_bar >= PATIENT_HOLD_BARS or elapsed_s >= PATIENT_HOLD_SECONDS) and any(tag in reason for tag in HARD)
+        return (elapsed_bar >= MIN_HOLD_BARS or elapsed_s >= MIN_HOLD_SECONDS)
 
     def _safe_full_close(reason):
         if NO_FULL_CLOSE_BEFORE_TP1 and not state.get("tp1_done"):
             if not _allow_full_close(reason):
-                logging.info(f"EXIT_BLOCKED (early): {reason}"); return False
-        close_market_strict(reason); return True
+                logging.info(f"EXIT_BLOCKED (patient): {reason}")
+                return False
+        close_market_strict(reason)
+        return True
 
     # Reverse consensus votes
     side=state.get("side")
@@ -1374,7 +1392,7 @@ def trade_loop():
                 desired = "long" if sig=="buy" else "short"
                 if state["side"] != desired:
                     prev_side = state["side"]
-                    close_market_strict("opposite_signal")
+                    close_market_strict("OPPOSITE_RF")  # أضف السبب المميز
                     wait_for_next_signal_side = "sell" if prev_side=="long" else "buy"
                     last_close_signal_time = info_closed["time"]
                     snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "waiting next opposite signal", df)
