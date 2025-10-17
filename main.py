@@ -7,6 +7,7 @@ RF Futures Bot — Trend-Only Pro (BingX Perp, CCXT) — FINAL
 • Impulse & Wick harvesting + Thrust Lock (Chandelier exit)
 • Emergency protection layer + Breakout Engine (with exits)
 • Strict exchange close + Patience Guard (no early full exits)
+• TVR (Time-Volume-Reaction) Enhanced Scout System
 • Flask metrics/health + keepalive + rotated logging
 
 NOTE: No scalping at all — trend-only management.
@@ -163,6 +164,16 @@ PATIENT_HOLD_BARS = 8       # يمسك على الأقل 8 شموع (≈ ساع�
 PATIENT_HOLD_SECONDS = 3600 # أو ساعة زمنياً أيهما أسبق
 EXIT_ONLY_ON_OPPOSITE_RF = True  # لا إغلاق كامل إلا بإشارة RF عكسية/طوارئ
 
+# =================== TVR (Time-Volume-Reaction) SETTINGS ===================
+TVR_ENABLED          = True       # تفعيل النظام
+TVR_BUCKETS          = 96         # 96 باكت = يوم كامل على فريم 15m
+TVR_VOL_SPIKE        = 1.8        # نسبة سبايك الحجم مقابل المتوسط الزمني
+TVR_REACTION_ATR     = 0.9        # جسم الشمعة/ATR كحد أدنى لاعتبارها اندفاعية
+TVR_MIN_ADX          = 14         # ADX الأدنى لقبول السبايك
+TVR_SCOUT_FRAC       = 0.50       # حجم دخول Scout (نصف الحجم العادي)
+TVR_TIMEOUT_BARS     = 6          # أقصى عدد شموع يظل فيها وضع Scout "خاص"
+TVR_MAX_SPREAD_BPS   = 6.0        # لا ندخل إن كان السبريد كبير
+
 # =================== LOGGING ===================
 def setup_file_logging():
     logger = logging.getLogger()
@@ -251,7 +262,15 @@ state = {
     "_tp_ladder": None, "_tp_fracs": None,
     "_consensus_score": None, "_atr_pct": None,
     # Idempotency/wait
-    "opened_at": None
+    "opened_at": None,
+    # TVR
+    "_tvr_profile": None,
+    "tvr_active": False,
+    "tvr_bars_alive": 0,
+    "tvr_vol_ratio": None,
+    "tvr_reaction": None,
+    "tvr_bucket": None,
+    "tvr_direction": None,  # 1=up, -1=down
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -391,6 +410,143 @@ def compute_next_sleep(df):
         return BASE_SLEEP
     except Exception:
         return BASE_SLEEP
+
+# =================== TVR (Time-Volume-Reaction) FUNCTIONS ===================
+def _tvr_bucket_len_min():
+    # عدد دقائق الباكت الواحد (يوم = 1440 دقيقة)
+    return max(1, 1440 // int(TVR_BUCKETS or 96))
+
+def _tvr_bucket_index(ts_ms: int) -> int:
+    """يعطي باكت الوقت (0..TVR_BUCKETS-1) اعتمادًا على وقت الشمعة UTC."""
+    bucket_min = _tvr_bucket_len_min()
+    mins_in_day = int((ts_ms // 60000) % 1440)
+    return int(mins_in_day // bucket_min) % int(TVR_BUCKETS or 96)
+
+def build_tvr_profile(df: pd.DataFrame):
+    """
+    نبني بروفايل حجم زمني: متوسط/ميديان حجم كل باكت وقتي عبر آخر عدة أيام.
+    لا نستخدم أي إنترنت – فقط من بيانات OHLCV الموجودة.
+    """
+    if not TVR_ENABLED or len(df) < TVR_BUCKETS*2:
+        return None
+    try:
+        vols = df["volume"].astype(float)
+        times = df["time"].astype(int)
+        bucket_min = _tvr_bucket_len_min()
+        bucket_series = ((times // 60000) % 1440 // bucket_min).astype(int)
+        grp = vols.groupby(bucket_series)
+        med = grp.median()  # ميديان أكثر ثباتًا
+        prof = [float(med.get(i, vols.median())) for i in range(int(TVR_BUCKETS or 96))]
+        return prof
+    except Exception:
+        return None
+
+def compute_tvr_features(df_closed: pd.DataFrame, ind: dict):
+    """
+    نحسب سبايك الحجم + ردّة الفعل السعري (جسم/ATR) على آخر شمعة مُغلقة فقط.
+    """
+    if not TVR_ENABLED or len(df_closed) < 3:
+        return None
+    try:
+        # آخر شمعة مُغلقة:
+        o = float(df_closed["open"].iloc[-1])
+        c = float(df_closed["close"].iloc[-1])
+        v = float(df_closed["volume"].iloc[-1])
+        ts = int(df_closed["time"].iloc[-1])
+        atr = float(ind.get("atr") or 0.0)
+        if atr <= 0:
+            return None
+
+        # بروفايل الحجم الزمني (نبنيه مرة ونحتفظ به في state)
+        if state.get("_tvr_profile") is None or len(state.get("_tvr_profile") or []) != int(TVR_BUCKETS or 96):
+            p = build_tvr_profile(df_closed)
+            if p: state["_tvr_profile"] = p
+
+        prof = state.get("_tvr_profile")
+        if not prof:  # لم نستطع البناء
+            return None
+
+        bucket = _tvr_bucket_index(ts)
+        base_vol = max(float(prof[bucket]), 1e-12)
+        vol_ratio = v / base_vol
+
+        body = abs(c - o)
+        reaction = body / max(atr, 1e-12)
+        direction = 1 if c > o else -1
+
+        # إشارة قوية؟ (حجم مرتفع + ردّة فعل سعرية + ADX مقبول)
+        adx_ok = float(ind.get("adx") or 0.0) >= TVR_MIN_ADX
+        strong = (vol_ratio >= TVR_VOL_SPIKE) and (reaction >= TVR_REACTION_ATR) and adx_ok
+
+        return {
+            "bucket": bucket,
+            "vol_ratio": float(vol_ratio),
+            "reaction": float(reaction),
+            "direction": int(direction),
+            "strong": bool(strong)
+        }
+    except Exception:
+        return None
+
+def tvr_spike_entry(df_closed: pd.DataFrame, ind: dict, bal: float, px: float, spread_bps: float) -> bool:
+    """
+    دخول Scout/Explosion مستقل إذا لا توجد صفقة والمشهد قوي حسب TVR.
+    لا يغيّر قواعد الدخول الأساسية – يضيف مدخلات ذكية فقط.
+    """
+    if not TVR_ENABLED or state["open"]:
+        return False
+    if spread_bps is not None and spread_bps > TVR_MAX_SPREAD_BPS:
+        return False
+
+    feats = compute_tvr_features(df_closed, ind)
+    if not feats or not feats["strong"]:
+        return False
+
+    side = "buy" if feats["direction"] > 0 else "sell"
+    qty_full = compute_size(bal, px)
+    qty = safe_qty(qty_full * TVR_SCOUT_FRAC)
+    if qty <= 0:
+        return False
+
+    open_market(side, qty, px)
+    # وسم الحالة "وضع TVR"
+    state["tvr_active"] = True
+    state["tvr_bars_alive"] = 0
+    state["tvr_bucket"] = feats["bucket"]
+    state["tvr_vol_ratio"] = feats["vol_ratio"]
+    state["tvr_reaction"] = feats["reaction"]
+    state["tvr_direction"] = feats["direction"]
+    return True
+
+def tvr_post_entry_relax(df: pd.DataFrame, ind: dict):
+    """
+    أثناء وضع TVR: لا نُضيّق التريل مباشرة.
+    ننتظر هدوء موجة الاندفاع: جسم شمعتين صغيرتين أو انتهاء مهلة.
+    بعدها نُفعّل إدارة البوت العادية.
+    """
+    if not TVR_ENABLED or not state.get("tvr_active"):
+        return
+    try:
+        if len(df) < 3:
+            return
+        # آخر شمعة حيّة (قد تكون لم تغلق تمامًا)
+        o = float(df["open"].iloc[-1]); c = float(df["close"].iloc[-1])
+        body = abs(c - o)
+        atr = float(ind.get("atr") or 0.0)
+
+        state["tvr_bars_alive"] = int(state.get("tvr_bars_alive", 0)) + 1
+
+        small = (atr > 0 and (body / atr) <= 0.35)
+        calm_two = False
+        # فحص الشمعة المُغلقة قبلها أيضًا:
+        if len(df) >= 2 and atr > 0:
+            o1 = float(df["open"].iloc[-2]); c1 = float(df["close"].iloc[-2])
+            calm_two = small and (abs(c1 - o1) / atr <= 0.35)
+
+        if calm_two or state["tvr_bars_alive"] >= TVR_TIMEOUT_BARS:
+            state["tvr_active"] = False  # نعود للإدارة المعتادة
+    except Exception:
+        pass
 
 # =================== INDICATORS ===================
 def wilder_ema(s: pd.Series, n: int): return s.ewm(alpha=1/n, adjust=False).mean()
@@ -736,7 +892,14 @@ def reset_after_full_close(reason, prev_side=None):
         "breakout_active": False, "breakout_direction": None, "breakout_entry_price": None,
         "breakout_score": 0.0, "breakout_votes_detail": {}, "opened_by_breakout": False,
         "_tp_ladder": None, "_tp_fracs": None, "_consensus_score": None, "_atr_pct": None,
-        "opened_at": None
+        "opened_at": None,
+        # TVR
+        "tvr_active": False,
+        "tvr_bars_alive": 0,
+        "tvr_vol_ratio": None,
+        "tvr_reaction": None,
+        "tvr_bucket": None,
+        "tvr_direction": None,
     })
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
@@ -1266,6 +1429,12 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     print(f"   🎯 Signal  ✅ BUY={info['long']}   ❌ SELL={info['short']}   |   🧮 spread_bps={fmt(spread_bps,2)}")
     candle_info = insights['candle']
     print(f"   🕯️ Candles = {candle_info['name_ar']} / {candle_info['name_en']} (Strength: {candle_info['strength']}/4)")
+    
+    # إضافة بيانات TVR للعرض
+    if TVR_ENABLED:
+        tvr_line = f"TVR: bucket={state.get('tvr_bucket')}  vol×={fmt(state.get('tvr_vol_ratio'),2)}  react(ATR)={fmt(state.get('tvr_reaction'),2)}  active={bool(state.get('tvr_active'))}"
+        print(colored(f"   🕒 {tvr_line}", "yellow"))
+    
     if state.get("tci") is not None:
         hold_msg = "الترند قوي — امسك الصفقة" if state.get("_hold_trend") else "إدارة عادية"
         print(colored(f"   🧭 TCI={state['tci']:.0f}/100 • Chop01={state.get('chop01',0):.2f} → {hold_msg}", "cyan" if state.get("_hold_trend") else "blue"))
@@ -1365,6 +1534,14 @@ def trade_loop():
                 snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "BREAKOUT ACTIVE - monitoring exit", df)
                 time.sleep(compute_next_sleep(df)); continue
 
+            # TVR Scout/Explosion entry (مستقل عند عدم وجود صفقة)
+            if not state["open"]:
+                entered_tvr = tvr_spike_entry(df_closed, ind, bal, px or info_closed["price"], spread_bps)
+                if entered_tvr:
+                    snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "TVR SCOUT ENTRY", df)
+                    time.sleep(compute_next_sleep(df))
+                    continue
+
             # Emergency layer if open
             if state["open"]:
                 if breakout_emergency_protection(ind, prev_ind):
@@ -1376,6 +1553,9 @@ def trade_loop():
             post_action = smart_post_entry_manager(df, ind, {**info_closed, "price": px or info_closed["price"]})
             if post_action:
                 logging.info(f"POST_ENTRY_ACTION: {post_action}")
+
+            # TVR post-entry relax
+            tvr_post_entry_relax(df, ind)
 
             # ENTRY on closed-candle RF signal only
             sig = "buy" if info_closed["long"] else ("sell" if info_closed["short"] else None)
@@ -1456,7 +1636,7 @@ def home():
     global _root_logged
     if not _root_logged: print("GET / HTTP/1.1 200"); _root_logged=True
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — TREND-ONLY — CLOSED-CANDLE RF — SMART HARVESTING — BREAKOUT ENGINE — EMERGENCY LAYER — STRICT CLOSE"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — TREND-ONLY — CLOSED-CANDLE RF — SMART HARVESTING — BREAKOUT ENGINE — EMERGENCY LAYER — STRICT CLOSE — TVR ENHANCED"
 
 @app.route("/metrics")
 def metrics():
@@ -1492,6 +1672,13 @@ def metrics():
         },
         "ema_indicators": {
             "ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")
+        },
+        "tvr_enhanced": {
+            "enabled": TVR_ENABLED,
+            "active": state.get("tvr_active", False),
+            "vol_ratio": state.get("tvr_vol_ratio"),
+            "reaction": state.get("tvr_reaction"),
+            "bucket": state.get("tvr_bucket")
         }
     })
 
@@ -1515,7 +1702,9 @@ def health():
         "thrust_locked": state.get("thrust_locked", False),
         "fearless_hold": {"tci": state.get("tci"), "chop01": state.get("chop01"), "hold_mode": state.get("_hold_trend", False)},
         "dynamic_profit_taking": {"consensus_score": state.get("_consensus_score"), "atr_pct": state.get("_atr_pct"), "tp_ladder": state.get("_tp_ladder")},
-        "ema_indicators": {"ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")}
+        "ema_indicators": {"ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")},
+        "tvr_enabled": TVR_ENABLED,
+        "tvr_active": state.get("tvr_active", False)
     }), 200
 
 @app.route("/ping")
@@ -1532,6 +1721,7 @@ if __name__ == "__main__":
     _validate_market_specs()
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
     print(colored(f"STRATEGY: {STRATEGY.upper()} (TREND-ONLY) • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
+    print(colored(f"TVR ENHANCED: {'ON' if TVR_ENABLED else 'OFF'} • Buckets={TVR_BUCKETS} • Vol_Spike={TVR_VOL_SPIKE}x • Reaction_ATR={TVR_REACTION_ATR}", "yellow"))
     load_state()
     print(colored("🛡️ Watchdog started", "cyan"))
     threading.Thread(target=watchdog_check, daemon=True).start()
