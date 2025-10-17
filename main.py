@@ -998,11 +998,11 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
         MIN_HOLD_SECONDS = PATIENT_HOLD_SECONDS
 
     def _allow_full_close(reason: str) -> bool:
-        if PATIENT_TRADER_MODE:
-            # نسمح بالإغلاق الكامل فقط في الحالات الصلبة
-            HARD = ("TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT", "FORCE", "STOP", "EMERGENCY", "OPPOSITE_RF")
-            return (elapsed_bar >= PATIENT_HOLD_BARS or elapsed_s >= PATIENT_HOLD_SECONDS) and any(tag in reason for tag in HARD)
-        return (elapsed_bar >= MIN_HOLD_BARS or elapsed_s >= MIN_HOLD_SECONDS)
+        min_hold_reached = (elapsed_bar >= PATIENT_HOLD_BARS) or (elapsed_s >= PATIENT_HOLD_SECONDS)
+        HARD_ANYTIME = ("EMERGENCY", "TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT", "OPPOSITE_RF")
+        if any(tag in reason for tag in HARD_ANYTIME):
+            return True                     # طوارئ/تريل/شانديلير/RF عكسي مسموح في أي وقت
+        return min_hold_reached             # غير ذلك: لازم نكون عدّينا الحد الأدنى
 
     def _safe_full_close(reason):
         if NO_FULL_CLOSE_BEFORE_TP1 and not state.get("tp1_done"):
