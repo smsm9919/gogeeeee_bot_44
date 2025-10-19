@@ -180,6 +180,7 @@ TVR_LIVE_VOL_SPIKE      = 2.2      # حجم لحظي ≥ 2.2× المتوقّع
 TVR_LIVE_REACTION_ATR   = 1.4      # جسم الشمعة ≥ 1.4×ATR
 TVR_LIVE_MIN_ELAPSED    = 0.25     # لازم يمُر ≥25% من زمن الشمعة
 TVR_LIVE_MAX_SPREAD_BPS = 6.0
+TVR_SCOUT_TRAIL_MULT    = 1.2      # معامل التريل للدخول السكاوت
 
 # ===== Trap / Stop-Hunt Guard =====
 TRAP_ENABLED = True
@@ -684,7 +685,7 @@ def compute_tvr_features(df_closed: pd.DataFrame, ind: dict):
     except Exception:
         return None
 
-def tvr_spike_entry(df_closed: pd.DataFrame, ind: dict, bal: float, px: float, spread_bps: float) -> bool:
+def tvr_spike_entry(df_full: pd.DataFrame, df_closed: pd.DataFrame, ind: dict, bal: float, px: float, spread_bps: float) -> bool:
     """دخول Scout/Explosion مستقل إذا لا توجد صفقة والمشهد قوي حسب TVR."""
     if not TVR_ENABLED or state["open"]:
         return False
@@ -696,7 +697,7 @@ def tvr_spike_entry(df_closed: pd.DataFrame, ind: dict, bal: float, px: float, s
 
     # حاول live أولاً لو مُفعّل
     if TVR_USE_LIVE_BAR:
-        feats_live = compute_tvr_features_live(pd.concat([df_closed, df_closed.iloc[-1:]]), ind)
+        feats_live = compute_tvr_features_live(df_full, ind)  # استخدام df_full للشمعة الحية
         if feats_live and feats_live["strong"]:
             side = "buy" if feats_live["direction"] > 0 else "sell"
             qty_full = compute_size(bal, px)
@@ -2268,7 +2269,7 @@ def trade_loop():
 
             # TVR Scout/Explosion entry (مستقل عند عدم وجود صفقة)
             if not state["open"]:
-                entered_tvr = tvr_spike_entry(df_closed, ind, bal, px or info_closed["price"], spread_bps)
+                entered_tvr = tvr_spike_entry(df, df_closed, ind, bal, px or info_closed["price"], spread_bps)
                 if entered_tvr:
                     snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "TVR SCOUT ENTRY", df)
                     time.sleep(compute_next_sleep(df))
@@ -2307,6 +2308,11 @@ def trade_loop():
             # === لا قفل فوري على RF عكسي؛ نفّذ دفاع فقط ===
             if state["open"] and sig and (reason is None):
                 desired = "long" if sig == "buy" else "short"
+                
+                # عرّف المتغيرات قبل أي استخدام
+                px_now = px or info_closed.get("price")
+                rf_now = info_closed.get("filter")
+                
                 if state["side"] != desired:
                     # ✅ FIRST: تحقق من Trap Guard - لو شغّال: لا قفل كامل إطلاقًا
                     if state.get("_trap_active"):
@@ -2317,8 +2323,6 @@ def trade_loop():
                         continue
                     
                     # تأكيد العكسية: ADX + كسر واضح عن الفلتر + تكرار
-                    px_now  = px or info_closed.get("price")
-                    rf_now  = info_closed.get("filter")
                     adx_now = float(ind.get("adx") or 0.0)
 
                     bps = 0.0
