@@ -822,6 +822,245 @@ def detect_mss(df: pd.DataFrame, ind: dict, left:int=2, right:int=2, buffer_bps:
     except Exception:
         return {"mss": False, "dir": None, "level": None, "swing_high": None, "swing_low": None, "strength": 0.0}
 
+# =================== SMC PRO — LIQUIDITY TARGETS ===================
+def _smc_liquidity_targets(df: pd.DataFrame, side_or_sig: str, entry_px: float, atr_now: float):
+    """
+    توليد أهداف سيولة بناءً على الهيكل السعري + امتدادات فيبوناتشي + ATR
+    تُرجع:
+      - score: 0..1 (قوة الهيكل/السيولة)
+      - tp_candidates: قائمة أهداف % من سعر الدخول
+      - trail_mult: معامل التريل المقترح
+      - levels: معلومات تعليمية (OB/Equal Highs/Lows/BOS)
+    """
+    try:
+        if len(df) < 60 or entry_px is None or atr_now <= 0:
+            return {"score": 0.45, "tp_candidates": [], "trail_mult": SMC_TIGHT_TRAIL_MULT, "levels": {}}
+
+        d = df.iloc[:-1] if len(df) >= 2 else df.copy()  # شموع مغلقة فقط
+        h = d["high"].astype(float).values
+        l = d["low"].astype(float).values
+        c = d["close"].astype(float).values
+        current_price = float(c[-1])
+
+        # 1) البحث عن قمم وقيعان محلية (Swings)
+        ph, pl = _find_swings(d, left=2, right=2)
+        
+        # 2) Equal Highs/Lows
+        eqh_candidates = []; eql_candidates = []
+        tolerance_pct = 0.05  # 0.05%
+        
+        for i, price in enumerate(ph):
+            if price is None: continue
+            tolerance = price * tolerance_pct / 100.0
+            similar_highs = [ph[j] for j in range(max(0, i-10), min(len(ph), i+10)) 
+                           if ph[j] is not None and abs(ph[j] - price) <= tolerance]
+            if len(similar_highs) >= 2:  # على الأقل قمتين متشابهتين
+                eqh_candidates.append(max(similar_highs))
+                
+        for i, price in enumerate(pl):
+            if price is None: continue
+            tolerance = price * tolerance_pct / 100.0
+            similar_lows = [pl[j] for j in range(max(0, i-10), min(len(pl), i+10)) 
+                          if pl[j] is not None and abs(pl[j] - price) <= tolerance]
+            if len(similar_lows) >= 2:  # على الأقل قاعين متشابهين
+                eql_candidates.append(min(similar_lows))
+        
+        eqh = max(eqh_candidates) if eqh_candidates else None
+        eql = min(eql_candidates) if eql_candidates else None
+
+        # 3) Order Blocks (OB)
+        ob_candidates = []
+        try:
+            for i in range(len(d)-2, max(len(d)-SMC_OB_LOOKBACK, 1), -1):
+                high_val = float(d["high"].iloc[i])
+                low_val = float(d["low"].iloc[i])
+                open_val = float(d["open"].iloc[i])
+                close_val = float(d["close"].iloc[i])
+                
+                candle_range = high_val - low_val
+                if candle_range <= 0: continue
+                    
+                body_size = abs(close_val - open_val)
+                upper_wick = high_val - max(open_val, close_val)
+                lower_wick = min(open_val, close_val) - low_val
+                
+                upper_wick_pct = (upper_wick / candle_range) * 100
+                lower_wick_pct = (lower_wick / candle_range) * 100
+                
+                # شمعة اندفاع: جسم كبير + ذيول صغيرة
+                if (body_size >= SMC_DISPLACEMENT_ATR * atr_now and 
+                    upper_wick_pct <= SMC_WICK_MAX * 100 and 
+                    lower_wick_pct <= SMC_WICK_MAX * 100):
+                    
+                    side = "bull" if close_val > open_val else "bear"
+                    ob = {
+                        "side": side,
+                        "bot": min(open_val, close_val),
+                        "top": max(open_val, close_val),
+                        "time": int(d["time"].iloc[i])
+                    }
+                    ob_candidates.append(ob)
+                    break  # نأخذ أقرب OB
+        except Exception as e:
+            logging.error(f"SMC OB detection error: {e}")
+
+        # 4) Break of Structure (BOS) مبسط
+        bos_type = "NONE"
+        if eqh and current_price > eqh:
+            bos_type = "BULL_BOS"
+        elif eql and current_price < eql:
+            bos_type = "BEAR_BOS"
+
+        # 5) FVG (Fair Value Gap) مبسط
+        fvg_candidates = []
+        try:
+            for i in range(len(d)-3, max(len(d)-20, 2), -1):
+                prev_high = float(d["high"].iloc[i-1])
+                prev_low = float(d["low"].iloc[i-1])
+                current_low = float(d["low"].iloc[i])
+                current_high = float(d["high"].iloc[i])
+                
+                # FVG صاعد: قاع الشمعة الحالية > قمة الشمعة السابقة
+                if current_low > prev_high and (current_low - prev_high) <= SMC_FVG_MAX_GAP_ATR * atr_now:
+                    fvg_candidates.append({
+                        "type": "BULL_FVG",
+                        "bottom": prev_high,
+                        "top": current_low
+                    })
+                
+                # FVG هابط: قمة الشمعة الحالية < قاع الشمعة السابقة  
+                elif current_high < prev_low and (prev_low - current_high) <= SMC_FVG_MAX_GAP_ATR * atr_now:
+                    fvg_candidates.append({
+                        "type": "BEAR_FVG", 
+                        "bottom": current_high,
+                        "top": prev_low
+                    })
+        except Exception as e:
+            logging.error(f"SMC FVG detection error: {e}")
+
+        # 6) تحديد الجانب والاتجاه
+        side = "long" if side_or_sig in ("long", "buy") else "short"
+        
+        # 7) توليد أهداف الربح بناء على الهيكل
+        tp_candidates = []
+        base_price = entry_px
+        
+        if side == "long":
+            # أهداف صعودية: استخدام القمم، OB، فيبوناتشي
+            structure_targets = []
+            
+            if eqh: structure_targets.append(eqh)
+            if ob_candidates:
+                for ob in ob_candidates:
+                    if ob["side"] == "bear":  # OB هابط قد يكون مقاومة
+                        structure_targets.append(ob["bot"])
+            
+            # إضافة FVG كأهداف
+            for fvg in fvg_candidates:
+                if fvg["type"] == "BULL_FVG":
+                    structure_targets.append(fvg["top"])
+            
+            # أهداف فيبوناتشي من القاع إلى القمة
+            if eql and structure_targets:
+                for target in structure_targets:
+                    for fib_ext in SMC_FIB_EXTS:
+                        fib_target = eql + (target - eql) * fib_ext
+                        profit_pct = ((fib_target - entry_px) / entry_px) * 100
+                        if 0.1 <= profit_pct <= 10.0:  # فلترة واقعية
+                            tp_candidates.append(round(profit_pct, 2))
+            
+            # أهداف ATR-based كبديل
+            for atr_mult in [1.5, 2.5, 4.0]:
+                atr_target = entry_px + (atr_now * atr_mult)
+                profit_pct = ((atr_target - entry_px) / entry_px) * 100
+                if 0.1 <= profit_pct <= 8.0:
+                    tp_candidates.append(round(profit_pct, 2))
+                    
+        else:  # short
+            # أهداف هبوطية: استخدام القيعان، OB، فيبوناتشي
+            structure_targets = []
+            
+            if eql: structure_targets.append(eql)
+            if ob_candidates:
+                for ob in ob_candidates:
+                    if ob["side"] == "bull":  # OB صاعد قد يكون دعماً
+                        structure_targets.append(ob["top"])
+            
+            # إضافة FVG كأهداف
+            for fvg in fvg_candidates:
+                if fvg["type"] == "BEAR_FVG":
+                    structure_targets.append(fvg["bottom"])
+            
+            # أهداف فيبوناتشي من القمة إلى القاع
+            if eqh and structure_targets:
+                for target in structure_targets:
+                    for fib_ext in SMC_FIB_EXTS:
+                        fib_target = eqh - (eqh - target) * fib_ext
+                        profit_pct = ((entry_px - fib_target) / entry_px) * 100
+                        if 0.1 <= profit_pct <= 10.0:
+                            tp_candidates.append(round(profit_pct, 2))
+            
+            # أهداف ATR-based كبديل
+            for atr_mult in [1.5, 2.5, 4.0]:
+                atr_target = entry_px - (atr_now * atr_mult)
+                profit_pct = ((entry_px - atr_target) / entry_px) * 100
+                if 0.1 <= profit_pct <= 8.0:
+                    tp_candidates.append(round(profit_pct, 2))
+
+        # إزالة التكرارات والفرز
+        tp_candidates = sorted(set([t for t in tp_candidates if 0.15 <= t <= 8.0]))
+        tp_candidates = tp_candidates[:4]  # أقصى 4 أهداف
+
+        # 8) حساب قوة الهيكل (Score)
+        score = 0.35  # درجة أساسية
+        
+        # نقاط للهيكل المتوافق مع الاتجاه
+        if side == "long":
+            if bos_type == "BULL_BOS": score += 0.25
+            if eqh and current_price > eqh: score += 0.15
+            if any(ob["side"] == "bull" for ob in ob_candidates): score += 0.15
+        else:  # short
+            if bos_type == "BEAR_BOS": score += 0.25  
+            if eql and current_price < eql: score += 0.15
+            if any(ob["side"] == "bear" for ob in ob_candidates): score += 0.15
+        
+        # نقاط للحجم والتقلب
+        if len(d) >= 21:
+            current_volume = float(d["volume"].iloc[-1])
+            volume_ma = d["volume"].iloc[-21:-1].astype(float).mean()
+            if volume_ma > 0 and current_volume > volume_ma * SMC_VOL_SPIKE:
+                score += 0.10
+        
+        score = min(1.0, max(0.0, score))
+
+        # 9) تحديد معامل التريل
+        if score >= SMC_SCORE_STRONG:
+            trail_mult = SMC_WIDE_TRAIL_MULT
+        elif score >= SMC_SCORE_HOLD:
+            trail_mult = (SMC_WIDE_TRAIL_MULT + SMC_TIGHT_TRAIL_MULT) / 2
+        else:
+            trail_mult = SMC_TIGHT_TRAIL_MULT
+
+        # 10) تجميع معلومات المستويات
+        levels = {
+            "ob": ob_candidates[0] if ob_candidates else None,
+            "eqh": eqh,
+            "eql": eql, 
+            "bos": {"type": bos_type},
+            "fvg": fvg_candidates[0] if fvg_candidates else None
+        }
+
+        return {
+            "score": float(score),
+            "tp_candidates": tp_candidates,
+            "trail_mult": float(trail_mult),
+            "levels": levels
+        }
+
+    except Exception as e:
+        logging.error(f"SMC liquidity targets error: {e}")
+        return {"score": 0.45, "tp_candidates": [], "trail_mult": SMC_TIGHT_TRAIL_MULT, "levels": {}}
+
 # =================== SMC MSS MANAGER ===================
 def smc_mss_manager(ind: dict, mss: dict):
     """يساند الإدارة بعد الدخول بناءً على MSS بدون أي تغيير في الدخول."""
