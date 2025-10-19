@@ -204,6 +204,23 @@ SMC_DEFER_TP_ON_ALIGNED = True  # تأجيل TP مرة واحدة عندما MSS
 ORCH_WEIGHTS = {"momentum": 0.25, "volatility": 0.20, "trend": 0.20, "structure": 0.35}
 ORCH_STRONG = 0.65
 
+# ======= Fakeout / Stop-Hunt Guard =======
+TRAP_ENABLED       = True
+TRAP_WICK_PCT      = 60.0   # % من مدى الشمعة لازم يكون ذيل
+TRAP_BODY_MAX_PCT  = 25.0   # الجسم صغير → رفض
+TRAP_ATR_MIN       = 0.6    # مدى الشمعة ≥ 0.6×ATR
+TRAP_VOL_SPIKE     = 1.30   # حجم أكبر من متوسط 20 شمعة ×1.3
+TRAP_PROX_BPS      = 12.0   # قرب من EQH/EQL/OB بالـ bps
+TRAP_HOLD_BARS     = 4      # نمنع القفل الكامل N شموع بعد الفخ
+
+# === Patient Trading – لا قفل كامل بدري ===
+NEVER_FULL_CLOSE_BEFORE_TP1   = True   # يمنع أي قفل كامل قبل TP1 إلا طوارئ/Trail
+OPP_RF_NEED_BARS              = 2      # عدد إشارات RF عكسية مغلقة متتالية قبل التفكير في قفل كامل
+OPP_RF_MIN_ADX                = 22     # لازم ADX ≥ هذا عند العكسية
+OPP_RF_MIN_HYST_BPS           = 8.0    # كسر واضح عن الـ RF بالـbps
+OPP_RF_DEFEND_PARTIAL         = 0.25   # نسبة الجني عند أول عكسية (يتعدل تلقائيًا حسب TP1)
+OPP_RF_TIGHT_TRAIL_MULT       = 1.6    # تشديد التريل عند العكسية
+
 # =================== LOGGING ===================
 def setup_file_logging():
     logger = logging.getLogger()
@@ -304,6 +321,14 @@ state = {
     # SMC
     "smc_mss": None,
     "smc_extra_partials": 0.0,
+    # Trap Guard
+    "_trap_active": False,
+    "_trap_dir": None,
+    "_trap_left": 0,
+    "_last_trap_ts": None,
+    # Opposite RF votes
+    "_opp_rf_votes": 0,
+    "_trend_exit_votes": 0,
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -1103,6 +1128,103 @@ def smc_mss_manager(ind: dict, mss: dict):
 
     return "+".join(actions) if actions else None
 
+# =================== TRAP / FAKEOUT GUARD ===================
+def _near_level(px, lvl, bps):
+    try: 
+        return abs((px-lvl)/lvl)*10000.0 <= bps
+    except Exception: 
+        return False
+
+def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
+    """يرصد سحب سيولة بفتيلة طويلة عند قمم/قيعان/OB مع حجم مرتفع."""
+    if not TRAP_ENABLED or len(df) < 3: 
+        return None
+    try:
+        o = float(df["open"].iloc[-1]); h = float(df["high"].iloc[-1])
+        l = float(df["low"].iloc[-1]);  c = float(df["close"].iloc[-1])
+        rng = max(h-l, 1e-12); body = abs(c-o)
+        upper = h - max(o,c); lower = min(o,c) - l
+        upper_pct = upper/rng*100.0; lower_pct = lower/rng*100.0; body_pct = body/rng*100.0
+        atr = float(ind.get("atr") or 0.0)
+        v   = float(df["volume"].iloc[-1])
+        vma = df["volume"].iloc[-21:-1].astype(float).mean() if len(df)>=21 else 0.0
+        vol_ok = (vma>0 and v/vma >= TRAP_VOL_SPIKE)
+
+        eqh = (levels or {}).get("eqh")
+        eql = (levels or {}).get("eql")
+        ob  = (levels or {}).get("ob")  # dict(side/bot/top)
+
+        near_eqh = (eqh and _near_level(h, eqh, TRAP_PROX_BPS))
+        near_eql = (eql and _near_level(l, eql, TRAP_PROX_BPS))
+        near_ob_res = (ob and ob.get("side")=="bear" and _near_level(h, ob["bot"], TRAP_PROX_BPS))
+        near_ob_sup = (ob and ob.get("side")=="bull" and _near_level(l, ob["top"], TRAP_PROX_BPS))
+
+        bull_trap = (lower_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eql or near_ob_sup))
+        bear_trap = (upper_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eqh or near_ob_res))
+
+        if (bull_trap or bear_trap) and vol_ok:
+            return {"trap": "bull" if bull_trap else "bear", "ts": int(df["time"].iloc[-1])}
+    except Exception as e:
+        logging.error(f"detect_stop_hunt error: {e}")
+    return None
+
+def apply_trap_guard(trap: dict, ind: dict):
+    """فعّل حماية الفخ: امنع القفل الكامل لفترة وشدّ التريل لكن كمّل تداول."""
+    state["_trap_active"] = True
+    state["_trap_dir"]    = trap.get("trap")
+    state["_trap_left"]   = int(TRAP_HOLD_BARS)
+    state["_last_trap_ts"] = trap.get("ts")
+    px  = ind.get("price") or price_now() or state.get("entry")
+    atr = float(ind.get("atr") or 0.0)
+    
+    # جني جزئي دفاعي
+    if state.get("open") and state["qty"] > 0:
+        close_partial(0.15, f"Trap guard partial - {trap.get('trap')} trap detected")
+    
+    # تثبيت التعادل
+    state["breakeven"] = state.get("breakeven") or state["entry"]
+    
+    # تشديد التريل
+    if atr>0 and px and state.get("open"):
+        gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.8)
+        if state["side"]=="long":
+            state["trail"] = max(state.get("trail") or (px-gap), px-gap)
+        else:
+            state["trail"] = min(state.get("trail") or (px+gap), px+gap)
+    
+    logging.info(f"TRAP GUARD ACTIVATED: {trap.get('trap')} trap - blocking full close for {TRAP_HOLD_BARS} bars")
+
+def defend_on_opposite_rf(ind: dict, info: dict):
+    """عند إشارة RF عكسية: لا قفل كامل. جزئي + تعادل + تريل مشدود + تصويت للخروج."""
+    if not state["open"] or state["qty"] <= 0:
+        return False
+
+    side = state["side"]
+    px   = info.get("price") or price_now() or state["entry"]
+    atr  = float(ind.get("atr") or 0.0)
+    adx  = float(ind.get("adx") or 0.0)
+
+    # 1) جني جزئي صغير (أكبر لو TP1 لسه محصلش)
+    base_frac = OPP_RF_DEFEND_PARTIAL
+    if not state.get("tp1_done", False):
+        base_frac = min(0.30, max(0.15, base_frac))  # حماية أكبر قبل TP1
+    close_partial(base_frac, "Opposite RF — defensive partial")
+
+    # 2) تثبيت التعادل
+    state["breakeven"] = state.get("breakeven") or state["entry"]
+
+    # 3) تريل مشدود بقدر الإمكان
+    if atr > 0 and px is not None:
+        gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, OPP_RF_TIGHT_TRAIL_MULT)
+        if side == "long":
+            state["trail"] = max(state.get("trail") or (px - gap), px - gap)
+        else:
+            state["trail"] = min(state.get("trail") or (px + gap), px + gap)
+
+    # 4) عدّ تصويتات العكسية (لا قفل كامل إلا بعد تأكيد × مرتين)
+    state["_opp_rf_votes"] = int(state.get("_opp_rf_votes", 0)) + 1
+    return True
+
 # =================== ORDERS ===================
 def _position_params_for_open(side: str):
     if BINGX_POSITION_MODE == "hedge":
@@ -1262,6 +1384,14 @@ def reset_after_full_close(reason, prev_side=None):
         # SMC
         "smc_mss": None,
         "smc_extra_partials": 0.0,
+        # Trap Guard
+        "_trap_active": False,
+        "_trap_dir": None,
+        "_trap_left": 0,
+        "_last_trap_ts": None,
+        # Opposite RF votes
+        "_opp_rf_votes": 0,
+        "_trend_exit_votes": 0,
     })
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
@@ -1477,8 +1607,24 @@ def trend_profit_taking(ind: dict, info: dict, df_cached: pd.DataFrame):
     if float(ind.get("adx") or 0.0) >= MIN_TREND_HOLD_ADX:
         return None
     if state.get("profit_targets_achieved", 0) >= len(targets) or trend_end_confirmed(ind, detect_candle_pattern(df_cached), info):
-        close_market_strict("TREND finished — full exit")
-        return "TREND_COMPLETE"
+        # شدّ التريل وخد تصويت للخروج بدل القفل الفوري
+        state["_trend_exit_votes"] = int(state.get("_trend_exit_votes", 0)) + 1
+
+        atr_now = float(ind.get("atr") or 0.0)
+        px_now  = ind.get("price") or price_now() or state["entry"]
+        tmult   = max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.6)
+
+        if atr_now > 0 and px_now is not None:
+            gap = atr_now * tmult
+            if state["side"] == "long":
+                state["trail"] = max(state.get("trail") or (px_now - gap), px_now - gap)
+            else:
+                state["trail"] = min(state.get("trail") or (px_now + gap), px_now + gap)
+
+        if state["_trend_exit_votes"] >= 2 and state.get("bars", 0) >= PATIENT_HOLD_BARS:
+            close_market_strict("TREND_COMPLETE_CONFIRMED")
+            return "TREND_COMPLETE_CONFIRMED"
+        return "TREND_EXIT_VOTE"
     return None
 
 def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
@@ -1555,6 +1701,12 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
 
 def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     if not (STRATEGY=="smart" and USE_SMART_EXIT and state["open"]): return None
+    
+    # ✅ أثناء trap: امنع أي full close (إلا طوارئ/Trail)
+    if state.get("_trap_active"):
+        state["_exit_soft_block"] = True
+        logging.info("TRAP GUARD: blocking full close in smart_exit_check")
+    
     now_ts = info.get("time") or time.time()
     opened_at = state.get("opened_at") or now_ts
     elapsed_s = max(0, now_ts - opened_at)
@@ -1567,15 +1719,17 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
 
     def _allow_full_close(reason: str) -> bool:
         min_hold_reached = (elapsed_bar >= PATIENT_HOLD_BARS) or (elapsed_s >= PATIENT_HOLD_SECONDS)
-        HARD_ANYTIME = ("EMERGENCY", "TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT", "OPPOSITE_RF")
+        HARD_ANYTIME = ("EMERGENCY", "TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT")
         if any(tag in reason for tag in HARD_ANYTIME):
             return True                     # طوارئ/تريل/شانديلير/RF عكسي مسموح في أي وقت
         return min_hold_reached             # غير ذلك: لازم نكون عدّينا الحد الأدنى
 
     def _safe_full_close(reason):
-        if NO_FULL_CLOSE_BEFORE_TP1 and not state.get("tp1_done"):
-            if not _allow_full_close(reason):
-                logging.info(f"EXIT_BLOCKED (patient): {reason}")
+        # ✅ منع القفل الكامل قبل TP1 في وضع الصبر
+        if NEVER_FULL_CLOSE_BEFORE_TP1 and not state.get("tp1_done"):
+            # قبل TP1: ممنوع Full Close إلا طوارئ/Trail/Strict
+            if not any(tag in reason for tag in ("EMERGENCY", "TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT")):
+                logging.info(f"PATIENT: block full close ({reason}) before TP1")
                 return False
         
         # --- SMC Structural Patience Guard ---
@@ -1878,6 +2032,12 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     if ach < len(lad):
         nxt = lad[ach]
         print(colored(f"   🎯 Dynamic TP: next={nxt:.2f}% • ATR%≈{state.get('_atr_pct',0):.2f} • Consensus={state.get('_consensus_score',0):.1f}/5", "magenta"))
+    
+    # إضافة بيانات Trap Guard للعرض
+    if state.get("_trap_active"):
+        trap_line = f"TRAP: {state.get('_trap_dir')} • bars_left={state.get('_trap_left', 0)}"
+        print(colored(f"   🚨 {trap_line}", "red"))
+        
     if not state["open"] and wait_for_next_signal_side:
         print(colored(f"   ⏳ WAITING — need next {wait_for_next_signal_side.upper()} RF signal", "cyan"))
     if state["breakout_active"]:
@@ -1958,6 +2118,21 @@ def trade_loop():
             mss_info = detect_mss(df, ind, buffer_bps=SMC_BUFFER_BPS) if SMC_MSS_ENABLED else {"mss": False}
             state["smc_mss"] = mss_info
 
+            # Trap detection من مستويات SMC
+            levels = (state.get("_smc") or {}).get("levels", {}) if SMC_ENABLED else {}
+            trap = detect_stop_hunt(df, ind, levels)
+            if trap and state.get("open"):
+                apply_trap_guard(trap, {**ind, "price": px or info_closed["price"]})
+
+            # إطفاء الفخ بعد انتهاء مدته
+            if state.get("_trap_active") and new_bar:
+                left = int(state.get("_trap_left", 0)) - 1
+                state["_trap_left"] = left
+                if left <= 0:
+                    state["_trap_active"] = False
+                    state["_trap_dir"] = None
+                    logging.info("TRAP GUARD DEACTIVATED - time expired")
+
             # PnL snapshot
             if state["open"] and px:
                 state["pnl"] = (px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
@@ -2012,16 +2187,46 @@ def trade_loop():
             elif post_close_cooldown > 0:
                 reason=f"cooldown {post_close_cooldown} bars"
 
-            # If open and opposite signal → close strictly then wait next opposite signal
+            # === لا قفل فوري على RF عكسي؛ نفّذ دفاع فقط ===
             if state["open"] and sig and (reason is None):
-                desired = "long" if sig=="buy" else "short"
+                desired = "long" if sig == "buy" else "short"
                 if state["side"] != desired:
-                    prev_side = state["side"]
-                    close_market_strict("OPPOSITE_RF")  # أضف السبب المميز
-                    wait_for_next_signal_side = "sell" if prev_side=="long" else "buy"
-                    last_close_signal_time = info_closed["time"]
-                    snapshot(bal, {**info_closed, "price": px or info_closed["price"]}, ind, spread_bps, "waiting next opposite signal", df)
-                    time.sleep(compute_next_sleep(df)); continue
+                    # ✅ FIRST: تحقق من Trap Guard - لو شغّال: لا قفل كامل إطلاقًا
+                    if state.get("_trap_active"):
+                        defend_on_opposite_rf(ind, {**info_closed, "price": px_now})
+                        reason = "trap guard active — ignore full close"
+                        snapshot(bal, {**info_closed, "price": px_now}, ind, spread_bps, reason, df)
+                        time.sleep(compute_next_sleep(df)); 
+                        continue
+                    
+                    # تأكيد العكسية: ADX + كسر واضح عن الفلتر + تكرار
+                    px_now  = px or info_closed.get("price")
+                    rf_now  = info_closed.get("filter")
+                    adx_now = float(ind.get("adx") or 0.0)
+
+                    bps = 0.0
+                    try:
+                        if px_now and rf_now:
+                            bps = abs((px_now - rf_now) / rf_now) * 10000.0
+                    except Exception:
+                        pass
+
+                    # نفّذ دفاع دائمًا أول مرة
+                    defend_on_opposite_rf(ind, {**info_closed, "price": px_now})
+
+                    # لو تراكمت الأصوات وكمان الشروط اتحققت ومع ذلك عديّنا حد الصبر → قفل كامل
+                    min_hold_ok = (state.get("bars", 0) >= PATIENT_HOLD_BARS) or ((time.time() - (state.get("opened_at") or time.time())) >= PATIENT_HOLD_SECONDS)
+                    votes_ok    = int(state.get("_opp_rf_votes", 0)) >= OPP_RF_NEED_BARS
+                    confirmed   = (adx_now >= OPP_RF_MIN_ADX) and (bps >= OPP_RF_MIN_HYST_BPS)
+
+                    if votes_ok and confirmed and min_hold_ok and (not NEVER_FULL_CLOSE_BEFORE_TP1 or state.get("tp1_done")):
+                        close_market_strict("OPPOSITE_RF_CONFIRMED")
+                        wait_for_next_signal_side = "sell" if state.get("side") == "long" else "buy"
+                        last_close_signal_time = info_closed["time"]
+                        snapshot(bal, {**info_closed, "price": px_now}, ind, spread_bps, "opposite RF confirmed (full close)", df)
+                        time.sleep(compute_next_sleep(df)); continue
+                    else:
+                        reason = f"opp RF defend (votes={int(state.get('_opp_rf_votes',0))}/{OPP_RF_NEED_BARS}, ADX={adx_now:.1f}, Δ={bps:.1f}bps)"
 
             # Open when flat
             if not state["open"] and (reason is None) and sig:
@@ -2157,6 +2362,12 @@ def metrics():
         },
         "smc_mss": state.get("smc_mss"),
         "smc_extra_partials": state.get("smc_extra_partials", 0.0),
+        "trap_guard": {
+            "enabled": TRAP_ENABLED,
+            "active": state.get("_trap_active", False),
+            "direction": state.get("_trap_dir"),
+            "bars_left": state.get("_trap_left", 0)
+        }
     })
 
 @app.route("/health")
@@ -2185,7 +2396,8 @@ def health():
         "smc_enabled": SMC_ENABLED,
         "smc_score": state.get("_smc", {}).get("score"),
         "smc_mss": state.get("smc_mss"),
-        "smc_extra_partials": state.get("smc_extra_partials", 0.0)
+        "smc_extra_partials": state.get("smc_extra_partials", 0.0),
+        "trap_guard_active": state.get("_trap_active", False)
     }), 200
 
 @app.route("/ping")
@@ -2205,6 +2417,7 @@ if __name__ == "__main__":
     print(colored(f"TVR ENHANCED: {'ON' if TVR_ENABLED else 'OFF'} • Buckets={TVR_BUCKETS} • Vol_Spike={TVR_VOL_SPIKE}x • Reaction_ATR={TVR_REACTION_ATR}", "yellow"))
     print(colored(f"SMC PRO: {'ON' if SMC_ENABLED else 'OFF'} • EQHL_LB={SMC_EQHL_LOOKBACK} • OB_LB={SMC_OB_LOOKBACK} • FVG_Gap={SMC_FVG_MAX_GAP_ATR}ATR", "yellow"))
     print(colored(f"SMC MSS: {'ON' if SMC_MSS_ENABLED else 'OFF'} • Strong_ADX={SMC_STRONG_ADX} • Buffer={SMC_BUFFER_BPS}bps • Partial_Opposite={SMC_PARTIAL_ON_OPPOSITE*100}%", "yellow"))
+    print(colored(f"TRAP GUARD: {'ON' if TRAP_ENABLED else 'OFF'} • Wick_Pct={TRAP_WICK_PCT}% • Vol_Spike={TRAP_VOL_SPIKE}x • Hold_Bars={TRAP_HOLD_BARS}", "yellow"))
     load_state()
     print(colored("🛡️ Watchdog started", "cyan"))
     threading.Thread(target=watchdog_check, daemon=True).start()
