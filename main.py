@@ -360,6 +360,19 @@ last_close_signal_time = None
 
 _state_lock = threading.Lock()
 
+# --- SAFE STATE ACCESS HELPERS ---
+def get_state():
+    """يرجع نسخة آمنة من state للقراءة فقط"""
+    with _state_lock:
+        return dict(state)
+
+def set_state(upd: dict):
+    """تحديث state بأمان مع القفل"""
+    if not isinstance(upd, dict):
+        return
+    with _state_lock:
+        state.update(upd)
+
 def save_state():
     try:
         data = {"state": state, "compound_pnl": compound_pnl, "last_signal_id": last_signal_id, "timestamp": time.time()}
@@ -533,10 +546,13 @@ def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
 
 def apply_trap_guard(trap: dict, ind: dict):
     """فعّل حماية الفخ: امنع القفل الكامل لفترة وشدّ التريل لكن كمّل تداول."""
-    state["_trap_active"] = True
-    state["_trap_dir"]    = trap.get("trap")
-    state["_trap_left"]   = int(TRAP_HOLD_BARS)
-    state["_last_trap_ts"] = trap.get("ts")
+    set_state({
+        "_trap_active": True,
+        "_trap_dir": trap.get("trap"),
+        "_trap_left": int(TRAP_HOLD_BARS),
+        "_last_trap_ts": trap.get("ts"),
+        "breakeven": state.get("breakeven") or state.get("entry")
+    })
     px  = ind.get("price") or price_now() or state.get("entry")
     atr = float(ind.get("atr") or 0.0)
     
@@ -550,10 +566,13 @@ def apply_trap_guard(trap: dict, ind: dict):
     # تشديد التريل
     if atr>0 and px and state.get("open"):
         gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.8)
-        if state["side"]=="long":
-            state["trail"] = max(state.get("trail") or (px-gap), px-gap)
+        current_state = get_state()
+        if current_state["side"] == "long":
+            new_trail = max(current_state.get("trail") or (px - gap), px - gap)
+            set_state({"trail": new_trail})
         else:
-            state["trail"] = min(state.get("trail") or (px+gap), px+gap)
+            new_trail = min(current_state.get("trail") or (px + gap), px + gap)
+            set_state({"trail": new_trail})
     
     logging.info(f"TRAP GUARD ACTIVATED: {trap.get('trap')} trap - blocking full close for {TRAP_HOLD_BARS} bars")
 
@@ -704,6 +723,16 @@ def tvr_spike_entry(df_full: pd.DataFrame, df_closed: pd.DataFrame, ind: dict, b
             qty = safe_qty(qty_full * TVR_SCOUT_FRAC)
             if qty > 0:
                 open_market(side, qty, px)
+                # Initialize SMC snapshot on TVR entries
+                if SMC_ENABLED:
+                    try:
+                        entry_px = px
+                        current_atr = float(ind.get("atr") or 0.0)
+                        smc_data = _smc_liquidity_targets(df_full, side, entry_px, current_atr)
+                        set_state({"_smc": smc_data})
+                        logging.info(f"SMC initialized for TVR {side} entry")
+                    except Exception as e:
+                        logging.error(f"SMC init in TVR error: {e}")
                 # حماية فورية
                 atr = float(ind.get("atr") or 0.0)
                 if atr > 0:
@@ -735,6 +764,16 @@ def tvr_spike_entry(df_full: pd.DataFrame, df_closed: pd.DataFrame, ind: dict, b
         return False
 
     open_market(side, qty, px)
+    # Initialize SMC snapshot on TVR entries
+    if SMC_ENABLED:
+        try:
+            entry_px = px
+            current_atr = float(ind.get("atr") or 0.0)
+            smc_data = _smc_liquidity_targets(df_full, side, entry_px, current_atr)
+            set_state({"_smc": smc_data})
+            logging.info(f"SMC initialized for TVR {side} entry")
+        except Exception as e:
+            logging.error(f"SMC init in TVR error: {e}")
     state["tvr_active"] = True
     state["tvr_bars_alive"] = 0
     state["tvr_bucket"] = feats["bucket"]
@@ -1372,7 +1411,7 @@ def open_market(side, qty, price):
             ex.create_order(SYMBOL,"market",side,qty,None,params)
         except Exception as e:
             print(colored(f"❌ open: {e}","red")); logging.error(f"open_market error: {e}"); return
-    state.update({
+    set_state({
         "open": True, "side": "long" if side=="buy" else "short",
         "entry": price, "qty": qty, "pnl": 0.0, "bars": 0,
         "trail": None, "breakeven": None,
@@ -1459,9 +1498,15 @@ def close_partial(frac, reason):
         except Exception as e: print(colored(f"❌ partial close: {e}","red")); logging.error(f"close_partial error: {e}"); return
     pnl=(px-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
     compound_pnl += pnl
-    state["qty"] -= qty_close
-    state["scale_outs"] += 1
-    state["last_action"]="SCALE_OUT"; state["action_reason"]=reason
+    
+    # استخدام set_state للتحديث الآمن
+    current_state = get_state()
+    set_state({
+        "qty": current_state["qty"] - qty_close,
+        "scale_outs": current_state["scale_outs"] + 1,
+        "last_action": "SCALE_OUT",
+        "action_reason": reason
+    })
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
     logging.info(f"PARTIAL_CLOSE {reason} qty={qty_close} pnl={pnl} remaining={state['qty']}")
     
@@ -1479,7 +1524,7 @@ def reset_after_full_close(reason, prev_side=None):
     print(colored(f"🔚 CLOSE {reason} totalCompounded now={fmt(compound_pnl)}","magenta"))
     logging.info(f"FULL_CLOSE {reason} total_compounded={compound_pnl}")
     if prev_side is None: prev_side = state.get("side")
-    state.update({
+    set_state({
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None,
         "breakeven": None, "scale_ins": 0, "scale_outs": 0,
@@ -1753,7 +1798,7 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     state["_hold_trend"]=bool(hold["hold_mode"])
     state["tci"]=hold["tci"]; state["chop01"]=hold["chop01"]
     if hold["strong_hold"]:
-        state["_adaptive_trail_mult"]=max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, TRAIL_MULT_STRONG_ALPHA)
+        set_state({"_adaptive_trail_mult": max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, TRAIL_MULT_STRONG_ALPHA)})
     if state.get("trade_mode") is None: state["trade_mode"]="TREND"; state["profit_targets_achieved"]=0
     # سلّم ديناميكي كل دورة
     tp_list, tp_fracs, atr_pct, cscore = _build_tp_ladder(info, ind, state.get("side"))
@@ -2035,12 +2080,24 @@ def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: fl
     if qty < (LOT_MIN or 1): return False
     if breakout_signal == "BULL_BREAKOUT":
         open_market("buy", qty, price)
-        state["breakout_active"]=True; state["breakout_direction"]="bull"
+        set_state({
+            "breakout_active": True,
+            "breakout_direction": "bull",
+            "breakout_entry_price": price,
+            "opened_by_breakout": True,
+            "breakout_score": breakout_score,
+            "breakout_votes_detail": vote_details
+        })
     elif breakout_signal == "BEAR_BREAKOUT":
         open_market("sell", qty, price)
-        state["breakout_active"]=True; state["breakout_direction"]="bear"
-    state["breakout_entry_price"]=price; state["opened_by_breakout"]=True
-    state["breakout_score"]=breakout_score; state["breakout_votes_detail"]=vote_details
+        set_state({
+            "breakout_active": True, 
+            "breakout_direction": "bear",
+            "breakout_entry_price": price,
+            "opened_by_breakout": True,
+            "breakout_score": breakout_score,
+            "breakout_votes_detail": vote_details
+        })
     return True
 
 def handle_breakout_exits(df: pd.DataFrame, ind: dict, prev_ind: dict) -> bool:
@@ -2232,6 +2289,13 @@ def trade_loop():
             prev_ind = compute_indicators(df.iloc[:-1]) if len(df)>=2 else ind
             spread_bps = orderbook_spread_bps()
 
+            # تحديث قيم EMA في state للميتريكس
+            set_state({
+                "ema9": ind.get("ema9"),
+                "ema20": ind.get("ema20"), 
+                "ema9_slope": ind.get("ema9_slope")
+            })
+
             # SMC / MSS snapshot
             mss_info = detect_mss(df, ind, buffer_bps=SMC_BUFFER_BPS) if SMC_MSS_ENABLED else {"mss": False}
             state["smc_mss"] = mss_info
@@ -2297,6 +2361,14 @@ def trade_loop():
 
             # ENTRY on closed-candle RF signal only
             sig = "buy" if info_closed["long"] else ("sell" if info_closed["short"] else None)
+            
+            # Reset opposite-RF votes عندما لا توجد عكسية أو ظهرت إشارة مع اتجاه الصفقة
+            if state.get("open"):
+                if sig is None or \
+                   (state["side"] == "long" and info_closed["long"]) or \
+                   (state["side"] == "short" and info_closed["short"]):
+                    set_state({"_opp_rf_votes": 0})
+            
             reason=None
             if not sig:
                 reason="no signal"
@@ -2344,6 +2416,7 @@ def trade_loop():
                         close_market_strict("OPPOSITE_RF_CONFIRMED")
                         wait_for_next_signal_side = "sell" if state.get("side") == "long" else "buy"
                         last_close_signal_time = info_closed["time"]
+                        set_state({"_opp_rf_votes": 0})  # Reset votes after confirmed close
                         snapshot(bal, {**info_closed, "price": px_now}, ind, spread_bps, "opposite RF confirmed (full close)", df)
                         time.sleep(compute_next_sleep(df)); continue
                     else:
