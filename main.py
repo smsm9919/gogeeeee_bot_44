@@ -226,15 +226,6 @@ SMC_DEFER_TP_ON_ALIGNED = True  # تأجيل TP مرة واحدة عندما MSS
 ORCH_WEIGHTS = {"momentum": 0.25, "volatility": 0.20, "trend": 0.20, "structure": 0.35}
 ORCH_STRONG = 0.65
 
-# ======= Fakeout / Stop-Hunt Guard =======
-TRAP_ENABLED       = True
-TRAP_WICK_PCT      = 60.0   # % من مدى الشمعة لازم يكون ذيل
-TRAP_BODY_MAX_PCT  = 25.0   # الجسم صغير → رفض
-TRAP_ATR_MIN       = 0.6    # مدى الشمعة ≥ 0.6×ATR
-TRAP_VOL_SPIKE     = 1.30   # حجم أكبر من متوسط 20 شمعة ×1.3
-TRAP_PROX_BPS      = 12.0   # قرب من EQH/EQL/OB بالـ bps
-TRAP_HOLD_BARS     = 4      # نمنع القفل الكامل N شموع بعد الفخ
-
 # === Patient Trading – لا قفل كامل بدري ===
 NEVER_FULL_CLOSE_BEFORE_TP1   = True   # يمنع أي قفل كامل قبل TP1 إلا طوارئ/Trail
 OPP_RF_NEED_BARS              = 2      # عدد إشارات RF عكسية مغلقة متتالية قبل التفكير في قفل كامل
@@ -408,6 +399,47 @@ def _graceful_exit(signum, frame):
 signal.signal(signal.SIGTERM, _graceful_exit)
 signal.signal(signal.SIGINT,  _graceful_exit)
 
+# =================== PATCH HELPERS (NEW) ===================
+def update_state(mutator):
+    """
+    يطبق تعديلات على state تحت القفل. استخدمه لتعديلات متعددة الحقول.
+    """
+    if not callable(mutator):
+        return
+    with _state_lock:
+        mutator(state)
+
+def _safe_price(default=None):
+    """قراءة سعر آمنة لتفادي None/NaN."""
+    try:
+        p = price_now()
+        if p is None or (isinstance(p, float) and (math.isnan(p) or math.isinf(p))):
+            return default
+        return p
+    except Exception:
+        return default
+
+def _min_tradable_qty(price: float) -> float:
+    """
+    أقل كمية قابلة للتداول وفق LOT_MIN/LOT_STEP. رجوع 1.0 كحل أخير.
+    """
+    try:
+        if LOT_MIN and LOT_MIN > 0:
+            return float(LOT_MIN)
+        if LOT_STEP and LOT_STEP > 0:
+            return float(LOT_STEP)
+        return 1.0
+    except Exception:
+        return 1.0
+
+def _close_partial_min_check(qty_close: float) -> bool:
+    """رفض الجزئي إن كان دون الحد الأدنى الفعلي."""
+    min_qty = _min_tradable_qty(_safe_price(state.get("entry")) or state.get("entry") or 0.0)
+    if qty_close < (min_qty or 0.0):
+        print(colored(f"⚠️ skip partial close (amount={fmt(qty_close,4)} < min lot {fmt(min_qty,4)})", "yellow"))
+        return False
+    return True
+
 # =================== HELPERS ===================
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 def _round_amt(q):
@@ -544,36 +576,35 @@ def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
         logging.error(f"detect_stop_hunt error: {e}")
     return None
 
+# (REPLACED) apply_trap_guard with atomic updates
 def apply_trap_guard(trap: dict, ind: dict):
-    """فعّل حماية الفخ: امنع القفل الكامل لفترة وشدّ التريل لكن كمّل تداول."""
-    set_state({
-        "_trap_active": True,
-        "_trap_dir": trap.get("trap"),
-        "_trap_left": int(TRAP_HOLD_BARS),
-        "_last_trap_ts": trap.get("ts"),
-        "breakeven": state.get("breakeven") or state.get("entry")
-    })
-    px  = ind.get("price") or price_now() or state.get("entry")
+    """تفعيل حماية الفخ: جزئي دفاعي + تعادل + تريل مشدود، بكتابة ذرّية للـ state."""
+    px  = ind.get("price") or _safe_price(state.get("entry")) or state.get("entry")
     atr = float(ind.get("atr") or 0.0)
-    
-    # جني جزئي دفاعي
+
+    update_state(lambda s: (
+        s.__setitem__("_trap_active", True),
+        s.__setitem__("_trap_dir", trap.get("trap")),
+        s.__setitem__("_trap_left", int(TRAP_HOLD_BARS)),
+        s.__setitem__("_last_trap_ts", trap.get("ts")),
+        s.__setitem__("breakeven", s.get("breakeven") or s.get("entry"))
+    ))
+
     if state.get("open") and state["qty"] > 0:
         close_partial(0.15, f"Trap guard partial - {trap.get('trap')} trap detected")
-    
-    # تثبيت التعادل
-    state["breakeven"] = state.get("breakeven") or state["entry"]
-    
-    # تشديد التريل
-    if atr>0 and px and state.get("open"):
+
+    if atr > 0 and px and state.get("open"):
         gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.8)
-        current_state = get_state()
-        if current_state["side"] == "long":
-            new_trail = max(current_state.get("trail") or (px - gap), px - gap)
-            set_state({"trail": new_trail})
-        else:
-            new_trail = min(current_state.get("trail") or (px + gap), px + gap)
-            set_state({"trail": new_trail})
-    
+        def _tighten_trail(s):
+            side = s.get("side")
+            cur  = s.get("trail")
+            if side == "long":
+                nt = max(cur or (px - gap), px - gap)
+            else:
+                nt = min(cur or (px + gap), px + gap)
+            s["trail"] = nt
+        update_state(_tighten_trail)
+
     logging.info(f"TRAP GUARD ACTIVATED: {trap.get('trap')} trap - blocking full close for {TRAP_HOLD_BARS} bars")
 
 # =================== TVR (Time-Volume-Reaction) FUNCTIONS ===================
@@ -1472,45 +1503,52 @@ def close_market_strict(reason):
     print(colored(f"❌ STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — manual check needed. Last error: {last_error}", "red"))
     logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
 
+# (REPLACED) close_partial with exchange-aware min qty and atomic updates
 def close_partial(frac, reason):
+    """
+    إغلاق جزئي آمن، مع احترام حد الكمية الدنيا وفق مواصفات السوق،
+    ومنع كسر حارس البقايا، وتحديث state تحت القفل عند الحاجة.
+    """
     global state, compound_pnl
-    if not state["open"]: return
-    qty_close = safe_qty(max(0.0, state["qty"] * min(max(frac,0.0),1.0)))
-    
-    # 🔥 NEW: Residual guard
-    px = price_now() or state["entry"]
+    if not state["open"]:
+        return
+
+    qty_close = safe_qty(max(0.0, state["qty"] * min(max(frac, 0.0), 1.0)))
+
+    # 🔒 حارس البقايا: لا ندع الكمية المتبقية تهبط تحت الحد الأدنى
+    px = _safe_price(state["entry"]) or state["entry"]
     min_qty_guard = max(RESIDUAL_MIN_QTY, (RESIDUAL_MIN_USDT/(px or 1e-9)))
 
-    # امنع الجزئي لو هيكسر الحارس
     if state["qty"] - qty_close < min_qty_guard:
         qty_close = safe_qty(max(0.0, state["qty"] - min_qty_guard))
         if qty_close <= 0:
             print(colored("⏸️ skip partial (residual guard would be broken)", "yellow"))
             return
 
-    if qty_close < 1:
-        print(colored(f"⚠️ skip partial close (amount={fmt(qty_close,4)} < 1 DOGE)", "yellow"))
+    # حد الكمية الدنيا القابلة للتداول (بدل شرط ثابت)
+    if not _close_partial_min_check(qty_close):
         return
-    
+
     side = "sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
         try: ex.create_order(SYMBOL,"market",side,qty_close,None,_position_params_for_close())
         except Exception as e: print(colored(f"❌ partial close: {e}","red")); logging.error(f"close_partial error: {e}"); return
-    pnl=(px-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
+    px_now = _safe_price(state["entry"]) or state["entry"]
+    pnl=(px_now-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
     compound_pnl += pnl
-    
-    # استخدام set_state للتحديث الآمن
-    current_state = get_state()
-    set_state({
-        "qty": current_state["qty"] - qty_close,
-        "scale_outs": current_state["scale_outs"] + 1,
-        "last_action": "SCALE_OUT",
-        "action_reason": reason
-    })
+
+    # تحديثات state الذرّية
+    def _after_partial(s):
+        s["qty"] = safe_qty((s.get("qty") or 0.0) - qty_close)
+        s["scale_outs"] = int(s.get("scale_outs") or 0) + 1
+        s["last_action"] = "SCALE_OUT"
+        s["action_reason"] = reason
+    update_state(_after_partial)
+
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
     logging.info(f"PARTIAL_CLOSE {reason} qty={qty_close} pnl={pnl} remaining={state['qty']}")
-    
-    # 🔥 NEW: Residual guard check after close
+
+    # إن أصبحت الكمية المتبقية دون الحد الأدنى، أغلِق بالكامل إذا سُمح بذلك
     if state["qty"] < min_qty_guard:
         if RESPECT_PATIENT_MODE_FOR_DUST and PATIENT_TRADER_MODE and (not state.get("tp1_done", False)):
             print(colored("⏸️ residual < guard but patient mode blocks full close before TP1", "yellow"))
@@ -2032,7 +2070,7 @@ def breakout_votes(df: pd.DataFrame, ind: dict, prev_ind: dict) -> tuple:
                 ratio=current_volume/volume_ma
                 if ratio>=BREAKOUT_VOLUME_SPIKE: votes+=1.0; vote_details["volume"]=f"Spike ({ratio:.2f}x)"
                 elif ratio>=BREAKOUT_VOLUME_MED: votes+=0.5; vote_details["volume"]=f"High ({ratio:.2f}x)"
-                else: vote_details["volume"]=f"Normal ({ratio:.2f}x)"
+                else: vote_details["volume"]=f"Normal"
         recent_highs=df["high"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
         recent_lows =df["low"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
         if len(recent_highs)>0 and len(recent_lows)>0:
@@ -2268,7 +2306,7 @@ def watchdog_check(max_stall=180):
 
 # =================== MAIN LOOP ===================
 def trade_loop():
-    global state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint
+    global state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint, last_signal_id
     loop_counter=0
     while True:
         try:
