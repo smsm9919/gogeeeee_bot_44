@@ -119,6 +119,9 @@ BASE_SLEEP        = 10
 NEAR_CLOSE_SLEEP  = 1
 JUST_CLOSED_WINDOW= 8
 
+# Spread guard (unified)
+MAX_SPREAD_BPS = 6.0
+
 # Strict close
 STRICT_EXCHANGE_CLOSE = True
 CLOSE_RETRY_ATTEMPTS = 6
@@ -225,6 +228,15 @@ SMC_DEFER_TP_ON_ALIGNED = True  # تأجيل TP مرة واحدة عندما MSS
 # زوّد وزن الـ Structure في الأوركسترا
 ORCH_WEIGHTS = {"momentum": 0.25, "volatility": 0.20, "trend": 0.20, "structure": 0.35}
 ORCH_STRONG = 0.65
+
+# ======= Fakeout / Stop-Hunt Guard =======
+TRAP_ENABLED       = True
+TRAP_WICK_PCT      = 60.0   # % من مدى الشمعة لازم يكون ذيل
+TRAP_BODY_MAX_PCT  = 25.0   # الجسم صغير → رفض
+TRAP_ATR_MIN       = 0.6    # مدى الشمعة ≥ 0.6×ATR
+TRAP_VOL_SPIKE     = 1.30   # حجم أكبر من متوسط 20 شمعة ×1.3
+TRAP_PROX_BPS      = 12.0   # قرب من EQH/EQL/OB بالـ bps
+TRAP_HOLD_BARS     = 4      # نمنع القفل الكامل N شموع بعد الفخ
 
 # === Patient Trading – لا قفل كامل بدري ===
 NEVER_FULL_CLOSE_BEFORE_TP1   = True   # يمنع أي قفل كامل قبل TP1 إلا طوارئ/Trail
@@ -399,47 +411,6 @@ def _graceful_exit(signum, frame):
 signal.signal(signal.SIGTERM, _graceful_exit)
 signal.signal(signal.SIGINT,  _graceful_exit)
 
-# =================== PATCH HELPERS (NEW) ===================
-def update_state(mutator):
-    """
-    يطبق تعديلات على state تحت القفل. استخدمه لتعديلات متعددة الحقول.
-    """
-    if not callable(mutator):
-        return
-    with _state_lock:
-        mutator(state)
-
-def _safe_price(default=None):
-    """قراءة سعر آمنة لتفادي None/NaN."""
-    try:
-        p = price_now()
-        if p is None or (isinstance(p, float) and (math.isnan(p) or math.isinf(p))):
-            return default
-        return p
-    except Exception:
-        return default
-
-def _min_tradable_qty(price: float) -> float:
-    """
-    أقل كمية قابلة للتداول وفق LOT_MIN/LOT_STEP. رجوع 1.0 كحل أخير.
-    """
-    try:
-        if LOT_MIN and LOT_MIN > 0:
-            return float(LOT_MIN)
-        if LOT_STEP and LOT_STEP > 0:
-            return float(LOT_STEP)
-        return 1.0
-    except Exception:
-        return 1.0
-
-def _close_partial_min_check(qty_close: float) -> bool:
-    """رفض الجزئي إن كان دون الحد الأدنى الفعلي."""
-    min_qty = _min_tradable_qty(_safe_price(state.get("entry")) or state.get("entry") or 0.0)
-    if qty_close < (min_qty or 0.0):
-        print(colored(f"⚠️ skip partial close (amount={fmt(qty_close,4)} < min lot {fmt(min_qty,4)})", "yellow"))
-        return False
-    return True
-
 # =================== HELPERS ===================
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 def _round_amt(q):
@@ -560,15 +531,21 @@ def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
 
         eqh = (levels or {}).get("eqh")
         eql = (levels or {}).get("eql")
-        ob  = (levels or {}).get("ob")  # dict(side/bot/top)
+        ob  = (levels or {}).get("ob")   # dict(side/bot/top)
+        fvg = (levels or {}).get("fvg")  # dict(type/bottom/top)
 
         near_eqh = (eqh and _near_level(h, eqh, TRAP_PROX_BPS))
         near_eql = (eql and _near_level(l, eql, TRAP_PROX_BPS))
         near_ob_res = (ob and ob.get("side")=="bear" and _near_level(h, ob["bot"], TRAP_PROX_BPS))
         near_ob_sup = (ob and ob.get("side")=="bull" and _near_level(l, ob["top"], TRAP_PROX_BPS))
+        # FVG كمنطقة فخ (مقاومة/دعم)
+        near_fvg_res = bool(fvg and fvg.get("type")=="BEAR_FVG" and _near_level(h, fvg.get("bottom", h), TRAP_PROX_BPS))
+        near_fvg_sup = bool(fvg and fvg.get("type")=="BULL_FVG" and _near_level(l, fvg.get("top", l),    TRAP_PROX_BPS))
 
-        bull_trap = (lower_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eql or near_ob_sup))
-        bear_trap = (upper_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eqh or near_ob_res))
+        bull_trap = (lower_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN
+                     and (near_eql or near_ob_sup or near_fvg_sup))
+        bear_trap = (upper_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN
+                     and (near_eqh or near_ob_res or near_fvg_res))
 
         if (bull_trap or bear_trap) and vol_ok:
             return {"trap": "bull" if bull_trap else "bear", "ts": int(df["time"].iloc[-1])}
@@ -576,35 +553,36 @@ def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
         logging.error(f"detect_stop_hunt error: {e}")
     return None
 
-# (REPLACED) apply_trap_guard with atomic updates
 def apply_trap_guard(trap: dict, ind: dict):
-    """تفعيل حماية الفخ: جزئي دفاعي + تعادل + تريل مشدود، بكتابة ذرّية للـ state."""
-    px  = ind.get("price") or _safe_price(state.get("entry")) or state.get("entry")
+    """فعّل حماية الفخ: امنع القفل الكامل لفترة وشدّ التريل لكن كمّل تداول."""
+    set_state({
+        "_trap_active": True,
+        "_trap_dir": trap.get("trap"),
+        "_trap_left": int(TRAP_HOLD_BARS),
+        "_last_trap_ts": trap.get("ts"),
+        "breakeven": state.get("breakeven") or state.get("entry")
+    })
+    px  = ind.get("price") or price_now() or state.get("entry")
     atr = float(ind.get("atr") or 0.0)
-
-    update_state(lambda s: (
-        s.__setitem__("_trap_active", True),
-        s.__setitem__("_trap_dir", trap.get("trap")),
-        s.__setitem__("_trap_left", int(TRAP_HOLD_BARS)),
-        s.__setitem__("_last_trap_ts", trap.get("ts")),
-        s.__setitem__("breakeven", s.get("breakeven") or s.get("entry"))
-    ))
-
+    
+    # جني جزئي دفاعي
     if state.get("open") and state["qty"] > 0:
         close_partial(0.15, f"Trap guard partial - {trap.get('trap')} trap detected")
-
-    if atr > 0 and px and state.get("open"):
+    
+    # تثبيت التعادل
+    state["breakeven"] = state.get("breakeven") or state["entry"]
+    
+    # تشديد التريل
+    if atr>0 and px and state.get("open"):
         gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.8)
-        def _tighten_trail(s):
-            side = s.get("side")
-            cur  = s.get("trail")
-            if side == "long":
-                nt = max(cur or (px - gap), px - gap)
-            else:
-                nt = min(cur or (px + gap), px + gap)
-            s["trail"] = nt
-        update_state(_tighten_trail)
-
+        current_state = get_state()
+        if current_state["side"] == "long":
+            new_trail = max(current_state.get("trail") or (px - gap), px - gap)
+            set_state({"trail": new_trail})
+        else:
+            new_trail = min(current_state.get("trail") or (px + gap), px + gap)
+            set_state({"trail": new_trail})
+    
     logging.info(f"TRAP GUARD ACTIVATED: {trap.get('trap')} trap - blocking full close for {TRAP_HOLD_BARS} bars")
 
 # =================== TVR (Time-Volume-Reaction) FUNCTIONS ===================
@@ -1503,52 +1481,45 @@ def close_market_strict(reason):
     print(colored(f"❌ STRICT CLOSE FAILED after {CLOSE_RETRY_ATTEMPTS} attempts — manual check needed. Last error: {last_error}", "red"))
     logging.critical(f"STRICT CLOSE FAILED — last_error={last_error}")
 
-# (REPLACED) close_partial with exchange-aware min qty and atomic updates
 def close_partial(frac, reason):
-    """
-    إغلاق جزئي آمن، مع احترام حد الكمية الدنيا وفق مواصفات السوق،
-    ومنع كسر حارس البقايا، وتحديث state تحت القفل عند الحاجة.
-    """
     global state, compound_pnl
-    if not state["open"]:
-        return
-
-    qty_close = safe_qty(max(0.0, state["qty"] * min(max(frac, 0.0), 1.0)))
-
-    # 🔒 حارس البقايا: لا ندع الكمية المتبقية تهبط تحت الحد الأدنى
-    px = _safe_price(state["entry"]) or state["entry"]
+    if not state["open"]: return
+    qty_close = safe_qty(max(0.0, state["qty"] * min(max(frac,0.0),1.0)))
+    
+    # 🔥 NEW: Residual guard
+    px = price_now() or state["entry"]
     min_qty_guard = max(RESIDUAL_MIN_QTY, (RESIDUAL_MIN_USDT/(px or 1e-9)))
 
+    # امنع الجزئي لو هيكسر الحارس
     if state["qty"] - qty_close < min_qty_guard:
         qty_close = safe_qty(max(0.0, state["qty"] - min_qty_guard))
         if qty_close <= 0:
             print(colored("⏸️ skip partial (residual guard would be broken)", "yellow"))
             return
 
-    # حد الكمية الدنيا القابلة للتداول (بدل شرط ثابت)
-    if not _close_partial_min_check(qty_close):
+    if qty_close < 1:
+        print(colored(f"⚠️ skip partial close (amount={fmt(qty_close,4)} < 1 DOGE)", "yellow"))
         return
-
+    
     side = "sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
         try: ex.create_order(SYMBOL,"market",side,qty_close,None,_position_params_for_close())
         except Exception as e: print(colored(f"❌ partial close: {e}","red")); logging.error(f"close_partial error: {e}"); return
-    px_now = _safe_price(state["entry"]) or state["entry"]
-    pnl=(px_now-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
+    pnl=(px-state["entry"])*qty_close*(1 if state["side"]=="long" else -1)
     compound_pnl += pnl
-
-    # تحديثات state الذرّية
-    def _after_partial(s):
-        s["qty"] = safe_qty((s.get("qty") or 0.0) - qty_close)
-        s["scale_outs"] = int(s.get("scale_outs") or 0) + 1
-        s["last_action"] = "SCALE_OUT"
-        s["action_reason"] = reason
-    update_state(_after_partial)
-
+    
+    # استخدام set_state للتحديث الآمن
+    current_state = get_state()
+    set_state({
+        "qty": current_state["qty"] - qty_close,
+        "scale_outs": current_state["scale_outs"] + 1,
+        "last_action": "SCALE_OUT",
+        "action_reason": reason
+    })
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
     logging.info(f"PARTIAL_CLOSE {reason} qty={qty_close} pnl={pnl} remaining={state['qty']}")
-
-    # إن أصبحت الكمية المتبقية دون الحد الأدنى، أغلِق بالكامل إذا سُمح بذلك
+    
+    # 🔥 NEW: Residual guard check after close
     if state["qty"] < min_qty_guard:
         if RESPECT_PATIENT_MODE_FOR_DUST and PATIENT_TRADER_MODE and (not state.get("tp1_done", False)):
             print(colored("⏸️ residual < guard but patient mode blocks full close before TP1", "yellow"))
@@ -1823,6 +1794,12 @@ def trend_profit_taking(ind: dict, info: dict, df_cached: pd.DataFrame):
                 state["trail"] = min(state.get("trail") or (px_now + gap), px_now + gap)
 
         if state["_trend_exit_votes"] >= 2 and state.get("bars", 0) >= PATIENT_HOLD_BARS:
+            # أثناء Trap Guard: لا قفل كامل — اكتفِ بتشديد التريل
+            if state.get("_trap_active"):
+                return "TREND_EXIT_VOTE_TRAP"
+            # احترام منع الإغلاق الكامل قبل TP1 (إلا طوارئ/تريل)
+            if NEVER_FULL_CLOSE_BEFORE_TP1 and not state.get("tp1_done"):
+                return "TREND_EXIT_VOTE_PATIENT"
             close_market_strict("TREND_COMPLETE_CONFIRMED")
             return "TREND_COMPLETE_CONFIRMED"
         return "TREND_EXIT_VOTE"
@@ -1972,8 +1949,8 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
         if side=="short" and (pdi - mdi) > DI_FLIP_BUFFER: reverse_votes+=1
     except Exception: pass
 
-    # Set soft block
-    need=max(PATIENCE_NEED_CONSENSUS, 3)
+    # احترم الإعداد كما هو (بدون رفع تلقائي)
+    need=int(PATIENCE_NEED_CONSENSUS)
     state["_exit_soft_block"] = not (elapsed_bar >= MIN_HOLD_BARS and elapsed_s >= MIN_HOLD_SECONDS and reverse_votes >= need)
     if ENABLE_PATIENCE and state.get("_exit_soft_block"): return None
 
@@ -2015,7 +1992,10 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
     tp_multiplier, trail_activate_multiplier = get_dynamic_tp_params(adx)
     current_tp1_pct = TP1_PCT * tp_multiplier
     current_trail_activate = TRAIL_ACTIVATE * trail_activate_multiplier
-    trail_mult_to_use = state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL
+    # لا تستبدل 0.0 بقيمة افتراضية — 0.0 يعني تعطيل التريل قبل TP1
+    trail_mult_to_use = state.get("_adaptive_trail_mult")
+    if trail_mult_to_use is None:
+        trail_mult_to_use = ATR_MULT_TRAIL
 
     # TP1 & breakeven
     if (not state.get("tp1_done")) and rr >= current_tp1_pct:
@@ -2070,7 +2050,7 @@ def breakout_votes(df: pd.DataFrame, ind: dict, prev_ind: dict) -> tuple:
                 ratio=current_volume/volume_ma
                 if ratio>=BREAKOUT_VOLUME_SPIKE: votes+=1.0; vote_details["volume"]=f"Spike ({ratio:.2f}x)"
                 elif ratio>=BREAKOUT_VOLUME_MED: votes+=0.5; vote_details["volume"]=f"High ({ratio:.2f}x)"
-                else: vote_details["volume"]=f"Normal"
+                else: vote_details["volume"]=f"Normal ({ratio:.2f}x)"
         recent_highs=df["high"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
         recent_lows =df["low"].iloc[-BREAKOUT_LOOKBACK_BARS:-1].astype(float)
         if len(recent_highs)>0 and len(recent_lows)>0:
@@ -2113,7 +2093,7 @@ def handle_breakout_entries(df: pd.DataFrame, ind: dict, prev_ind: dict, bal: fl
     price = ind.get("price") or float(df["close"].iloc[-1])
     breakout_score, vote_details = breakout_votes(df, ind, prev_ind)
     if breakout_score < 3.0: return False
-    if spread_bps is not None and spread_bps > 6: return False
+    if spread_bps is not None and spread_bps > MAX_SPREAD_BPS: return False
     qty = compute_size(bal, price)
     if qty < (LOT_MIN or 1): return False
     if breakout_signal == "BULL_BREAKOUT":
@@ -2306,7 +2286,7 @@ def watchdog_check(max_stall=180):
 
 # =================== MAIN LOOP ===================
 def trade_loop():
-    global state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint, last_signal_id
+    global state, post_close_cooldown, wait_for_next_signal_side, last_close_signal_time, last_open_fingerprint
     loop_counter=0
     while True:
         try:
@@ -2397,6 +2377,10 @@ def trade_loop():
             # TVR post-entry relax
             tvr_post_entry_relax(df, ind)
 
+            # Decay زمني لأصوات RF العكسي — يُقلّل مع كل شمعة جديدة
+            if state.get("open") and new_bar:
+                state["_opp_rf_votes"] = max(0, int(state.get("_opp_rf_votes", 0)) - 1)
+
             # ENTRY on closed-candle RF signal only
             sig = "buy" if info_closed["long"] else ("sell" if info_closed["short"] else None)
             
@@ -2410,8 +2394,8 @@ def trade_loop():
             reason=None
             if not sig:
                 reason="no signal"
-            elif spread_bps is not None and spread_bps > 6:
-                reason=f"spread too high ({fmt(spread_bps,2)}bps > 6)"
+            elif spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
+                reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             elif post_close_cooldown > 0:
                 reason=f"cooldown {post_close_cooldown} bars"
 
@@ -2546,19 +2530,20 @@ def home():
 
 @app.route("/metrics")
 def metrics():
+    s = get_state()
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
-        "position": state, "compound_pnl": compound_pnl, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "position": s, "compound_pnl": compound_pnl, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "strategy": STRATEGY, "trend_only": True, "bingx_mode": BINGX_POSITION_MODE,
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
         "waiting_for_signal": wait_for_next_signal_side,
         "breakout_engine": {
-            "active": state.get("breakout_active", False),
-            "direction": state.get("breakout_direction"),
-            "entry_price": state.get("breakout_entry_price"),
-            "score": state.get("breakout_score", 0.0),
-            "votes": state.get("breakout_votes_detail", {})
+            "active": s.get("breakout_active", False),
+            "direction": s.get("breakout_direction"),
+            "entry_price": s.get("breakout_entry_price"),
+            "score": s.get("breakout_score", 0.0),
+            "votes": s.get("breakout_votes_detail", {})
         },
         "emergency_protection": {
             "enabled": EMERGENCY_PROTECTION_ENABLED,
@@ -2566,70 +2551,71 @@ def metrics():
             "harvest_frac": EMERGENCY_HARVEST_FRAC
         },
         "fearless_hold": {
-            "tci": state.get("tci"), "chop01": state.get("chop01"),
-            "hold_mode": state.get("_hold_trend", False),
+            "tci": s.get("tci"), "chop01": s.get("chop01"),
+            "hold_mode": s.get("_hold_trend", False),
             "hold_tci_threshold": HOLD_TCI, "strong_hold_tci_threshold": HOLD_STRONG_TCI
         },
         "dynamic_profit_taking": {
-            "consensus_score": state.get("_consensus_score"),
-            "atr_pct": state.get("_atr_pct"),
-            "tp_ladder": state.get("_tp_ladder"),
-            "tp_fracs": state.get("_tp_fracs")
+            "consensus_score": s.get("_consensus_score"),
+            "atr_pct": s.get("_atr_pct"),
+            "tp_ladder": s.get("_tp_ladder"),
+            "tp_fracs": s.get("_tp_fracs")
         },
         "ema_indicators": {
-            "ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")
+            "ema9": s.get("ema9"), "ema20": s.get("ema20"), "ema9_slope": s.get("ema9_slope")
         },
         "tvr_enhanced": {
             "enabled": TVR_ENABLED,
-            "active": state.get("tvr_active", False),
-            "vol_ratio": state.get("tvr_vol_ratio"),
-            "reaction": state.get("tvr_reaction"),
-            "bucket": state.get("tvr_bucket")
+            "active": s.get("tvr_active", False),
+            "vol_ratio": s.get("tvr_vol_ratio"),
+            "reaction": s.get("tvr_reaction"),
+            "bucket": s.get("tvr_bucket")
         },
         "smc_pro": {
             "enabled": SMC_ENABLED,
-            "score": state.get("_smc", {}).get("score"),
-            "tp_candidates": state.get("_smc", {}).get("tp_candidates"),
-            "trail_mult": state.get("_smc", {}).get("trail_mult")
+            "score": s.get("_smc", {}).get("score"),
+            "tp_candidates": s.get("_smc", {}).get("tp_candidates"),
+            "trail_mult": s.get("_smc", {}).get("trail_mult")
         },
-        "smc_mss": state.get("smc_mss"),
-        "smc_extra_partials": state.get("smc_extra_partials", 0.0),
+        "smc_mss": s.get("smc_mss"),
+        "smc_extra_partials": s.get("smc_extra_partials", 0.0),
         "trap_guard": {
             "enabled": TRAP_ENABLED,
-            "active": state.get("_trap_active", False),
-            "direction": state.get("_trap_dir"),
-            "bars_left": state.get("_trap_left", 0)
+            "active": s.get("_trap_active", False),
+            "direction": s.get("_trap_dir"),
+            "bars_left": s.get("_trap_left", 0)
         }
     })
 
 @app.route("/health")
 def health():
+    s = get_state()
     return jsonify({
         "ok": True,
         "loop_stall_s": time.time() - last_loop_ts,
         "mode": "live" if MODE_LIVE else "paper",
-        "open": state["open"], "side": state["side"], "qty": state["qty"],
+        "open": s["open"], "side": s["side"], "qty": s["qty"],
         "compound_pnl": compound_pnl, "consecutive_errors": _consec_err,
         "timestamp": datetime.utcnow().isoformat(),
         "strict_close_enabled": STRICT_EXCHANGE_CLOSE,
-        "trade_mode": state.get("trade_mode"),
-        "profit_targets_achieved": state.get("profit_targets_achieved", 0),
+        "trade_mode": s.get("trade_mode"),
+        "profit_targets_achieved": s.get("profit_targets_achieved", 0),
         "waiting_for_signal": wait_for_next_signal_side,
-        "breakout_active": state.get("breakout_active", False),
+        "breakout_active": s.get("breakout_active", False),
         "emergency_protection_enabled": EMERGENCY_PROTECTION_ENABLED,
-        "breakout_score": state.get("breakout_score", 0.0),
-        "tp0_done": state.get("_tp0_done", False),
-        "thrust_locked": state.get("thrust_locked", False),
-        "fearless_hold": {"tci": state.get("tci"), "chop01": state.get("chop01"), "hold_mode": state.get("_hold_trend", False)},
-        "dynamic_profit_taking": {"consensus_score": state.get("_consensus_score"), "atr_pct": state.get("_atr_pct"), "tp_ladder": state.get("_tp_ladder")},
-        "ema_indicators": {"ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")},
+        "breakout_score": s.get("breakout_score", 0.0),
+        "tp0_done": s.get("_tp0_done", False),
+        "thrust_locked": s.get("thrust_locked", False),
+        "fearless_hold": {"tci": s.get("tci"), "chop01": s.get("chop01"), "hold_mode": s.get("_hold_trend", False)},
+        "dynamic_profit_taking": {"consensus_score": s.get("_consensus_score"), "atr_pct": s.get("_atr_pct"), "tp_ladder": s.get("_tp_ladder")},
+        "ema_indicators": {"ema9": s.get("ema9"), "ema20": s.get("ema20"), "ema9_slope": s.get("ema9_slope")},
         "tvr_enabled": TVR_ENABLED,
-        "tvr_active": state.get("tvr_active", False),
+        "tvr_active": s.get("tvr_active", False),
         "smc_enabled": SMC_ENABLED,
-        "smc_score": state.get("_smc", {}).get("score"),
-        "smc_mss": state.get("smc_mss"),
-        "smc_extra_partials": state.get("smc_extra_partials", 0.0),
-        "trap_guard_active": state.get("_trap_active", False)
+        "smc_score": s.get("_smc", {}).get("score"),
+        "smc_mss": s.get("smc_mss"),
+        "smc_extra_partials": s.get("smc_extra_partials", 0.0),
+        "trap_guard_active": s.get("_trap_active", False)
     }), 200
 
 @app.route("/ping")
