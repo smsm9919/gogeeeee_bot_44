@@ -174,6 +174,27 @@ TVR_SCOUT_FRAC       = 0.50       # حجم دخول Scout (نصف الحجم ا�
 TVR_TIMEOUT_BARS     = 6          # أقصى عدد شموع يظل فيها وضع Scout "خاص"
 TVR_MAX_SPREAD_BPS   = 6.0        # لا ندخل إن كان السبريد كبير
 
+# ===== SMC Pro (Structure / Liquidity) =====
+SMC_ENABLED = True
+SMC_EQHL_LOOKBACK    = 30   # البحث عن Equal Highs/Lows
+SMC_OB_LOOKBACK      = 40   # نطاق البحث عن الـ Order Blocks الأخيرة
+SMC_DISPLACEMENT_ATR = 1.20 # اندفاع (جسم ≥ 1.2×ATR) لتأكيد OB
+SMC_WICK_MAX         = 0.35 # أقصى نسبة ذيل من مدى الشمعة لاعتماد شمعة OB
+SMC_VOL_SPIKE        = 1.30 # سبايك حجم لتأكيد الـ OB/الاندفاع
+SMC_FVG_MAX_GAP_ATR  = 2.00 # أقصى فجوة FVG (كـ ATR) نعتمدها
+SMC_PREM_WIN         = 40   # نافذة Premium/Discount (عدد شموع)
+SMC_FIB_EXTS         = [1.00, 1.272, 1.618]  # أهداف امتداد
+SMC_SCORE_STRONG     = 0.65
+SMC_SCORE_HOLD       = 0.55
+SMC_SCORE_WARN       = 0.40
+SMC_WARN_PARTIAL     = 0.20
+SMC_TIGHT_TRAIL_MULT = 1.6
+SMC_WIDE_TRAIL_MULT  = 2.4
+
+# زوّد وزن الـ Structure في الأوركسترا
+ORCH_WEIGHTS = {"momentum": 0.25, "volatility": 0.20, "trend": 0.20, "structure": 0.35}
+ORCH_STRONG = 0.65
+
 # =================== LOGGING ===================
 def setup_file_logging():
     logger = logging.getLogger()
@@ -744,6 +765,281 @@ def _build_tp_ladder(info: dict, ind: dict, side: str):
     close_fracs = [0.25, 0.30, 0.45]
     return targets, close_fracs, atr_pct, score
 
+# =================== SMC PRO FUNCTIONS ===================
+def _slices(df, n):
+    """يرجع آخر n شموع"""
+    return df.iloc[-n:] if len(df) >= n else df.copy()
+
+def _last_swings(df, lb=5, k=3):
+    """يرجع آخر k قمم وقيعان بسيطة"""
+    if len(df) < lb*3: 
+        return [], []
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    highs, lows = [], []
+    for i in range(lb, len(df)-lb):
+        win_h = h.iloc[i-lb:i+lb+1]
+        win_l = l.iloc[i-lb:i+lb+1]
+        if h.iloc[i] == win_h.max(): 
+            highs.append((i, float(h.iloc[i])))
+        if l.iloc[i] == win_l.min(): 
+            lows.append((i, float(l.iloc[i])))
+    # ترتيب من الأحدث للأقدم
+    highs.sort(key=lambda x: x[0], reverse=True)
+    lows.sort(key=lambda x: x[0], reverse=True)
+    return [h[1] for h in highs[:k]], [l[1] for l in lows[:k]]
+
+def _equal_levels(arr, tol):
+    """يجمع المستويات المتقاربة (Equal Highs/Lows)"""
+    if not arr: 
+        return []
+    arr = sorted(arr)
+    groups = [[arr[0]]]
+    for x in arr[1:]:
+        if abs(x - groups[-1][-1]) <= tol:
+            groups[-1].append(x)
+        else:
+            groups.append([x])
+    return [sum(g)/len(g) for g in groups if len(g) >= 2]
+
+def _detect_eq_highs_lows(df, lookback=30, tol_bps=6.0):
+    """يكتشف Equal Highs و Equal Lows"""
+    d = _slices(df, lookback)
+    highs, lows = _last_swings(d, lb=3, k=20)
+    if not highs and not lows: 
+        return {"eqh": [], "eql": []}
+    px = float(df["close"].iloc[-1])
+    tol = px * (tol_bps/10000.0)
+    return {
+        "eqh": _equal_levels(highs, tol), 
+        "eql": _equal_levels(lows, tol)
+    }
+
+def _fvg_list(df, atr):
+    """يرجع قائمة FVGs بسيطة (نوع/حدود)"""
+    out = []
+    if len(df) < 3: 
+        return out
+    for i in range(2, len(df)):
+        h2 = float(df["high"].iloc[i-2])
+        l2 = float(df["low"].iloc[i-2])
+        h1 = float(df["high"].iloc[i-1])
+        l1 = float(df["low"].iloc[i-1])
+        if l1 > h2:  # فجوة صاعدة
+            gap = l1 - h2
+            if atr > 0 and gap/atr <= SMC_FVG_MAX_GAP_ATR:
+                out.append({"type":"bull", "top":l1, "bot":h2, "mid": (l1+h2)/2})
+        elif h1 < l2:  # فجوة هابطة
+            gap = l2 - h1
+            if atr > 0 and gap/atr <= SMC_FVG_MAX_GAP_ATR:
+                out.append({"type":"bear", "top":l2, "bot":h1, "mid": (l2+h1)/2})
+    return out[-6:]  # آخر 6 فُجوات تكفي للإدارة
+
+def _volume_ma(df, n=20):
+    """يحسب متوسط الحجم لآخر n شمعة"""
+    if len(df) < n+1: 
+        return 0.0
+    return float(df["volume"].iloc[-n-1:-1].astype(float).mean())
+
+def _detect_ob_pro(df, atr, side_hint=None):
+    """
+    OB محسّن: آخر شمعة عكسية ذات جسم معتبر
+    """
+    if len(df) < 25 or atr is None or atr <= 0: 
+        return None
+    
+    o = df["open"].astype(float)
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
+    vol_ma = _volume_ma(df, 20)
+    
+    # اكتشاف الاندفاع
+    def _impulse_dir():
+        if len(df) < 4:
+            return None
+        b1 = abs(c.iloc[-2] - o.iloc[-2])
+        b2 = abs(c.iloc[-3] - o.iloc[-3])
+        up = (c.iloc[-2] > o.iloc[-2] and c.iloc[-3] > o.iloc[-3] and
+              b1 >= SMC_DISPLACEMENT_ATR*atr and b2 >= SMC_DISPLACEMENT_ATR*atr)
+        dn = (c.iloc[-2] < o.iloc[-2] and c.iloc[-3] < o.iloc[-3] and
+              b1 >= SMC_DISPLACEMENT_ATR*atr and b2 >= SMC_DISPLACEMENT_ATR*atr)
+        if up: return "up"
+        if dn: return "down"
+        return None
+    
+    d = _impulse_dir()
+    if side_hint == "long":  
+        d = d or "up"
+    if side_hint == "short": 
+        d = d or "down"
+
+    rng = range(len(df)-4, max(len(df)-SMC_OB_LOOKBACK, 0), -1)
+    
+    if d == "up":
+        for j in rng:
+            # شمعة هابطة بذيول معقولة
+            body = o.iloc[j] - c.iloc[j]
+            rngc = h.iloc[j] - l.iloc[j]
+            if rngc <= 0:
+                continue
+            body_ratio = body / rngc
+            if c.iloc[j] < o.iloc[j] and body_ratio >= (1.0 - SMC_WICK_MAX):
+                v_spike = df["volume"].iloc[j] > vol_ma*SMC_VOL_SPIKE if vol_ma > 0 else True
+                if v_spike:
+                    return {
+                        "side": "bull", 
+                        "top": float(o.iloc[j]), 
+                        "bot": float(l.iloc[j]),
+                        "mid": (float(o.iloc[j]) + float(l.iloc[j]))/2
+                    }
+    
+    if d == "down":
+        for j in rng:
+            # شمعة صاعدة بذيول معقولة
+            body = c.iloc[j] - o.iloc[j]
+            rngc = h.iloc[j] - l.iloc[j]
+            if rngc <= 0:
+                continue
+            body_ratio = body / rngc
+            if c.iloc[j] > o.iloc[j] and body_ratio >= (1.0 - SMC_WICK_MAX):
+                v_spike = df["volume"].iloc[j] > vol_ma*SMC_VOL_SPIKE if vol_ma > 0 else True
+                if v_spike:
+                    return {
+                        "side": "bear", 
+                        "top": float(h.iloc[j]), 
+                        "bot": float(o.iloc[j]),
+                        "mid": (float(h.iloc[j]) + float(o.iloc[j]))/2
+                    }
+    return None
+
+def _mss_bos(df):
+    """اكتشاف Break of Structure مبسط"""
+    if len(df) < 12: 
+        return None
+    h = df["high"].astype(float).iloc[-12:]
+    l = df["low"].ast(float).iloc[-12:]
+    last_c = float(df["close"].iloc[-1])
+    if last_c > h.iloc[:-1].max(): 
+        return {"type": "BOS_UP"}
+    if last_c < l.iloc[:-1].min(): 
+        return {"type": "BOS_DOWN"}
+    return None
+
+def _premium_discount(df):
+    """تحديد مناطق Premium/Discount"""
+    if len(df) < SMC_PREM_WIN: 
+        return None
+    cut = _slices(df, SMC_PREM_WIN)
+    hi = float(cut["high"].astype(float).max())
+    lo = float(cut["low"].astype(float).min())
+    mid = (hi + lo)/2.0
+    last_c = float(df["close"].iloc[-1])
+    zone = "PREMIUM" if last_c > mid else "DISCOUNT"
+    return {"hi": hi, "lo": lo, "mid": mid, "zone": zone}
+
+def _smc_liquidity_targets(df, side, entry, atr):
+    """يبني خريطة أهداف السيولة والهيكل"""
+    if not SMC_ENABLED:
+        return None
+        
+    px = float(df["close"].iloc[-1])
+    atr_pct = (atr/max(entry, 1e-9))*100.0 if atr else 0.6
+    
+    # جمع بيانات الهيكل
+    eq = _detect_eq_highs_lows(df, SMC_EQHL_LOOKBACK)
+    highs, lows = _last_swings(df, lb=3, k=6)
+    fvgz = _fvg_list(df, atr)
+    prem = _premium_discount(df)
+    ob = _detect_ob_pro(df, atr, side_hint=side)
+    bos = _mss_bos(df)
+
+    # بناء الأهداف حسب الاتجاه - التصحيح هنا
+    targets = []
+    if side == "long":
+        # أهداف صاعدة - التصحيح: نقل الشرط بعد القائمة
+        targets += [x for x in eq.get("eqh", []) if x > px]
+        targets += [x for x in highs if x > px]
+        targets += [z["top"] for z in fvgz if z["type"] == "bull" and z["top"] > px]
+        targets += [z["mid"] for z in fvgz if z["type"] == "bull" and z["mid"] > px]
+    else:
+        # أهداف هابطة - التصحيح: نقل الشرط بعد القائمة
+        targets += [x for x in eq.get("eql", []) if x < px]
+        targets += [x for x in lows if x < px]
+        targets += [z["bot"] for z in fvgz if z["type"] == "bear" and z["bot"] < px]
+        targets += [z["mid"] for z in fvgz if z["type"] == "bear" and z["mid"] < px]
+
+    # إضافة امتدادات فيبوناتشي
+    if highs and lows:
+        last_hi = max(highs)
+        last_lo = min(lows)
+        if side == "long" and last_hi > last_lo:
+            leg = last_hi - last_lo
+            for e in SMC_FIB_EXTS:
+                targets.append(last_hi + leg*(e-1.0))
+        elif side == "short" and last_hi > last_lo:
+            leg = last_hi - last_lo
+            for e in SMC_FIB_EXTS:
+                targets.append(last_lo - leg*(e-1.0))
+
+    # تحويل لنسب مئوية من سعر الدخول
+    def _to_pct(levels):
+        out = []
+        for level in sorted(set(levels)):
+            if level <= 0:
+                continue
+            rr = (level - entry)/entry * 100.0 * (1 if side=="long" else -1)
+            if rr > 0.1:  # تجاهل الأهداف الصغيرة جداً
+                out.append(round(rr, 2))
+        return sorted(out)[:3]  # أقرب 3 أهداف
+
+    tp_candidates = _to_pct(targets)
+
+    # حساب درجة SMC
+    smc_score = 0.0
+    
+    # OB متوافق مع الاتجاه
+    if ob and ((side=="long" and ob["side"]=="bull") or (side=="short" and ob["side"]=="bear")):
+        smc_score += 0.4
+    
+    # المنطقة السعرية مناسبة
+    if prem:
+        if (side=="long" and prem["zone"]=="DISCOUNT") or (side=="short" and prem["zone"]=="PREMIUM"):
+            smc_score += 0.2
+    
+    # وجود أهداف كافية
+    if len(tp_candidates) >= 2:
+        smc_score += 0.2
+    
+    # BOS متوافق مع الاتجاه
+    if bos:
+        if (bos["type"]=="BOS_UP" and side=="long") or (bos["type"]=="BOS_DOWN" and side=="short"):
+            smc_score += 0.2
+
+    smc_score = round(min(1.0, smc_score), 2)
+
+    # تحديد معامل التريل
+    if smc_score >= SMC_SCORE_STRONG:
+        trail_mult = SMC_WIDE_TRAIL_MULT
+    elif smc_score >= SMC_SCORE_HOLD:
+        trail_mult = SMC_WIDE_TRAIL_MULT
+    else:
+        trail_mult = SMC_TIGHT_TRAIL_MULT
+
+    return {
+        "score": smc_score,
+        "tp_candidates": tp_candidates,
+        "trail_mult": trail_mult,
+        "levels": {
+            "eq": eq, 
+            "ob": ob, 
+            "fvg": fvgz, 
+            "swings": {"hi": highs, "lo": lows}, 
+            "premium": prem,
+            "bos": bos
+        }
+    }
+
 # =================== ORDERS ===================
 def _position_params_for_open(side: str):
     if BINGX_POSITION_MODE == "hedge":
@@ -1128,6 +1424,44 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     tp_list, tp_fracs, atr_pct, cscore = _build_tp_ladder(info, ind, state.get("side"))
     state["_tp_ladder"]=tp_list; state["_tp_fracs"]=tp_fracs
     state["_consensus_score"]=cscore; state["_atr_pct"]=atr_pct
+
+    # --- SMC Pro Integration ---
+    if SMC_ENABLED and state["open"] and state["qty"] > 0:
+        try:
+            entry_px = state.get("entry") or info.get("price")
+            current_atr = float(ind.get("atr") or 0.0)
+            smc_data = _smc_liquidity_targets(df, state["side"], entry_px, current_atr)
+            
+            if smc_data:
+                state["_smc"] = smc_data
+                
+                # SMC قوي: توسيع الأهداف وتهدئة التريل
+                if smc_data["score"] >= SMC_SCORE_HOLD:
+                    if smc_data.get("tp_candidates"):
+                        # دمج أهداف SMC مع الأهداف الديناميكية
+                        dynamic_tps = state.get("_tp_ladder") or []
+                        all_tps = sorted(set(dynamic_tps + smc_data["tp_candidates"]))
+                        state["_tp_ladder"] = all_tps[:4]  # احتفظ بأقرب 4 أهداف
+                    
+                    # تحسين التريل
+                    state["_adaptive_trail_mult"] = max(
+                        state.get("_adaptive_trail_mult") or 0.0, 
+                        smc_data["trail_mult"]
+                    )
+                    logging.info(f"SMC STRONG: score={smc_data['score']}, expanded targets, wider trail")
+                
+                # SMC تحذير: جني جزئي وشد التريل
+                elif smc_data["score"] < SMC_SCORE_WARN and not state.get("tp1_done"):
+                    close_partial(SMC_WARN_PARTIAL, "SMC weak signal — protective harvest")
+                    state["_adaptive_trail_mult"] = max(
+                        state.get("_adaptive_trail_mult") or 0.0, 
+                        SMC_TIGHT_TRAIL_MULT
+                    )
+                    logging.info(f"SMC WARN: score={smc_data['score']}, took protective partial")
+                    
+        except Exception as e:
+            logging.error(f"SMC integration error: {e}")
+
     if TRAIL_ONLY_AFTER_TP1 and not state.get("tp1_done"):
         state["_adaptive_trail_mult"]=0.0
     # Quick cash صغير
@@ -1172,6 +1506,17 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
             if not _allow_full_close(reason):
                 logging.info(f"EXIT_BLOCKED (patient): {reason}")
                 return False
+        
+        # --- SMC Structural Patience Guard ---
+        if (SMC_ENABLED and state["open"] and not state.get("tp1_done")):
+            smc_data = state.get("_smc")
+            if smc_data and smc_data.get("tp_candidates"):
+                # منع الإغلاق الكامل إذا لا توجد طوارئ ولم نلمس أهداف السيولة بعد
+                hard_exit_reasons = ("EMERGENCY", "OPPOSITE_RF", "TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT")
+                if not any(exit_reason in str(reason) for exit_reason in hard_exit_reasons):
+                    logging.info("SMC PATIENCE: Blocking full close - waiting for liquidity targets")
+                    return False  # منع الإغلاق الكامل
+        
         close_market_strict(reason)
         return True
 
@@ -1434,6 +1779,20 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     if TVR_ENABLED:
         tvr_line = f"TVR: bucket={state.get('tvr_bucket')}  vol×={fmt(state.get('tvr_vol_ratio'),2)}  react(ATR)={fmt(state.get('tvr_reaction'),2)}  active={bool(state.get('tvr_active'))}"
         print(colored(f"   🕒 {tvr_line}", "yellow"))
+
+    # عرض SMC Pro data
+    if state.get("_smc"):
+        smc = state["_smc"]
+        score_color = "green" if smc["score"] >= SMC_SCORE_HOLD else "yellow" if smc["score"] >= SMC_SCORE_WARN else "red"
+        score_text = colored(f"{smc['score']:.2f}", score_color)
+        print(colored(f"   🧠 SMC Pro: score={score_text} • targets={smc.get('tp_candidates', [])} • trail×{smc.get('trail_mult', 0)}", "cyan"))
+        
+        # عرض تفاصيل إضافية في وضع verbose
+        if smc.get("levels", {}).get("ob"):
+            ob = smc["levels"]["ob"]
+            print(colored(f"   📦 OB: {ob['side']} zone[{fmt(ob['bot'])}-{fmt(ob['top'])}]", "white"))
+        if smc.get("levels", {}).get("bos"):
+            print(colored(f"   🏗️ BOS: {smc['levels']['bos']['type']}", "white"))
     
     if state.get("tci") is not None:
         hold_msg = "الترند قوي — امسك الصفقة" if state.get("_hold_trend") else "إدارة عادية"
@@ -1518,6 +1877,15 @@ def trade_loop():
             prev_ind = compute_indicators(df.iloc[:-1]) if len(df)>=2 else ind
             spread_bps = orderbook_spread_bps()
 
+            # --- SMC snapshot (يُحدَّث كل دورة) ---
+            mss_info = detect_mss(df, ind)
+            fvg_list = detect_fvg(df, ind)
+            ob_info  = detect_ob_lite(df, ind)
+            state["mss_bull"] = mss_info.get("mss_bull", False)
+            state["mss_bear"] = mss_info.get("mss_bear", False)
+            state["fvg_active"] = fvg_list[:3] if fvg_list else []
+            state["ob_active"]  = ob_info
+
             # PnL snapshot
             if state["open"] and px:
                 state["pnl"] = (px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
@@ -1587,6 +1955,18 @@ def trade_loop():
                         qty = compute_size(bal, px or info_closed["price"])
                         if qty>0:
                             open_market(sig, qty, px or info_closed["price"])
+                            
+                            # 🔥 تهيئة SMC Pro فور فتح الصفقة
+                            if SMC_ENABLED:
+                                try:
+                                    entry_px = px or info_closed["price"]
+                                    current_atr = float(ind.get("atr") or 0.0)
+                                    smc_data = _smc_liquidity_targets(df, sig, entry_px, current_atr)
+                                    state["_smc"] = smc_data
+                                    logging.info(f"SMC initialized for new {sig} position")
+                                except Exception as e:
+                                    logging.error(f"SMC init error: {e}")
+                            
                             wait_for_next_signal_side=None; last_close_signal_time=None; last_open_fingerprint=None
                             last_signal_id=f"{info_closed['time']}:{sig}"
                         else:
@@ -1595,6 +1975,18 @@ def trade_loop():
                     qty = compute_size(bal, px or info_closed["price"])
                     if qty>0:
                         open_market(sig, qty, px or info_closed["price"])
+                        
+                        # 🔥 تهيئة SMC Pro فور فتح الصفقة
+                        if SMC_ENABLED:
+                            try:
+                                entry_px = px or info_closed["price"]
+                                current_atr = float(ind.get("atr") or 0.0)
+                                smc_data = _smc_liquidity_targets(df, sig, entry_px, current_atr)
+                                state["_smc"] = smc_data
+                                logging.info(f"SMC initialized for new {sig} position")
+                            except Exception as e:
+                                logging.error(f"SMC init error: {e}")
+                        
                         last_open_fingerprint=None
                         last_signal_id=f"{info_closed['time']}:{sig}"
                     else:
@@ -1636,7 +2028,7 @@ def home():
     global _root_logged
     if not _root_logged: print("GET / HTTP/1.1 200"); _root_logged=True
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — TREND-ONLY — CLOSED-CANDLE RF — SMART HARVESTING — BREAKOUT ENGINE — EMERGENCY LAYER — STRICT CLOSE — TVR ENHANCED"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — TREND-ONLY — CLOSED-CANDLE RF — SMART HARVESTING — BREAKOUT ENGINE — EMERGENCY LAYER — STRICT CLOSE — TVR ENHANCED — SMC PRO"
 
 @app.route("/metrics")
 def metrics():
@@ -1679,6 +2071,12 @@ def metrics():
             "vol_ratio": state.get("tvr_vol_ratio"),
             "reaction": state.get("tvr_reaction"),
             "bucket": state.get("tvr_bucket")
+        },
+        "smc_pro": {
+            "enabled": SMC_ENABLED,
+            "score": state.get("_smc", {}).get("score"),
+            "tp_candidates": state.get("_smc", {}).get("tp_candidates"),
+            "trail_mult": state.get("_smc", {}).get("trail_mult")
         }
     })
 
@@ -1704,7 +2102,9 @@ def health():
         "dynamic_profit_taking": {"consensus_score": state.get("_consensus_score"), "atr_pct": state.get("_atr_pct"), "tp_ladder": state.get("_tp_ladder")},
         "ema_indicators": {"ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")},
         "tvr_enabled": TVR_ENABLED,
-        "tvr_active": state.get("tvr_active", False)
+        "tvr_active": state.get("tvr_active", False),
+        "smc_enabled": SMC_ENABLED,
+        "smc_score": state.get("_smc", {}).get("score")
     }), 200
 
 @app.route("/ping")
@@ -1722,6 +2122,7 @@ if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
     print(colored(f"STRATEGY: {STRATEGY.upper()} (TREND-ONLY) • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
     print(colored(f"TVR ENHANCED: {'ON' if TVR_ENABLED else 'OFF'} • Buckets={TVR_BUCKETS} • Vol_Spike={TVR_VOL_SPIKE}x • Reaction_ATR={TVR_REACTION_ATR}", "yellow"))
+    print(colored(f"SMC PRO: {'ON' if SMC_ENABLED else 'OFF'} • EQHL_LB={SMC_EQHL_LOOKBACK} • OB_LB={SMC_OB_LOOKBACK} • FVG_Gap={SMC_FVG_MAX_GAP_ATR}ATR", "yellow"))
     load_state()
     print(colored("🛡️ Watchdog started", "cyan"))
     threading.Thread(target=watchdog_check, daemon=True).start()
