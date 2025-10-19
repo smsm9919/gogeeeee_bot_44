@@ -174,6 +174,27 @@ TVR_SCOUT_FRAC       = 0.50       # حجم دخول Scout (نصف الحجم ا�
 TVR_TIMEOUT_BARS     = 6          # أقصى عدد شموع يظل فيها وضع Scout "خاص"
 TVR_MAX_SPREAD_BPS   = 6.0        # لا ندخل إن كان السبريد كبير
 
+# ===== TVR live-scout (اختياري) ====
+TVR_USE_LIVE_BAR        = True     # فعّل شمّة حيّة
+TVR_LIVE_VOL_SPIKE      = 2.2      # حجم لحظي ≥ 2.2× المتوقّع
+TVR_LIVE_REACTION_ATR   = 1.4      # جسم الشمعة ≥ 1.4×ATR
+TVR_LIVE_MIN_ELAPSED    = 0.25     # لازم يمُر ≥25% من زمن الشمعة
+TVR_LIVE_MAX_SPREAD_BPS = 6.0
+
+# ===== Trap / Stop-Hunt Guard =====
+TRAP_ENABLED = True
+TRAP_WICK_PCT = 60.0   # % من مدى الشمعة لازم يكون ذيل
+TRAP_BODY_MAX_PCT = 25.0   # الجسم صغير → رفض
+TRAP_ATR_MIN = 0.6    # مدى الشمعة ≥ 0.6×ATR
+TRAP_VOL_SPIKE = 1.30   # حجم أكبر من متوسط 20 شمعة ×1.3
+TRAP_PROX_BPS = 12.0   # قرب من EQH/EQL/OB بالـ bps
+TRAP_HOLD_BARS = 4      # نمنع القفل الكامل N شموع بعد الفخ
+
+# --- Residual / Dust guard ---
+RESIDUAL_MIN_QTY   = 10.0                 # أقل كمية نسمح نكمل بها الصفقة
+RESIDUAL_MIN_USDT  = 0.0                  # أو حد بالدولار (اختياري)
+RESPECT_PATIENT_MODE_FOR_DUST = True      # لا تقفل كامل قبل TP1 في وضع الصبر
+
 # ===== SMC Pro (Structure / Liquidity) =====
 SMC_ENABLED = True
 SMC_EQHL_LOOKBACK    = 30   # البحث عن Equal Highs/Lows
@@ -469,6 +490,72 @@ def compute_next_sleep(df):
     except Exception:
         return BASE_SLEEP
 
+# =================== TRAP / FAKEOUT GUARD ===================
+def _near_level(px, lvl, bps):
+    try: 
+        return abs((px-lvl)/lvl)*10000.0 <= bps
+    except Exception: 
+        return False
+
+def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
+    """يرصد سحب سيولة بفتيلة طويلة عند قمم/قيعان/OB مع حجم مرتفع."""
+    if not TRAP_ENABLED or len(df) < 3: 
+        return None
+    try:
+        o = float(df["open"].iloc[-1]); h = float(df["high"].iloc[-1])
+        l = float(df["low"].iloc[-1]);  c = float(df["close"].iloc[-1])
+        rng = max(h-l, 1e-12); body = abs(c-o)
+        upper = h - max(o,c); lower = min(o,c) - l
+        upper_pct = upper/rng*100.0; lower_pct = lower/rng*100.0; body_pct = body/rng*100.0
+        atr = float(ind.get("atr") or 0.0)
+        v   = float(df["volume"].iloc[-1])
+        vma = df["volume"].iloc[-21:-1].astype(float).mean() if len(df)>=21 else 0.0
+        vol_ok = (vma>0 and v/vma >= TRAP_VOL_SPIKE)
+
+        eqh = (levels or {}).get("eqh")
+        eql = (levels or {}).get("eql")
+        ob  = (levels or {}).get("ob")  # dict(side/bot/top)
+
+        near_eqh = (eqh and _near_level(h, eqh, TRAP_PROX_BPS))
+        near_eql = (eql and _near_level(l, eql, TRAP_PROX_BPS))
+        near_ob_res = (ob and ob.get("side")=="bear" and _near_level(h, ob["bot"], TRAP_PROX_BPS))
+        near_ob_sup = (ob and ob.get("side")=="bull" and _near_level(l, ob["top"], TRAP_PROX_BPS))
+
+        bull_trap = (lower_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eql or near_ob_sup))
+        bear_trap = (upper_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eqh or near_ob_res))
+
+        if (bull_trap or bear_trap) and vol_ok:
+            return {"trap": "bull" if bull_trap else "bear", "ts": int(df["time"].iloc[-1])}
+    except Exception as e:
+        logging.error(f"detect_stop_hunt error: {e}")
+    return None
+
+def apply_trap_guard(trap: dict, ind: dict):
+    """فعّل حماية الفخ: امنع القفل الكامل لفترة وشدّ التريل لكن كمّل تداول."""
+    state["_trap_active"] = True
+    state["_trap_dir"]    = trap.get("trap")
+    state["_trap_left"]   = int(TRAP_HOLD_BARS)
+    state["_last_trap_ts"] = trap.get("ts")
+    px  = ind.get("price") or price_now() or state.get("entry")
+    atr = float(ind.get("atr") or 0.0)
+    
+    # جني جزئي دفاعي
+    if state.get("open") and state["qty"] > 0:
+        close_partial(0.15, f"Trap guard partial - {trap.get('trap')} trap detected")
+    
+    # تثبيت التعادل
+    state["breakeven"] = state.get("breakeven") or state["entry"]
+    
+    # تشديد التريل
+    if atr>0 and px and state.get("open"):
+        gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.8)
+        if state["side"]=="long":
+            state["trail"] = max(state.get("trail") or (px-gap), px-gap)
+        else:
+            state["trail"] = min(state.get("trail") or (px+gap), px+gap)
+    
+    logging.info(f"TRAP GUARD ACTIVATED: {trap.get('trap')} trap - blocking full close for {TRAP_HOLD_BARS} bars")
+
 # =================== TVR (Time-Volume-Reaction) FUNCTIONS ===================
 def _tvr_bucket_len_min():
     # عدد دقائق الباكت الواحد (يوم = 1440 دقيقة)
@@ -496,6 +583,57 @@ def build_tvr_profile(df: pd.DataFrame):
         med = grp.median()  # ميديان أكثر ثباتًا
         prof = [float(med.get(i, vols.median())) for i in range(int(TVR_BUCKETS or 96))]
         return prof
+    except Exception:
+        return None
+
+def _bar_elapsed_frac(df):
+    tf = _interval_seconds(INTERVAL)
+    left = time_to_candle_close(df, USE_TV_BAR)
+    return max(0.0, min(1.0, (tf - left) / max(tf, 1)))
+
+def compute_tvr_features_live(df: pd.DataFrame, ind: dict):
+    """يحسب TVR على الشمعة الحية (لم تغلق بعد)."""
+    if not TVR_ENABLED or len(df) < 3:
+        return None
+    try:
+        # آخر سطر = الشمعة الحيّة
+        o = float(df["open"].iloc[-1]); c = float(df["close"].iloc[-1])
+        v = float(df["volume"].iloc[-1]); ts = int(df["time"].iloc[-1])
+        atr = float(ind.get("atr") or 0.0)
+        if atr <= 0: return None
+
+        # تأكد إن البروفايل مبني
+        if state.get("_tvr_profile") is None or len(state.get("_tvr_profile") or []) != int(TVR_BUCKETS or 96):
+            p = build_tvr_profile(df.iloc[:-1])  # استخدم المغلق لبناء البروفايل
+            if p: state["_tvr_profile"] = p
+        prof = state.get("_tvr_profile")
+        if not prof: return None
+
+        bucket = _tvr_bucket_index(ts)
+        base_vol_bucket = max(float(prof[bucket]), 1e-12)
+
+        # عدّى قد إيه من زمن الشمعة؟
+        frac = _bar_elapsed_frac(df)
+        if frac < TVR_LIVE_MIN_ELAPSED:   # لسه بدري – تجنب false spikes
+            return None
+
+        # نقيس الحجم مقابل المتوقع حتى الآن
+        exp_vol_so_far = max(base_vol_bucket * frac, 1e-12)
+        vol_ratio = v / exp_vol_so_far
+
+        body = abs(c - o)
+        reaction = body / max(atr, 1e-12)
+        direction = 1 if c > o else -1
+
+        strong = (vol_ratio >= TVR_LIVE_VOL_SPIKE) and (reaction >= TVR_LIVE_REACTION_ATR)
+        return {
+            "bucket": bucket,
+            "vol_ratio": float(vol_ratio),
+            "reaction": float(reaction),
+            "direction": int(direction),
+            "strong": bool(strong),
+            "elapsed_frac": float(frac)
+        }
     except Exception:
         return None
 
@@ -547,15 +685,44 @@ def compute_tvr_features(df_closed: pd.DataFrame, ind: dict):
         return None
 
 def tvr_spike_entry(df_closed: pd.DataFrame, ind: dict, bal: float, px: float, spread_bps: float) -> bool:
-    """
-    دخول Scout/Explosion مستقل إذا لا توجد صفقة والمشهد قوي حسب TVR.
-    لا يغيّر قواعد الدخول الأساسية – يضيف مدخلات ذكية فقط.
-    """
+    """دخول Scout/Explosion مستقل إذا لا توجد صفقة والمشهد قوي حسب TVR."""
     if not TVR_ENABLED or state["open"]:
         return False
-    if spread_bps is not None and spread_bps > TVR_MAX_SPREAD_BPS:
+
+    # فلتر السبريد
+    max_spread = TVR_LIVE_MAX_SPREAD_BPS if TVR_USE_LIVE_BAR else TVR_MAX_SPREAD_BPS
+    if spread_bps is not None and spread_bps > max_spread:
         return False
 
+    # حاول live أولاً لو مُفعّل
+    if TVR_USE_LIVE_BAR:
+        feats_live = compute_tvr_features_live(pd.concat([df_closed, df_closed.iloc[-1:]]), ind)
+        if feats_live and feats_live["strong"]:
+            side = "buy" if feats_live["direction"] > 0 else "sell"
+            qty_full = compute_size(bal, px)
+            qty = safe_qty(qty_full * TVR_SCOUT_FRAC)
+            if qty > 0:
+                open_market(side, qty, px)
+                # حماية فورية
+                atr = float(ind.get("atr") or 0.0)
+                if atr > 0:
+                    gap = atr * TVR_SCOUT_TRAIL_MULT
+                    if side == "buy":
+                        state["trail"] = (px - gap)
+                    else:
+                        state["trail"] = (px + gap)
+                    state["breakeven"] = state.get("breakeven") or state["entry"]
+                # علّم وضع TVR
+                state["tvr_active"] = True
+                state["tvr_bars_alive"] = 0
+                state["tvr_bucket"] = feats_live["bucket"]
+                state["tvr_vol_ratio"] = feats_live["vol_ratio"]
+                state["tvr_reaction"] = feats_live["reaction"]
+                state["tvr_direction"] = feats_live["direction"]
+                logging.info(f"TVR LIVE SCOUT ENTRY: {side} at {px}, vol_ratio={feats_live['vol_ratio']:.2f}, reaction={feats_live['reaction']:.2f}")
+                return True
+
+    # لو الحيّة مش قوية/غير مفعّلة، جرّب النسخة المُغلقة
     feats = compute_tvr_features(df_closed, ind)
     if not feats or not feats["strong"]:
         return False
@@ -567,7 +734,6 @@ def tvr_spike_entry(df_closed: pd.DataFrame, ind: dict, bal: float, px: float, s
         return False
 
     open_market(side, qty, px)
-    # وسم الحالة "وضع TVR"
     state["tvr_active"] = True
     state["tvr_bars_alive"] = 0
     state["tvr_bucket"] = feats["bucket"]
@@ -1128,72 +1294,6 @@ def smc_mss_manager(ind: dict, mss: dict):
 
     return "+".join(actions) if actions else None
 
-# =================== TRAP / FAKEOUT GUARD ===================
-def _near_level(px, lvl, bps):
-    try: 
-        return abs((px-lvl)/lvl)*10000.0 <= bps
-    except Exception: 
-        return False
-
-def detect_stop_hunt(df: pd.DataFrame, ind: dict, levels: dict):
-    """يرصد سحب سيولة بفتيلة طويلة عند قمم/قيعان/OB مع حجم مرتفع."""
-    if not TRAP_ENABLED or len(df) < 3: 
-        return None
-    try:
-        o = float(df["open"].iloc[-1]); h = float(df["high"].iloc[-1])
-        l = float(df["low"].iloc[-1]);  c = float(df["close"].iloc[-1])
-        rng = max(h-l, 1e-12); body = abs(c-o)
-        upper = h - max(o,c); lower = min(o,c) - l
-        upper_pct = upper/rng*100.0; lower_pct = lower/rng*100.0; body_pct = body/rng*100.0
-        atr = float(ind.get("atr") or 0.0)
-        v   = float(df["volume"].iloc[-1])
-        vma = df["volume"].iloc[-21:-1].astype(float).mean() if len(df)>=21 else 0.0
-        vol_ok = (vma>0 and v/vma >= TRAP_VOL_SPIKE)
-
-        eqh = (levels or {}).get("eqh")
-        eql = (levels or {}).get("eql")
-        ob  = (levels or {}).get("ob")  # dict(side/bot/top)
-
-        near_eqh = (eqh and _near_level(h, eqh, TRAP_PROX_BPS))
-        near_eql = (eql and _near_level(l, eql, TRAP_PROX_BPS))
-        near_ob_res = (ob and ob.get("side")=="bear" and _near_level(h, ob["bot"], TRAP_PROX_BPS))
-        near_ob_sup = (ob and ob.get("side")=="bull" and _near_level(l, ob["top"], TRAP_PROX_BPS))
-
-        bull_trap = (lower_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eql or near_ob_sup))
-        bear_trap = (upper_pct>=TRAP_WICK_PCT and body_pct<=TRAP_BODY_MAX_PCT and atr>0 and (rng/atr)>=TRAP_ATR_MIN and (near_eqh or near_ob_res))
-
-        if (bull_trap or bear_trap) and vol_ok:
-            return {"trap": "bull" if bull_trap else "bear", "ts": int(df["time"].iloc[-1])}
-    except Exception as e:
-        logging.error(f"detect_stop_hunt error: {e}")
-    return None
-
-def apply_trap_guard(trap: dict, ind: dict):
-    """فعّل حماية الفخ: امنع القفل الكامل لفترة وشدّ التريل لكن كمّل تداول."""
-    state["_trap_active"] = True
-    state["_trap_dir"]    = trap.get("trap")
-    state["_trap_left"]   = int(TRAP_HOLD_BARS)
-    state["_last_trap_ts"] = trap.get("ts")
-    px  = ind.get("price") or price_now() or state.get("entry")
-    atr = float(ind.get("atr") or 0.0)
-    
-    # جني جزئي دفاعي
-    if state.get("open") and state["qty"] > 0:
-        close_partial(0.15, f"Trap guard partial - {trap.get('trap')} trap detected")
-    
-    # تثبيت التعادل
-    state["breakeven"] = state.get("breakeven") or state["entry"]
-    
-    # تشديد التريل
-    if atr>0 and px and state.get("open"):
-        gap = atr * max(state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL, 1.8)
-        if state["side"]=="long":
-            state["trail"] = max(state.get("trail") or (px-gap), px-gap)
-        else:
-            state["trail"] = min(state.get("trail") or (px+gap), px+gap)
-    
-    logging.info(f"TRAP GUARD ACTIVATED: {trap.get('trap')} trap - blocking full close for {TRAP_HOLD_BARS} bars")
-
 def defend_on_opposite_rf(ind: dict, info: dict):
     """عند إشارة RF عكسية: لا قفل كامل. جزئي + تعادل + تريل مشدود + تصويت للخروج."""
     if not state["open"] or state["qty"] <= 0:
@@ -1336,10 +1436,22 @@ def close_partial(frac, reason):
     global state, compound_pnl
     if not state["open"]: return
     qty_close = safe_qty(max(0.0, state["qty"] * min(max(frac,0.0),1.0)))
+    
+    # 🔥 NEW: Residual guard
+    px = price_now() or state["entry"]
+    min_qty_guard = max(RESIDUAL_MIN_QTY, (RESIDUAL_MIN_USDT/(px or 1e-9)))
+
+    # امنع الجزئي لو هيكسر الحارس
+    if state["qty"] - qty_close < min_qty_guard:
+        qty_close = safe_qty(max(0.0, state["qty"] - min_qty_guard))
+        if qty_close <= 0:
+            print(colored("⏸️ skip partial (residual guard would be broken)", "yellow"))
+            return
+
     if qty_close < 1:
         print(colored(f"⚠️ skip partial close (amount={fmt(qty_close,4)} < 1 DOGE)", "yellow"))
         return
-    px = price_now() or state["entry"]
+    
     side = "sell" if state["side"]=="long" else "buy"
     if MODE_LIVE:
         try: ex.create_order(SYMBOL,"market",side,qty_close,None,_position_params_for_close())
@@ -1351,9 +1463,14 @@ def close_partial(frac, reason):
     state["last_action"]="SCALE_OUT"; state["action_reason"]=reason
     print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem_qty={fmt(state['qty'],4)}","magenta"))
     logging.info(f"PARTIAL_CLOSE {reason} qty={qty_close} pnl={pnl} remaining={state['qty']}")
-    if state["qty"] < 60:
-        print(colored(f"⚠️ Remaining qty={fmt(state['qty'],2)} < 60 DOGE → full close", "yellow"))
-        close_market_strict("auto_full_close_small_qty"); return
+    
+    # 🔥 NEW: Residual guard check after close
+    if state["qty"] < min_qty_guard:
+        if RESPECT_PATIENT_MODE_FOR_DUST and PATIENT_TRADER_MODE and (not state.get("tp1_done", False)):
+            print(colored("⏸️ residual < guard but patient mode blocks full close before TP1", "yellow"))
+        else:
+            close_market_strict("auto_full_close_small_qty_guard")
+        return
     save_state()
 
 def reset_after_full_close(reason, prev_side=None):
@@ -2033,7 +2150,7 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
         nxt = lad[ach]
         print(colored(f"   🎯 Dynamic TP: next={nxt:.2f}% • ATR%≈{state.get('_atr_pct',0):.2f} • Consensus={state.get('_consensus_score',0):.1f}/5", "magenta"))
     
-    # إضافة بيانات Trap Guard للعرض
+    # 🔥 NEW: عرض بيانات Trap Guard للعرض
     if state.get("_trap_active"):
         trap_line = f"TRAP: {state.get('_trap_dir')} • bars_left={state.get('_trap_left', 0)}"
         print(colored(f"   🚨 {trap_line}", "red"))
@@ -2118,13 +2235,13 @@ def trade_loop():
             mss_info = detect_mss(df, ind, buffer_bps=SMC_BUFFER_BPS) if SMC_MSS_ENABLED else {"mss": False}
             state["smc_mss"] = mss_info
 
-            # Trap detection من مستويات SMC
+            # 🔥 NEW: Trap detection من مستويات SMC
             levels = (state.get("_smc") or {}).get("levels", {}) if SMC_ENABLED else {}
             trap = detect_stop_hunt(df, ind, levels)
             if trap and state.get("open"):
                 apply_trap_guard(trap, {**ind, "price": px or info_closed["price"]})
 
-            # إطفاء الفخ بعد انتهاء مدته
+            # 🔥 NEW: إطفاء الفخ بعد انتهاء مدته
             if state.get("_trap_active") and new_bar:
                 left = int(state.get("_trap_left", 0)) - 1
                 state["_trap_left"] = left
