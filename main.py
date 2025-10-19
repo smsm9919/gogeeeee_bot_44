@@ -174,6 +174,36 @@ TVR_SCOUT_FRAC       = 0.50       # حجم دخول Scout (نصف الحجم ا�
 TVR_TIMEOUT_BARS     = 6          # أقصى عدد شموع يظل فيها وضع Scout "خاص"
 TVR_MAX_SPREAD_BPS   = 6.0        # لا ندخل إن كان السبريد كبير
 
+# ===== SMC Pro (Structure / Liquidity) =====
+SMC_ENABLED = True
+SMC_EQHL_LOOKBACK    = 30   # البحث عن Equal Highs/Lows
+SMC_OB_LOOKBACK      = 40   # نطاق البحث عن الـ Order Blocks الأخيرة
+SMC_DISPLACEMENT_ATR = 1.20 # اندفاع (جسم ≥ 1.2×ATR) لتأكيد OB
+SMC_WICK_MAX         = 0.35 # أقصى نسبة ذيل من مدى الشمعة لاعتماد شمعة OB
+SMC_VOL_SPIKE        = 1.30 # سبايك حجم لتأكيد الـ OB/الاندفاع
+SMC_FVG_MAX_GAP_ATR  = 2.00 # أقصى فجوة FVG (كـ ATR) نعتمدها
+SMC_PREM_WIN         = 40   # نافذة Premium/Discount (عدد شموع)
+SMC_FIB_EXTS         = [1.00, 1.272, 1.618]  # أهداف امتداد
+SMC_SCORE_STRONG     = 0.65
+SMC_SCORE_HOLD       = 0.55
+SMC_SCORE_WARN       = 0.40
+SMC_WARN_PARTIAL     = 0.20
+SMC_TIGHT_TRAIL_MULT = 1.6
+SMC_WIDE_TRAIL_MULT  = 2.4
+
+# ============== SMC / MSS SETTINGS ==============
+SMC_MSS_ENABLED = True
+SMC_STRONG_ADX = 22             # أدنى ADX لاعتبار MSS مؤثرًا
+SMC_BUFFER_BPS = 6.0            # هامش كسر القمة/القاع (بِبْس)
+SMC_PARTIAL_ON_OPPOSITE = 0.25  # نسبة إغلاق جزئي عند MSS عكسي قوي
+SMC_MAX_EXTRA_PARTIAL = 0.30    # سقف كل الإغلاقات الجزئية الإضافية التي يسمح بها MSS
+SMC_BOOST_TRAIL_MULT = 0.4      # زيادة على معامل ATR للتريل عند MSS موافق للاتجاه
+SMC_DEFER_TP_ON_ALIGNED = True  # تأجيل TP مرة واحدة عندما MSS مع الاتجاه
+
+# زوّد وزن الـ Structure في الأوركسترا
+ORCH_WEIGHTS = {"momentum": 0.25, "volatility": 0.20, "trend": 0.20, "structure": 0.35}
+ORCH_STRONG = 0.65
+
 # =================== LOGGING ===================
 def setup_file_logging():
     logger = logging.getLogger()
@@ -271,6 +301,9 @@ state = {
     "tvr_reaction": None,
     "tvr_bucket": None,
     "tvr_direction": None,  # 1=up, -1=down
+    # SMC
+    "smc_mss": None,
+    "smc_extra_partials": 0.0,
 }
 compound_pnl = 0.0
 last_signal_id = None
@@ -744,6 +777,93 @@ def _build_tp_ladder(info: dict, ind: dict, side: str):
     close_fracs = [0.25, 0.30, 0.45]
     return targets, close_fracs, atr_pct, score
 
+# =================== SMC / MSS (Market Structure Shift) ===================
+def _find_swings(df: pd.DataFrame, left:int=2, right:int=2):
+    """يرصد قمم/قيعان محلية بدون إعادة رسم."""
+    if len(df) < left+right+3:
+        return None, None
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    ph = [None]*len(df)
+    pl = [None]*len(df)
+    for i in range(left, len(df)-right):
+        if all(h[i] >= h[j] for j in range(i-left, i+right+1)):
+            ph[i] = h[i]
+        if all(l[i] <= l[j] for j in range(i-left, i+right+1)):
+            pl[i] = l[i]
+    return ph, pl
+
+def detect_mss(df: pd.DataFrame, ind: dict, left:int=2, right:int=2, buffer_bps:float=5.0):
+    """يكتشف تغيير هيكل السوق على الشموع المغلقة فقط."""
+    try:
+        d = df.iloc[:-1] if len(df) >= 2 else df.copy()   # مغلقة فقط
+        if len(d) < left+right+3:
+            return {"mss": False, "dir": None, "level": None, "swing_high": None, "swing_low": None, "strength": 0.0}
+        
+        ph, pl = _find_swings(d, left, right)
+        last_ph_i = max([i for i, v in enumerate(ph) if v is not None], default=None)
+        last_pl_i = max([i for i, v in enumerate(pl) if v is not None], default=None)
+        if last_ph_i is None or last_pl_i is None:
+            return {"mss": False, "dir": None, "level": None, "swing_high": None, "swing_low": None, "strength": 0.0}
+        
+        c = float(d["close"].iloc[-1])
+        sh = float(ph[last_ph_i])
+        sl = float(pl[last_pl_i])
+        buf_hi = sh * (1.0 + buffer_bps/10000.0)
+        buf_lo = sl * (1.0 - buffer_bps/10000.0)
+        strength = float(ind.get("adx") or 0.0)
+        
+        if c > buf_hi:
+            return {"mss": True, "dir": "bull", "level": sh, "swing_high": sh, "swing_low": sl, "strength": strength}
+        if c < buf_lo:
+            return {"mss": True, "dir": "bear", "level": sl, "swing_high": sh, "swing_low": sl, "strength": strength}
+        
+        return {"mss": False, "dir": None, "level": None, "swing_high": sh, "swing_low": sl, "strength": strength}
+    except Exception:
+        return {"mss": False, "dir": None, "level": None, "swing_high": None, "swing_low": None, "strength": 0.0}
+
+# =================== SMC MSS MANAGER ===================
+def smc_mss_manager(ind: dict, mss: dict):
+    """يساند الإدارة بعد الدخول بناءً على MSS بدون أي تغيير في الدخول."""
+    if not (SMC_MSS_ENABLED and state["open"] and mss):
+        return None
+    if not mss.get("mss"):
+        return None
+
+    side = state["side"]
+    aligned = (mss["dir"]=="bull" and side=="long") or (mss["dir"]=="bear" and side=="short")
+    adx = float(ind.get("adx") or 0.0)
+    px = ind.get("price") or price_now() or state["entry"]
+    atr = float(ind.get("atr") or 0.0)
+    actions = []
+
+    # MSS مع الاتجاه ⇒ اتركها تجري (نُرخي التريل ونؤجل TP مرة واحدة)
+    if aligned and adx >= SMC_STRONG_ADX:
+        cur = state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL
+        state["_adaptive_trail_mult"] = max(cur, cur + SMC_BOOST_TRAIL_MULT)
+        if SMC_DEFER_TP_ON_ALIGNED:
+            state["_smc_defer_tp_flag"] = True   # تُستهلك مرة واحدة
+        actions.append("MSS_ALIGNED_BOOST")
+
+    # MSS عكسي قوي ⇒ حماية: جزئي + تعادل + تريل مشدود
+    if (not aligned) and adx >= SMC_STRONG_ADX:
+        already = float(state.get("smc_extra_partials", 0.0))
+        can = max(0.0, SMC_MAX_EXTRA_PARTIAL - already)
+        frac = min(SMC_PARTIAL_ON_OPPOSITE, can)
+        if frac > 0 and state["qty"] > 0:
+            close_partial(frac, "MSS opposite (SMC guard)")
+            state["smc_extra_partials"] = already + frac
+        state["breakeven"] = state.get("breakeven") or state["entry"]
+        if atr > 0 and px is not None:
+            gap = atr * max(1.2, (state.get("_adaptive_trail_mult") or ATR_MULT_TRAIL) * 0.8)
+            if side == "long":
+                state["trail"] = max(state.get("trail") or (px - gap), px - gap)
+            else:
+                state["trail"] = min(state.get("trail") or (px + gap), px + gap)
+        actions.append("MSS_OPPOSITE_DEFEND")
+
+    return "+".join(actions) if actions else None
+
 # =================== ORDERS ===================
 def _position_params_for_open(side: str):
     if BINGX_POSITION_MODE == "hedge":
@@ -900,6 +1020,9 @@ def reset_after_full_close(reason, prev_side=None):
         "tvr_reaction": None,
         "tvr_bucket": None,
         "tvr_direction": None,
+        # SMC
+        "smc_mss": None,
+        "smc_extra_partials": 0.0,
     })
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
@@ -1101,6 +1224,11 @@ def trend_profit_taking(ind: dict, info: dict, df_cached: pd.DataFrame):
     fracs   = state.get("_tp_fracs",  TREND_CLOSE_FRACS)
     k = int(state.get("profit_targets_achieved", 0))
     cscore = float(state.get("_consensus_score", 0.0))
+    
+    # إذا MSS aligned طلب تأجيل TP مرة واحدة
+    if state.pop("_smc_defer_tp_flag", False) and k < len(targets)-1:
+        return None
+        
     if k < len(targets) and rr >= targets[k]:
         if cscore >= STRONG_HOLD_SCORE and k < max(DEFER_TP_UNTIL_IDX, len(targets)-1):
             return None  # تأجيل TP للترند القوي
@@ -1128,6 +1256,44 @@ def smart_post_entry_manager(df: pd.DataFrame, ind: dict, info: dict):
     tp_list, tp_fracs, atr_pct, cscore = _build_tp_ladder(info, ind, state.get("side"))
     state["_tp_ladder"]=tp_list; state["_tp_fracs"]=tp_fracs
     state["_consensus_score"]=cscore; state["_atr_pct"]=atr_pct
+
+    # --- SMC Pro Integration ---
+    if SMC_ENABLED and state["open"] and state["qty"] > 0:
+        try:
+            entry_px = state.get("entry") or info.get("price")
+            current_atr = float(ind.get("atr") or 0.0)
+            smc_data = _smc_liquidity_targets(df, state["side"], entry_px, current_atr)
+            
+            if smc_data:
+                state["_smc"] = smc_data
+                
+                # SMC قوي: توسيع الأهداف وتهدئة التريل
+                if smc_data["score"] >= SMC_SCORE_HOLD:
+                    if smc_data.get("tp_candidates"):
+                        # دمج أهداف SMC مع الأهداف الديناميكية
+                        dynamic_tps = state.get("_tp_ladder") or []
+                        all_tps = sorted(set(dynamic_tps + smc_data["tp_candidates"]))
+                        state["_tp_ladder"] = all_tps[:4]  # احتفظ بأقرب 4 أهداف
+                    
+                    # تحسين التريل
+                    state["_adaptive_trail_mult"] = max(
+                        state.get("_adaptive_trail_mult") or 0.0, 
+                        smc_data["trail_mult"]
+                    )
+                    logging.info(f"SMC STRONG: score={smc_data['score']}, expanded targets, wider trail")
+                
+                # SMC تحذير: جني جزئي وشد التريل
+                elif smc_data["score"] < SMC_SCORE_WARN and not state.get("tp1_done"):
+                    close_partial(SMC_WARN_PARTIAL, "SMC weak signal — protective harvest")
+                    state["_adaptive_trail_mult"] = max(
+                        state.get("_adaptive_trail_mult") or 0.0, 
+                        SMC_TIGHT_TRAIL_MULT
+                    )
+                    logging.info(f"SMC WARN: score={smc_data['score']}, took protective partial")
+                    
+        except Exception as e:
+            logging.error(f"SMC integration error: {e}")
+
     if TRAIL_ONLY_AFTER_TP1 and not state.get("tp1_done"):
         state["_adaptive_trail_mult"]=0.0
     # Quick cash صغير
@@ -1172,6 +1338,17 @@ def smart_exit_check(info, ind, df_cached=None, prev_ind_cached=None):
             if not _allow_full_close(reason):
                 logging.info(f"EXIT_BLOCKED (patient): {reason}")
                 return False
+        
+        # --- SMC Structural Patience Guard ---
+        if (SMC_ENABLED and state["open"] and not state.get("tp1_done")):
+            smc_data = state.get("_smc")
+            if smc_data and smc_data.get("tp_candidates"):
+                # منع الإغلاق الكامل إذا لا توجد طوارئ ولم نلمس أهداف السيولة بعد
+                hard_exit_reasons = ("EMERGENCY", "OPPOSITE_RF", "TRAIL", "TRAIL_ATR", "CHANDELIER", "STRICT")
+                if not any(exit_reason in str(reason) for exit_reason in hard_exit_reasons):
+                    logging.info("SMC PATIENCE: Blocking full close - waiting for liquidity targets")
+                    return False  # منع الإغلاق الكامل
+        
         close_market_strict(reason)
         return True
 
@@ -1434,6 +1611,26 @@ def snapshot(bal,info,ind,spread_bps,reason=None, df=None):
     if TVR_ENABLED:
         tvr_line = f"TVR: bucket={state.get('tvr_bucket')}  vol×={fmt(state.get('tvr_vol_ratio'),2)}  react(ATR)={fmt(state.get('tvr_reaction'),2)}  active={bool(state.get('tvr_active'))}"
         print(colored(f"   🕒 {tvr_line}", "yellow"))
+
+    # إضافة بيانات MSS للعرض
+    if state.get("smc_mss"):
+        m = state["smc_mss"]
+        mss_status = "🟢 مع الاتجاه" if ((m.get("dir")=="bull" and state.get("side")=="long") or (m.get("dir")=="bear" and state.get("side")=="short")) else "🔴 عكسي" if m.get("mss") else "⚪ لا شيء"
+        print(colored(f"   🧠 MSS: {mss_status} • اتجاه={m.get('dir')} • مستوى={fmt(m.get('level'))} • قوة={fmt(m.get('strength'),1)}", "yellow"))
+
+    # عرض SMC Pro data
+    if state.get("_smc"):
+        smc = state["_smc"]
+        score_color = "green" if smc["score"] >= SMC_SCORE_HOLD else "yellow" if smc["score"] >= SMC_SCORE_WARN else "red"
+        score_text = colored(f"{smc['score']:.2f}", score_color)
+        print(colored(f"   🧠 SMC Pro: score={score_text} • targets={smc.get('tp_candidates', [])} • trail×{smc.get('trail_mult', 0)}", "cyan"))
+        
+        # عرض تفاصيل إضافية في وضع verbose
+        if smc.get("levels", {}).get("ob"):
+            ob = smc["levels"]["ob"]
+            print(colored(f"   📦 OB: {ob['side']} zone[{fmt(ob['bot'])}-{fmt(ob['top'])}]", "white"))
+        if smc.get("levels", {}).get("bos"):
+            print(colored(f"   🏗️ BOS: {smc['levels']['bos']['type']}", "white"))
     
     if state.get("tci") is not None:
         hold_msg = "الترند قوي — امسك الصفقة" if state.get("_hold_trend") else "إدارة عادية"
@@ -1518,6 +1715,10 @@ def trade_loop():
             prev_ind = compute_indicators(df.iloc[:-1]) if len(df)>=2 else ind
             spread_bps = orderbook_spread_bps()
 
+            # SMC / MSS snapshot
+            mss_info = detect_mss(df, ind, buffer_bps=SMC_BUFFER_BPS) if SMC_MSS_ENABLED else {"mss": False}
+            state["smc_mss"] = mss_info
+
             # PnL snapshot
             if state["open"] and px:
                 state["pnl"] = (px-state["entry"])*state["qty"] if state["side"]=="long" else (state["entry"]-px)*state["qty"]
@@ -1554,6 +1755,11 @@ def trade_loop():
             if post_action:
                 logging.info(f"POST_ENTRY_ACTION: {post_action}")
 
+            # SMC MSS Management
+            mss_action = smc_mss_manager({**ind, "price": px or info_closed["price"]}, mss_info)
+            if mss_action:
+                logging.info(f"SMC_MSS_ACTION: {mss_action}")
+
             # TVR post-entry relax
             tvr_post_entry_relax(df, ind)
 
@@ -1587,6 +1793,18 @@ def trade_loop():
                         qty = compute_size(bal, px or info_closed["price"])
                         if qty>0:
                             open_market(sig, qty, px or info_closed["price"])
+                            
+                            # 🔥 تهيئة SMC Pro فور فتح الصفقة
+                            if SMC_ENABLED:
+                                try:
+                                    entry_px = px or info_closed["price"]
+                                    current_atr = float(ind.get("atr") or 0.0)
+                                    smc_data = _smc_liquidity_targets(df, sig, entry_px, current_atr)
+                                    state["_smc"] = smc_data
+                                    logging.info(f"SMC initialized for new {sig} position")
+                                except Exception as e:
+                                    logging.error(f"SMC init error: {e}")
+                            
                             wait_for_next_signal_side=None; last_close_signal_time=None; last_open_fingerprint=None
                             last_signal_id=f"{info_closed['time']}:{sig}"
                         else:
@@ -1595,6 +1813,18 @@ def trade_loop():
                     qty = compute_size(bal, px or info_closed["price"])
                     if qty>0:
                         open_market(sig, qty, px or info_closed["price"])
+                        
+                        # 🔥 تهيئة SMC Pro فور فتح الصفقة
+                        if SMC_ENABLED:
+                            try:
+                                entry_px = px or info_closed["price"]
+                                current_atr = float(ind.get("atr") or 0.0)
+                                smc_data = _smc_liquidity_targets(df, sig, entry_px, current_atr)
+                                state["_smc"] = smc_data
+                                logging.info(f"SMC initialized for new {sig} position")
+                            except Exception as e:
+                                logging.error(f"SMC init error: {e}")
+                        
                         last_open_fingerprint=None
                         last_signal_id=f"{info_closed['time']}:{sig}"
                     else:
@@ -1636,7 +1866,7 @@ def home():
     global _root_logged
     if not _root_logged: print("GET / HTTP/1.1 200"); _root_logged=True
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — TREND-ONLY — CLOSED-CANDLE RF — SMART HARVESTING — BREAKOUT ENGINE — EMERGENCY LAYER — STRICT CLOSE — TVR ENHANCED"
+    return f"✅ RF Bot — {SYMBOL} {INTERVAL} — {mode} — TREND-ONLY — CLOSED-CANDLE RF — SMART HARVESTING — BREAKOUT ENGINE — EMERGENCY LAYER — STRICT CLOSE — TVR ENHANCED — SMC PRO"
 
 @app.route("/metrics")
 def metrics():
@@ -1679,7 +1909,15 @@ def metrics():
             "vol_ratio": state.get("tvr_vol_ratio"),
             "reaction": state.get("tvr_reaction"),
             "bucket": state.get("tvr_bucket")
-        }
+        },
+        "smc_pro": {
+            "enabled": SMC_ENABLED,
+            "score": state.get("_smc", {}).get("score"),
+            "tp_candidates": state.get("_smc", {}).get("tp_candidates"),
+            "trail_mult": state.get("_smc", {}).get("trail_mult")
+        },
+        "smc_mss": state.get("smc_mss"),
+        "smc_extra_partials": state.get("smc_extra_partials", 0.0),
     })
 
 @app.route("/health")
@@ -1704,7 +1942,11 @@ def health():
         "dynamic_profit_taking": {"consensus_score": state.get("_consensus_score"), "atr_pct": state.get("_atr_pct"), "tp_ladder": state.get("_tp_ladder")},
         "ema_indicators": {"ema9": state.get("ema9"), "ema20": state.get("ema20"), "ema9_slope": state.get("ema9_slope")},
         "tvr_enabled": TVR_ENABLED,
-        "tvr_active": state.get("tvr_active", False)
+        "tvr_active": state.get("tvr_active", False),
+        "smc_enabled": SMC_ENABLED,
+        "smc_score": state.get("_smc", {}).get("score"),
+        "smc_mss": state.get("smc_mss"),
+        "smc_extra_partials": state.get("smc_extra_partials", 0.0)
     }), 200
 
 @app.route("/ping")
@@ -1722,6 +1964,8 @@ if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • SYMBOL={SYMBOL} • {INTERVAL}", "yellow"))
     print(colored(f"STRATEGY: {STRATEGY.upper()} (TREND-ONLY) • SMART_EXIT={'ON' if USE_SMART_EXIT else 'OFF'}", "yellow"))
     print(colored(f"TVR ENHANCED: {'ON' if TVR_ENABLED else 'OFF'} • Buckets={TVR_BUCKETS} • Vol_Spike={TVR_VOL_SPIKE}x • Reaction_ATR={TVR_REACTION_ATR}", "yellow"))
+    print(colored(f"SMC PRO: {'ON' if SMC_ENABLED else 'OFF'} • EQHL_LB={SMC_EQHL_LOOKBACK} • OB_LB={SMC_OB_LOOKBACK} • FVG_Gap={SMC_FVG_MAX_GAP_ATR}ATR", "yellow"))
+    print(colored(f"SMC MSS: {'ON' if SMC_MSS_ENABLED else 'OFF'} • Strong_ADX={SMC_STRONG_ADX} • Buffer={SMC_BUFFER_BPS}bps • Partial_Opposite={SMC_PARTIAL_ON_OPPOSITE*100}%", "yellow"))
     load_state()
     print(colored("🛡️ Watchdog started", "cyan"))
     threading.Thread(target=watchdog_check, daemon=True).start()
