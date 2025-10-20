@@ -767,18 +767,49 @@ def start_keepalive():
                     time.sleep(50)
             threading.Thread(target=ping, daemon=True).start()
 
+# Web keepalive =========================================================
+app = Flask(__name__)
+@app.route("/")
+def root():
+    return jsonify({
+        "mode": "LIVE" if MODE_LIVE else "PAPER",
+        "symbol": SYMBOL, "interval": INTERVAL,
+        "risk": f"{int(RISK_ALLOC*100)}% x {LEVERAGE}x",
+        "rf_live_only": RF_LIVE_ONLY,
+        "position_mode": POSITION_MODE,
+        "entry_lock_side": state.get("entry_lock_side"),
+        "open": state["open"], "side": state.get("side"),
+        "qty": state.get("qty"), "entry": state.get("entry"),
+        "trail": state.get("trail"),
+    })
+
+def run_flask():
+    # لازم نbind على 0.0.0.0 وبورت Render
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+def start_keepalive():
+    if SELF_URL:
+        import threading, requests, time as _t
+        def ping():
+            while True:
+                try: requests.get(SELF_URL, timeout=5)
+                except Exception: pass
+                _t.sleep(50)
+        threading.Thread(target=ping, daemon=True).start()
+
 # Entrypoint ============================================================
 if __name__ == "__main__":
+    import threading
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}","cyan"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE=True","cyan"))
-    try:
-        start_keepalive()
-    except Exception:
-        pass
-    print(colored("Serving Flask app 'main'","cyan"))
-    print(colored("Debug mode: off","cyan"))
+
+    # شغّل Flask أولاً عشان Render يلقط البورت فورًا
+    threading.Thread(target=run_flask, daemon=True).start()
+    start_keepalive()
+
     print(colored("=> Your service is live 🎉","green"))
     try:
-        trade_loop()
+        trade_loop()  # حلقة التداول تشتغل بالتوازي مع السيرفر
     except Exception:
         traceback.print_exc()
+
