@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-RF Futures Bot — Trend Pro++ (BingX Perp, CCXT) — LIVE-RF ENTRY — FINAL (TRAPS+WICKS)
-• دخول: Range Filter على الشمعة الحيّة + حارس السبريد
-• تأكيد القمم/القيعان + فشل الاختراق → جني/تشديد/إغلاق
-• قراءة شموع: body/upper/lower wick + range/ATR + انفجارات
-• FVG/OB/EQH/EQL (SMC مبسّط) + فوبوناتشي امتدادات + Golden Pocket
-• Wick Harvest + EMA Harvest + ATR Trail + Ratchet Lock
-• لوج احترافي + /metrics + /health
+RF Futures Bot — Trend Pro++ (BingX Perp, CCXT) — ENHANCED PROFIT EDITION
+• إدارة أرباح محسنة + تريل ديناميكي + حجم مرن
+• TP1 أعلى + جني أقل + حماية أقوى للربح
+• تكيف ذاتي مع تقلبات السوق
 """
 
 import os, time, math, threading, requests, traceback, random, signal, sys, logging
@@ -39,8 +36,8 @@ PORT       = int(os.getenv("PORT", 5000))
 SYMBOL   = "DOGE/USDT:USDT"
 INTERVAL = "15m"
 
-LEVERAGE   = 10          # 10x
-RISK_ALLOC = 0.60        # 60% من الرصيد
+LEVERAGE   = 10
+RISK_ALLOC = 0.60
 BINGX_POSITION_MODE = "oneway"
 
 # RF live entry
@@ -49,19 +46,25 @@ RF_PERIOD   = 20
 RF_MULT     = 3.5
 USE_RF_LIVE = True
 
+# =================== ENHANCED PROFIT MANAGEMENT ===================
+TP1_PCT         = 0.70        # 0.7% بدل 0.40% - توسيع هامش الربح قبل الدفاع
+TP1_CLOSE_FRAC  = 0.33        # 33% بدل 50% - تقليل الجني الأول
+BREAKEVEN_AFTER = 0.75        # 0.75% بدل 0.30% - أعلى من TP1 قليلاً
+
+# التريل الديناميكي المرتبط بالـATR
+TRAIL_ACTIVATE_DYNAMIC = True
+TRAIL_ACTIVATE_MIN = 1.8
+TRAIL_ATR_MULTIPLIER = 2.0
+ATR_MULT_TRAIL = 2.0           # 2.0 بدل 1.6 - مسك الترند لفترة أطول
+
+# الأهداف الديناميكية
+TREND_TARGETS = [0.70, 1.20, 2.00, 3.00]
+TREND_CLOSE_FRACS = [0.25, 0.25, 0.25, 0.25]
+
 # مؤشرات
 RSI_LEN = 14
 ADX_LEN = 14
 ATR_LEN = 14
-
-# إدارة الربح/الخروج
-TP1_PCT         = 0.40
-TP1_CLOSE_FRAC  = 0.50
-BREAKEVEN_AFTER = 0.30
-TRAIL_ACTIVATE  = 1.20
-ATR_MULT_TRAIL  = 1.6
-TREND_TARGETS     = [0.50, 1.00, 1.80]
-TREND_CLOSE_FRACS = [0.30, 0.30, 0.20]
 
 # حرس السوق
 MAX_SPREAD_BPS = 6.0
@@ -110,12 +113,12 @@ BREAKOUT_ATR_SPIKE = 1.8
 BREAKOUT_LOOKBACK = 20
 
 # شموع/فخاخ/ذيول
-WICK_LONG_RATIO = 0.6          # طول الذيل/المدى
-BIG_RANGE_ATR = 1.8           # مدى الشمعة/ATR
-EXPLOSION_ADX_DELTA = 5.0      # تسارع ADX
-WICK_HARVEST_FRAC = 0.45       # جني من ذيل طويل معنا
-TRAP_NEAR_BPS = 12.0           # قرب من EQH/EQL لاعتبار الفخ
-TRUE_BREAK_MIN_CLOSE_BPS = 6.0 # إقفال فوق/تحت المستوى ليُعتبر حقيقي
+WICK_LONG_RATIO = 0.6
+BIG_RANGE_ATR = 1.8
+EXPLOSION_ADX_DELTA = 5.0
+WICK_HARVEST_FRAC = 0.45
+TRAP_NEAR_BPS = 12.0
+TRUE_BREAK_MIN_CLOSE_BPS = 6.0
 
 # Pacing
 ADAPTIVE_PACING = True
@@ -212,10 +215,8 @@ state = {
     "trail": None, "breakeven": None, "scale_ins": 0, "scale_outs": 0,
     "last_action": None, "action_reason": None, "highest_profit_pct": 0.0,
     "tp1_done": False, "opened_at": None, "_fail_votes": 0, "_smc": {},
-    "diagnosed_after_open": False,
-    # مراقبة فورية:
-    "trap_prob": 0.0, "explosion_flag": False, "wick_profile": {},
-    "opposite_lock_side": None  # 🔐 جديد
+    "diagnosed_after_open": False, "trap_prob": 0.0, "explosion_flag": False, 
+    "wick_profile": {}, "opposite_lock_side": None, "enhanced_be_done": False
 }
 _state_lock = threading.Lock()
 
@@ -276,7 +277,7 @@ def _interval_seconds(iv: str) -> int:
     elif iv.endswith("d"):
         return int(float(iv[:-1])) * 86400
     else:
-        return 60  # افتراضي
+        return 60
 
 def time_to_candle_close(df):
     if len(df) == 0:
@@ -335,7 +336,6 @@ def orderbook_spread_bps():
     except Exception: 
         return None
 
-# كَمّيّة
 def _round_amt(q):
     if q is None: 
         return 0.0
@@ -368,6 +368,33 @@ def compute_size(balance, price):
     if float(price) * q < MIN_TRADE_USDT: 
         return 0.0
     return q
+
+# =================== DYNAMIC POSITION SIZING ===================
+def dynamic_position_sizing(balance, price, ind):
+    """حجم مركز ديناميكي بناءً على التقلبات"""
+    base_size = compute_size(balance, price)
+    
+    if not state["open"]:
+        # تقليل الحجم في فترات التقلب العالي
+        atr = ind.get("atr", 0)
+        atr_pct = (atr / price) * 100 if price and atr else 0
+        
+        if atr_pct > 2.0:  # تقلب عالي
+            adjustment = 0.7
+            reason = "HIGH_VOLATILITY"
+        elif atr_pct < 0.5:  # تقلب منخفض
+            adjustment = 1.2
+            reason = "LOW_VOLATILITY"
+        else:
+            adjustment = 1.0
+            reason = "NORMAL_VOLATILITY"
+        
+        adjusted_size = base_size * adjustment
+        print(colored(f"📊 Dynamic sizing: {reason} - ATR%: {atr_pct:.2f}% - Adjustment: {adjustment:.2f}x", "cyan"))
+        
+        return safe_qty(adjusted_size)
+    
+    return base_size
 
 # =================== INDICATORS ===================
 def wilder_ema(s, n): 
@@ -662,7 +689,6 @@ def in_golden_pocket(px, a, b):
 
 # =================== Candle Analytics / Traps ===================
 def candle_stats(df, atr_now):
-    """مقاييس الشمعة الحالية: الجسم/الذيول/المدى بالنسبة لـ ATR."""
     if len(df) == 0: 
         return {}
     
@@ -689,7 +715,6 @@ def near_bps(px, lvl, bps):
         return False
 
 def trap_detector(df, smc_snap, ind):
-    """يرصد فخاخ Liquidity: اختراق كاذب EQH/EQL بذيل طويل وإقفال داخلي + زخم غير داعم."""
     if not smc_snap: 
         return {"bull_trap": 0.0, "bear_trap": 0.0}
     
@@ -700,13 +725,11 @@ def trap_detector(df, smc_snap, ind):
     bull = 0.0
     bear = 0.0
 
-    # Bear trap: كسر كاذب أسفل EQL بذيل سفلي طويل ثم إقفال فوقه مع ADX ضعيف/انعكاس RSI
     if eql:
         broke_down = (df["low"].iloc[-1] < eql and px > eql and st.get("lo_ratio", 0) > WICK_LONG_RATIO)
         if broke_down and (ind.get("adx", 0.0) < MIN_TREND_ADX_HOLD or ind.get("rsi", 50.0) > 45):
             bear = min(1.0, 0.5 + 0.5 * st["lo_ratio"])
 
-    # Bull trap: اختراق كاذب أعلى EQH بذيل علوي طويل ثم إقفال تحته مع ADX ضعيف/انعكاس RSI
     if eqh:
         broke_up = (df["high"].iloc[-1] > eqh and px < eqh and st.get("up_ratio", 0) > WICK_LONG_RATIO)
         if broke_up and (ind.get("adx", 0.0) < MIN_TREND_ADX_HOLD or ind.get("rsi", 50.0) < 55):
@@ -715,7 +738,6 @@ def trap_detector(df, smc_snap, ind):
     return {"bull_trap": round(bull, 2), "bear_trap": round(bear, 2)}
 
 def true_break_confirmed(df, level, above=True):
-    """يعدّ الكسر حقيقيًا فقط إذا الإقفال تجاوز المستوى بهامش منطقي."""
     if level is None or len(df) == 0: 
         return False
     
@@ -726,7 +748,6 @@ def true_break_confirmed(df, level, above=True):
         return ((level - close) / level) * 10000.0 >= TRUE_BREAK_MIN_CLOSE_BPS
 
 def explosion_detector(df, ind, prev_ind):
-    """انفجار/انهيار محتمل حسب مدى الشمعة/ATR + تسارع ADX + جسم الشمعة."""
     st = candle_stats(df, ind.get("atr") or 0.0)
     adx_now = float(ind.get("adx") or 0.0)
     adx_prev = float(prev_ind.get("adx") or 0.0)
@@ -746,6 +767,113 @@ def explosion_detector(df, ind, prev_ind):
         "wick_up": round(st.get("up_ratio", 0.0), 2), 
         "wick_lo": round(st.get("lo_ratio", 0.0), 2)
     }
+
+# =================== DYNAMIC TRAIL SYSTEM ===================
+def dynamic_trail_activation(ind, px):
+    """حساب نقطة تفعيل التريل بشكل ديناميكي بناءً على ATR"""
+    if not TRAIL_ACTIVATE_DYNAMIC:
+        return TRAIL_ACTIVATE_MIN
+    
+    atr = ind.get("atr", 0.0)
+    if atr <= 0:
+        return TRAIL_ACTIVATE_MIN
+    
+    atr_pct = (atr / px) * 100.0
+    dynamic_activation = max(TRAIL_ATR_MULTIPLIER * atr_pct, TRAIL_ACTIVATE_MIN)
+    
+    return min(dynamic_activation, 5.0)
+
+def enhanced_atr_trail(ind, px):
+    """تريل محسّن يرتبط بتقلبات السوق"""
+    if not state["open"] or state["qty"] <= 0: 
+        return
+    
+    trail_activate_pct = dynamic_trail_activation(ind, px)
+    rr = trend_rr_pct(px)
+    
+    if rr < trail_activate_pct: 
+        return
+    
+    atr = ind.get("atr") or 0.0
+    if atr <= 0: 
+        return
+    
+    if state["side"] == "long":
+        new_trail = px - atr * ATR_MULT_TRAIL
+        
+        if state["trail"] is None:
+            state["trail"] = new_trail
+        else:
+            state["trail"] = max(state["trail"], new_trail)
+        
+        if state["breakeven"] is not None: 
+            state["trail"] = max(state["trail"], state["breakeven"])
+        
+        if px < state["trail"]: 
+            close_market_strict(f"ENHANCED_TRAIL_ATR({ATR_MULT_TRAIL}x) @ {trail_activate_pct:.2f}%")
+    
+    else:
+        new_trail = px + atr * ATR_MULT_TRAIL
+        
+        if state["trail"] is None:
+            state["trail"] = new_trail
+        else:
+            state["trail"] = min(state["trail"], new_trail)
+        
+        if state["breakeven"] is not None: 
+            state["trail"] = min(state["trail"], state["breakeven"])
+        
+        if px > state["trail"]: 
+            close_market_strict(f"ENHANCED_TRAIL_ATR({ATR_MULT_TRAIL}x) @ {trail_activate_pct:.2f}%")
+
+# =================== ENHANCED TP MANAGEMENT ===================
+def enhanced_tp_management(df, ind, px):
+    """إدارة محسنة لجني الأرباح مع الأهداف الموسعة"""
+    if not state["open"]:
+        return
+    
+    rr = trend_rr_pct(px)
+    
+    # TP1 - جني أولي أقل مع هامش ربح أعلى
+    if not state.get("tp1_done") and rr >= TP1_PCT:
+        close_partial(TP1_CLOSE_FRAC, f"ENHANCED_TP1@{TP1_PCT:.2f}%")
+        state["tp1_done"] = True
+        state["breakeven"] = state.get("entry")
+        print(colored(f"🛡️ Breakeven activated after TP1 @ {fmt(state['breakeven'])}", "green"))
+    
+    # Breakeven إضافي عند مستوى أعلى
+    if not state.get("enhanced_be_done") and rr >= BREAKEVEN_AFTER:
+        state["breakeven"] = state.get("entry")
+        state["enhanced_be_done"] = True
+        print(colored(f"🛡️ Enhanced Breakeven @ {fmt(state['breakeven'])}", "green"))
+    
+    # الأهداف الديناميكية مع FIBO
+    smc = smc_snapshot(df, ind.get("atr", 0))
+    tps, fracs = dynamic_tp_ladder(ind, smc)
+    
+    for i, tgt in enumerate(tps):
+        if rr >= tgt and state["qty"] > 0 and i >= (1 if state["tp1_done"] else 0):
+            close_partial(fracs[i], f"ENHANCED_TP@{tgt:.2f}%")
+            tps[i] = 10000.0
+
+def dynamic_tp_ladder(ind, smc_snap):
+    px = price_now() or state.get("entry")
+    atr = ind.get("atr") or 0.0
+    
+    if not (state["open"] and px): 
+        return TREND_TARGETS, TREND_CLOSE_FRACS
+    
+    atr_pct = (atr / max(px, 1e-9)) * 100.0 if atr > 0 else 0.5
+    base = [round(x, 2) for x in [1.6 * atr_pct, 2.6 * atr_pct, 4.0 * atr_pct]]
+    
+    fibs = []
+    if smc_snap.get("eql") and smc_snap.get("eqh"):
+        fibs = fib_targets_from_swings(state["entry"], smc_snap["eql"], smc_snap["eqh"], state["side"])
+    
+    all_tps = sorted(set(base + fibs + TREND_TARGETS))
+    fracs = [0.25, 0.30, 0.45][:len(all_tps)]
+    
+    return all_tps[:4], fracs[:len(all_tps[:4])]
 
 # =================== ORDERS / MANAGEMENT ===================
 def _position_params_for_open(side):
@@ -807,7 +935,7 @@ def open_market(side, qty, price, reason="OPEN"):
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None, "scale_ins": 0, "scale_outs": 0,
         "last_action": reason, "action_reason": reason, "highest_profit_pct": 0.0,
         "tp1_done": False, "opened_at": time.time(), "_fail_votes": 0, "diagnosed_after_open": False,
-        "opposite_lock_side": None  # إزالة القفل بعد الدخول
+        "opposite_lock_side": None, "enhanced_be_done": False
     })
     
     print(colored(f"✅ OPEN {side.upper()} qty={fmt(qty,4)} @ {fmt(price)} • reason={reason}",
@@ -862,7 +990,6 @@ def close_partial(frac, reason):
     save_state()
 
 def reset_after_full_close(reason):
-    # تحديد القفل العكسي
     lock_side = None
     if OPPOSITE_LOCK_AFTER_CLOSE and state.get("side"):
         lock_side = "sell" if state["side"] == "long" else "buy"
@@ -874,7 +1001,7 @@ def reset_after_full_close(reason):
         "last_action": "CLOSE", "action_reason": reason, "highest_profit_pct": 0.0, 
         "tp1_done": False, "opened_at": None, "_fail_votes": 0, "_smc": {}, 
         "diagnosed_after_open": False, "trap_prob": 0.0, "explosion_flag": False, 
-        "wick_profile": {}, "opposite_lock_side": lock_side  # 🔐 جديد
+        "wick_profile": {}, "opposite_lock_side": lock_side, "enhanced_be_done": False
     })
     save_state()
 
@@ -940,31 +1067,6 @@ def ema_harvest(ind, px):
     
     return acted
 
-def atr_trail(ind, px):
-    if not state["open"] or state["qty"] <= 0: 
-        return
-    
-    rr = trend_rr_pct(px)
-    atr = ind.get("atr") or 0.0
-    
-    if rr < TRAIL_ACTIVATE or atr <= 0: 
-        return
-    
-    if state["side"] == "long":
-        new = px - atr * ATR_MULT_TRAIL
-        state["trail"] = max(state["trail"] or new, new)
-        if state["breakeven"] is not None: 
-            state["trail"] = max(state["trail"], state["breakeven"])
-        if px < state["trail"]: 
-            close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
-    else:
-        new = px + atr * ATR_MULT_TRAIL
-        state["trail"] = min(state["trail"] or new, new)
-        if state["breakeven"] is not None: 
-            state["trail"] = min(state["trail"], state["breakeven"])
-        if px > state["trail"]: 
-            close_market_strict(f"TRAIL_ATR({ATR_MULT_TRAIL}x)")
-
 def ratchet_lock(px):
     if not state["open"] or state["qty"] <= 0: 
         return
@@ -976,25 +1078,6 @@ def ratchet_lock(px):
     if state["highest_profit_pct"] >= 20 and rr < state["highest_profit_pct"] * 0.60:
         close_partial(0.5, f"Ratchet {state['highest_profit_pct']:.1f}%→{rr:.1f}%")
         state["highest_profit_pct"] = rr
-
-def dynamic_tp_ladder(ind, smc_snap):
-    px = price_now() or state.get("entry")
-    atr = ind.get("atr") or 0.0
-    
-    if not (state["open"] and px): 
-        return TREND_TARGETS, TREND_CLOSE_FRACS
-    
-    atr_pct = (atr / max(px, 1e-9)) * 100.0 if atr > 0 else 0.5
-    base = [round(x, 2) for x in [1.6 * atr_pct, 2.6 * atr_pct, 4.0 * atr_pct]]
-    
-    fibs = []
-    if smc_snap.get("eql") and smc_snap.get("eqh"):
-        fibs = fib_targets_from_swings(state["entry"], smc_snap["eql"], smc_snap["eqh"], state["side"])
-    
-    all_tps = sorted(set(base + fibs + TREND_TARGETS))
-    fracs = [0.25, 0.30, 0.45][:len(all_tps)]
-    
-    return all_tps[:4], fracs[:len(all_tps[:4])]
 
 def breakout_failure_guard(df, px, ind, smc_snap):
     if not (state["open"] and px and smc_snap): 
@@ -1043,7 +1126,6 @@ def breakout_failure_guard(df, px, ind, smc_snap):
                     close_market_strict("LL_BREAK_FAILURE_CONFIRMED")
 
 def wick_harvest(df, ind):
-    """جني أرباح من ذيل طويل في صالحنا (يظهر فخ سيولة أو امتصاص)."""
     if not state["open"] or state["qty"] <= 0: 
         return
     
@@ -1094,38 +1176,58 @@ def breakout_signal(df, ind, prev_ind):
     
     return None
 
-# =================== HUD ===================
-def snapshot(bal, ind, spread_bps, df, smc, traps, expl):
+# =================== ENHANCED SNAPSHOT ===================
+def enhanced_snapshot(bal, ind, spread_bps, df, smc, traps, expl):
+    """لوج محسّع يعرض الإعدادات الجديدة"""
     left = time_to_candle_close(df)
     cs = candle_stats(df, ind.get("atr") or 0.0)
+    px = price_now() or float(df['close'].iloc[-1])
     
-    print(colored("—" * 108, "cyan"))
-    print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC", "cyan"))
-    print(f"💲 Price {fmt(df['close'].iloc[-1])} | ATR={fmt(ind['atr'])} | spread_bps={fmt(spread_bps,2)} | close_in≈{left}s")
-    print(f"🧮 RSI={fmt(ind['rsi'])}  ADX={fmt(ind['adx'])}  +DI={fmt(ind['plus_di'])}  -DI={fmt(ind['minus_di'])}  ST_dir={ind['st_dir']}")
-    print(f"🕯️ body={fmt(cs.get('body_ratio',0.0),2)}  upW={fmt(cs.get('up_ratio',0.0),2)}  loW={fmt(cs.get('lo_ratio',0.0),2)}  range/ATR={fmt(cs.get('range_atr',0.0),2)}")
-    print(f"🎭 traps → bull={traps['bull_trap']}  bear={traps['bear_trap']}   💥 explosion={expl['flag']} (ΔADX={expl['adx_delta']}, r/ATR={expl['range_atr']})")
+    print(colored("═" * 120, "cyan"))
+    print(colored(f"🎯 ENHANCED RF Pro++ Bot - {SYMBOL} {INTERVAL}", "cyan", attrs=['bold']))
+    print(colored("─" * 120, "cyan"))
     
-    eff = (bal or 0.0) + compound_pnl
-    print(f"💰 Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq={fmt(eff)}")
+    # قسم الإعدادات المحسنة
+    print(f"💰 السعر: {fmt(px)} | ATR: {fmt(ind['atr'])} | ATR%: {fmt((ind['atr']/px)*100, 2)}% | السبريد: {fmt(spread_bps,2)}bps")
+    print(f"🎯 الأهداف: TP1={TP1_PCT}% ({TP1_CLOSE_FRAC*100}%) | BE={BREAKEVEN_AFTER}% | التريل: ديناميكي (ATR×{TRAIL_ATR_MULTIPLIER})")
     
+    # قسم المؤشرات
+    print(f"📊 RSI={fmt(ind['rsi'])} ADX={fmt(ind['adx'])} +DI={fmt(ind['plus_di'])} -DI={fmt(ind['minus_di'])} ST={ind['st_dir']}")
+    print(f"🕯️ الجسم={fmt(cs.get('body_ratio',0.0),2)} الذيل العلوي={fmt(cs.get('up_ratio',0.0),2)} الذيل السفلي={fmt(cs.get('lo_ratio',0.0),2)}")
+    
+    # حالة التريل الديناميكي
     if state["open"]:
-        lamp = '🟩 LONG' if state['side'] == 'long' else '🟥 SHORT'
-        print(f"{lamp} Entry={fmt(state['entry'])} Qty={fmt(state['qty'],4)} Bars={state['bars']} Trail={fmt(state['trail'])} PnL≈{fmt(state['pnl'])}")
-        print(f"TP1={state['tp1_done']}  BE={fmt(state['breakeven'])}  HighRR={fmt(state['highest_profit_pct'],2)}%  FailVotes={state['_fail_votes']}")
+        trail_activate = dynamic_trail_activation(ind, px)
+        rr = trend_rr_pct(px)
+        trail_status = "🟢" if rr >= trail_activate else "🟡"
+        print(f"📈 التريل: {trail_status} {fmt(rr, 2)}% / {fmt(trail_activate, 2)}%")
+    
+    # قسم المحفظة
+    eff = (bal or 0.0) + compound_pnl
+    print(f"💼 الرصيد: {fmt(bal, 2)} | PnL تراكمي: {fmt(compound_pnl)} | حقوق: {fmt(eff)}")
+    
+    # قسم الصفقة
+    if state["open"]:
+        side_icon = "🟢 LONG" if state['side'] == 'long' else "🔴 SHORT"
+        pnl_pct = trend_rr_pct(px)
+        print(f"{side_icon} الدخول: {fmt(state['entry'])} | الكمية: {fmt(state['qty'],4)} | PnL: {fmt(pnl_pct, 2)}%")
+        print(f"   التريل: {fmt(state['trail'])} | Breakeven: {fmt(state['breakeven'])} | TP1: {state['tp1_done']}")
     else:
         print("⚪ FLAT")
     
-    if smc:
-        print(f"SMC: EQH={fmt(smc.get('eqh'))}  EQL={fmt(smc.get('eql'))}  OB={smc.get('ob')}  FVG={smc.get('fvg')}")
+    # التنبيهات
+    alert_msgs = []
+    if traps["bull_trap"] > 0.5: alert_msgs.append(f"🐂 فخ صاعد {traps['bull_trap']:.0%}")
+    if traps["bear_trap"] > 0.5: alert_msgs.append(f"🐻 فخ هابط {traps['bear_trap']:.0%}")
+    if expl["flag"]: alert_msgs.append("💥 انفجار")
+    if state.get("opposite_lock_side"): alert_msgs.append(f"🔐 قفل {state['opposite_lock_side'].upper()}")
     
-    # 🔐 عرض حالة القفل العكسي
-    lock_status = ""
-    if state.get("opposite_lock_side"):
-        lock_status = f" | OppLock={state['opposite_lock_side'].upper()}"
-    print(colored("—" * 108 + lock_status, "cyan"))
+    if alert_msgs:
+        print("🚨 " + " | ".join(alert_msgs))
+    
+    print(colored("═" * 120, "cyan"))
 
-# =================== LOOP ===================
+# =================== ENHANCED TRADE LOOP ===================
 _last_bar_ts = None
 
 def update_bar_counters(df):
@@ -1147,7 +1249,6 @@ def update_bar_counters(df):
     return False
 
 def post_open_diagnostics(df, ind, smc, traps, expl):
-    """تشغيل نظام الفحوص بعد الفتح مباشرة لتفادي الفخاخ القريبة."""
     if state["diagnosed_after_open"]: 
         return
     
@@ -1170,7 +1271,8 @@ def post_open_diagnostics(df, ind, smc, traps, expl):
     
     set_state({"diagnosed_after_open": True})
 
-def trade_loop():
+def enhanced_trade_loop():
+    """حلقة تداول محسنة مع الإعدادات الجديدة"""
     loop = 0
     while True:
         try:
@@ -1183,21 +1285,17 @@ def trade_loop():
                 continue
             
             new_bar = update_bar_counters(df)
-
             ind = compute_indicators(df)
             prev_ind = compute_indicators(df.iloc[:-1]) if len(df) >= 2 else ind
             rf_live = compute_rf_live(df)
-            rf_closed = compute_rf_closed(df.iloc[:-1] if len(df) >= 2 else df)
             smc = smc_snapshot(df, ind.get("atr") or 0.0)
-
-            # تحليلات الشموع/الفخاخ/الانفجار
             traps = trap_detector(df, smc, ind)
             expl = explosion_detector(df, ind, prev_ind)
 
-            # Spread guard
+            # حارس السبريد
             spread_bps = orderbook_spread_bps()
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
-                snapshot(bal, ind, spread_bps, df, smc, traps, expl)
+                enhanced_snapshot(bal, ind, spread_bps, df, smc, traps, expl)
                 time.sleep(compute_next_sleep(df))
                 continue
 
@@ -1208,93 +1306,69 @@ def trade_loop():
                 else:
                     state["pnl"] = (state["entry"] - px) * state["qty"]
 
-            # طوارئ
-            if state["open"]: 
-                emergency_layer(ind, prev_ind, px or rf_live["price"])
-
-            # انفجار/انهيار: لو فاضي، استخدم الإشارة للدخول مبكّرًا
-            if not state["open"] and expl["flag"]:
-                side = "buy" if ind.get("st_dir", 0) == 1 or ind.get("plus_di", 0) > ind.get("minus_di", 0) else "sell"
-                qty = compute_size(bal, px or rf_live["price"])
-                if qty > 0: 
-                    open_market(side, qty, px or rf_live["price"], reason="EXPLOSION")
-
-            # Breakout (اختياري)
+            # الدخول المعزز
             if not state["open"]:
-                br = breakout_signal(df, ind, prev_ind)
-                if br:
-                    qty = compute_size(bal, px or rf_live["price"])
+                # حجم ديناميكي
+                qty = dynamic_position_sizing(bal, px, ind)
+                
+                # دخول انفجار
+                if expl["flag"]:
+                    side = "buy" if ind.get("st_dir", 0) == 1 or ind.get("plus_di", 0) > ind.get("minus_di", 0) else "sell"
                     if qty > 0: 
-                        open_market("buy" if br == "BUY" else "sell", qty, px or rf_live["price"], reason="BREAKOUT")
+                        open_market(side, qty, px or rf_live["price"], reason="EXPLOSION_ENHANCED")
 
-            # RF live entry مع القفل العكسي
-            if not state["open"] and USE_RF_LIVE:
-                sig = "buy" if rf_live["buy"] else ("sell" if rf_live["sell"] else None)
-                
-                # 🔐 فحص القفل العكسي
-                lock_side = state.get("opposite_lock_side")
-                if sig and lock_side:
-                    if sig == lock_side:
-                        # الإشارة مطابقة للقفل → ننتظر الإشارة المعاكسة
-                        print(colored(f"🔐 Opposite-Lock: skipping {sig.upper()} (waiting for {lock_side.upper()} first)", "yellow"))
-                        sig = None
-                    else:
-                        # إشارة معاكسة للقفل → نزيل القفل وندخل
-                        print(colored(f"🔐 Opposite-Lock: {lock_side.upper()} signal arrived → releasing lock", "green"))
-                        set_state({"opposite_lock_side": None})
-                
-                if sig:
-                    qty = compute_size(bal, px or rf_live["price"])
-                    if qty > 0:
-                        reason = "RF_LIVE"
+                # دخول breakout
+                br = breakout_signal(df, ind, prev_ind)
+                if br and qty > 0:
+                    open_market("buy" if br == "BUY" else "sell", qty, px or rf_live["price"], reason="BREAKOUT_ENHANCED")
+
+                # دخول RF مع القفل العكسي
+                if USE_RF_LIVE:
+                    sig = "buy" if rf_live["buy"] else ("sell" if rf_live["sell"] else None)
+                    lock_side = state.get("opposite_lock_side")
+                    
+                    if sig and lock_side:
+                        if sig == lock_side:
+                            print(colored(f"🔐 Opposite-Lock: skipping {sig.upper()} (waiting for {lock_side.upper()} first)", "yellow"))
+                            sig = None
+                        else:
+                            print(colored(f"🔐 Opposite-Lock: {lock_side.upper()} signal arrived → releasing lock", "green"))
+                            set_state({"opposite_lock_side": None})
+                    
+                    if sig and qty > 0:
+                        reason = "RF_LIVE_ENHANCED"
                         if expl["flag"]:
                             reason += "+EXPLOSION"
                         open_market(sig, qty, px or rf_live["price"], reason=reason)
 
-            # بعد الفتح: شغّل المنظومة كلها
+            # إدارة الصفقة المحسنة
             if state["open"]:
                 post_open_diagnostics(df, ind, smc, traps, expl)
-
-                rr = trend_rr_pct(px or rf_live["price"])
-                if not state.get("tp1_done") and rr >= TP1_PCT:
-                    close_partial(TP1_CLOSE_FRAC, f"TP1@{TP1_PCT:.2f}%")
-                    state["tp1_done"] = True
-                    if rr >= BREAKEVEN_AFTER: 
-                        state["breakeven"] = state.get("entry")
-
-                # سلم ديناميكي + فوبو
-                tps, fracs = dynamic_tp_ladder(ind, smc)
-                for i, tgt in enumerate(tps):
-                    if rr >= tgt and state["qty"] > 0:
-                        close_partial(fracs[i], f"TP_dyn@{tgt:.2f}%")
-                        # علامة أن هذا الهدف تم تحقيقه
-                        tps[i] = 10000.0  # قيمة عالية لن تتحقق again
-
-                # Golden Pocket حماية
-                if smc.get("eql") and smc.get("eqh"):
-                    a, b = (smc["eql"], smc["eqh"]) if state["side"] == "long" else (smc["eqh"], smc["eql"])
-                    if px and in_golden_pocket(px, a, b):
-                        close_partial(0.25, "Golden Pocket protect")
-                        state["breakeven"] = state.get("breakeven") or state.get("entry")
-
-                # Wick / EMA / ATR / Ratchet
+                
+                # إدارة الأرباح المحسنة
+                enhanced_tp_management(df, ind, px or rf_live["price"])
+                
+                # التريل المحسّن
+                enhanced_atr_trail(ind, px or rf_live["price"])
+                
+                # أدوات الجني الأخرى
                 wick_harvest(df, ind)
                 ema_harvest(ind, px or rf_live["price"])
-                atr_trail(ind, px or rf_live["price"])
                 ratchet_lock(px or rf_live["price"])
-
-                # فشل اختراق القمم/القيعان
                 breakout_failure_guard(df, px or rf_live["price"], ind, smc)
+                emergency_layer(ind, prev_ind, px or rf_live["price"])
 
-            snapshot(bal, ind, spread_bps, df, smc, traps, expl)
+            # اللوج المحسن
+            enhanced_snapshot(bal, ind, spread_bps or 0, df, smc, traps, expl)
+            
             if loop % 5 == 0: 
                 save_state()
             loop += 1
             time.sleep(compute_next_sleep(df))
 
         except Exception as e:
-            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}", "red"))
-            logging.error(f"trade_loop error: {e}\n{traceback.format_exc()}")
+            print(colored(f"❌ Enhanced loop error: {e}\n{traceback.format_exc()}", "red"))
+            logging.error(f"enhanced_trade_loop error: {e}\n{traceback.format_exc()}")
             time.sleep(BASE_SLEEP)
 
 # =================== KEEPALIVE & API ===================
@@ -1323,16 +1397,26 @@ flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
 @app.route("/")
 def home():
     mode = 'LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF Pro++ Bot — {SYMBOL} {INTERVAL} — {mode} — TRAPS+WICKS — STRICT CLOSE"
+    return f"✅ ENHANCED RF Pro++ Bot — {SYMBOL} {INTERVAL} — {mode} — PROFIT OPTIMIZED"
 
 @app.route("/metrics")
 def metrics():
     s = get_state()
+    px = price_now()
+    ind = compute_indicators(fetch_ohlcv()) if px else {}
+    
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
-        "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
+        "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": px,
         "position": s, "compound_pnl": compound_pnl, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "smc": s.get("_smc", {}), "trap_prob": s.get("trap_prob", 0.0),
+        "enhanced_settings": {
+            "tp1_pct": TP1_PCT,
+            "tp1_close_frac": TP1_CLOSE_FRAC,
+            "breakeven_after": BREAKEVEN_AFTER,
+            "trail_dynamic": TRAIL_ACTIVATE_DYNAMIC,
+            "atr_mult_trail": ATR_MULT_TRAIL
+        },
+        "trail_activation": dynamic_trail_activation(ind, px) if px else 0,
         "opposite_lock_side": s.get("opposite_lock_side")
     })
 
@@ -1343,17 +1427,21 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper", "open": s["open"], "side": s["side"],
         "qty": s["qty"], "compound_pnl": compound_pnl, "tp1_done": s.get("tp1_done", False),
         "trail": s.get("trail"), "timestamp": datetime.utcnow().isoformat(),
-        "opposite_lock_side": s.get("opposite_lock_side")
+        "opposite_lock_side": s.get("opposite_lock_side"),
+        "enhanced_be_done": s.get("enhanced_be_done", False)
     }), 200
 
 # =================== BOOT ===================
 if __name__ == "__main__":
-    print(colored(f"🚀 RF Pro++ Bot — TRAP MASTER EDITION", "green", attrs=['bold']))
-    print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'} • {SYMBOL} • {INTERVAL}", "yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x • RF_LIVE={USE_RF_LIVE}", "yellow"))
-    print(colored(f"FEATURES: Opposite-Lock • Trap Detection • Explosion Detection", "cyan"))
+    print(colored(f"🚀 ENHANCED RF Pro++ Bot - PROFIT OPTIMIZED EDITION", "green", attrs=['bold']))
+    print(colored(f"📈 الإعدادات المحسنة:", "yellow"))
+    print(colored(f"   • TP1: {TP1_PCT}% (جني {TP1_CLOSE_FRAC*100}%)", "yellow"))
+    print(colored(f"   • Breakeven: {BREAKEVEN_AFTER}%", "yellow"))
+    print(colored(f"   • التريل: ديناميكي (ATR×{TRAIL_ATR_MULTIPLIER} | أدنى {TRAIL_ACTIVATE_MIN}%)", "yellow"))
+    print(colored(f"   • مضاعف التريل: {ATR_MULT_TRAIL}x", "yellow"))
+    print(colored(f"🎯 الرمز: {SYMBOL} | الإطار: {INTERVAL} | النمط: {'LIVE' if MODE_LIVE else 'PAPER'}", "cyan"))
     
     load_state()
-    threading.Thread(target=trade_loop, daemon=True).start()
+    threading.Thread(target=enhanced_trade_loop, daemon=True).start()
     threading.Thread(target=keepalive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
