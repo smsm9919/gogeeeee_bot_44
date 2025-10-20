@@ -32,61 +32,6 @@ try:
 except Exception:
     def colored(t,*a,**k): return t
 
-# =================== ENV ===================
-API_KEY    = os.getenv("BINGX_API_KEY", "")
-API_SECRET = os.getenv("BINGX_API_SECRET", "")
-MODE_LIVE  = bool(API_KEY and API_SECRET)
-SELF_URL   = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
-PORT       = int(os.getenv("PORT", 5000))
-LOG_LEVEL  = os.getenv("LOG_LEVEL","INFO").upper()
-
-# =================== SETTINGS ===================
-SYMBOL     = os.getenv("BOT_SYMBOL", "DOGE/USDT:USDT")
-INTERVAL   = os.getenv("BOT_INTERVAL", "15m")
-
-# 60% × 10x
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", "0.60"))
-LEVERAGE   = int(os.getenv("LEVERAGE", "10"))
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE","oneway").lower()
-
-# RF — دخول على الشمعة الحية فقط
-RF_SOURCE = "close"
-RF_PERIOD = int(os.getenv("RF_PERIOD","20"))
-RF_MULT   = float(os.getenv("RF_MULT","3.5"))
-RF_LIVE_ONLY = True
-
-# مؤشرات
-RSI_LEN, ADX_LEN, ATR_LEN = 14, 14, 14
-
-# سبريد
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS","6.0"))
-
-# إدارة أرباح أساسية
-TP0_PROFIT_PCT   = 0.20      # يغلق 10% سريعًا لو وصل 0.2%
-TP0_CLOSE_FRAC   = 0.10
-TP0_MAX_USDT     = 1.50
-
-TP1_BASE_PCT     = 0.40
-TP1_CLOSE_FRAC   = 0.50
-BREAKEVEN_AFTER  = 0.30
-TRAIL_ACTIVATE   = 1.20
-ATR_MULT_TRAIL   = 1.6
-
-# أهداف ديناميكية
-TREND_TARGETS     = [0.5, 1.0, 1.8]   # fallback
-TREND_CLOSE_FRACS = [0.30, 0.30, 0.20]
-
-# اندفاع/ذيول
-IMPULSE_X_ATR = 1.8
-WICK_PCT_HARVEST = 45.0
-
-# قمم/قيعان
-EXTREME_LEFT_RIGHT = 2
-EXTREME_RSI_WEAK   = (45,55)
-EXTREME_ADX_MIN    = 18
-EXTREME_WAIT_ONE_BAR = True
-
-# Trap
 TRAP_WICK_MIN = 60.0
 TRAP_BODY_MAX = 25.0
 TRAP_VOL_SPIKE = 1.30
