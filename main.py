@@ -9,6 +9,12 @@ RF Futures Bot — RF-LIVE FUSION PRO (BingX Perp via CCXT)
 • Opposite-signal WAIT policy after a close (enter only from RF again)
 • Trap/Fakeout guard on opposite RF while in position (defensive partial + tighten trail + votes)
 • Flask /metrics + /health + rotated logging + keepalive
+
+This version adds (non-invasive / additive only):
+• Candlestick Patterns library
+• EVX (X-FLASH) explosion/crash filter
+• Smart Council post-entry manager (consensus: patterns + EVX + SMC proximity + Volume/ATR/ADX)
+• One hook call after manage_after_entry(...) in trade_loop
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -325,7 +331,6 @@ def detect_smc_levels(df: pd.DataFrame):
     try:
         d = df.copy()
         ph, pl = _find_swings(d, 2, 2)
-        # Equal High/Low (tolerance 0.05%)
         def _eq_levels(vals, is_high=True):
             res = []
             tol_pct = 0.05
@@ -341,7 +346,6 @@ def detect_smc_levels(df: pd.DataFrame):
         eqh = _eq_levels(ph, True)
         eql = _eq_levels(pl, False)
 
-        # Simple OB: last strong candle with small wicks (body dominates)
         ob = None
         for i in range(len(d)-2, max(len(d)-40, 1), -1):
             o=float(d["open"].iloc[i]); c=float(d["close"].iloc[i])
@@ -353,7 +357,6 @@ def detect_smc_levels(df: pd.DataFrame):
                 ob={"side":side,"bot":min(o,c),"top":max(o,c),"time":int(d["time"].iloc[i])}
                 break
 
-        # Simple FVG (within last 20 bars)
         fvg=None
         for i in range(len(d)-3, max(len(d)-20, 2), -1):
             prev_high = float(d["high"].iloc[i-1]); prev_low = float(d["low"].iloc[i-1])
@@ -400,7 +403,7 @@ def detect_stop_hunt(df: pd.DataFrame, smc: dict):
         pass
     return None
 
-# =================== CANDLES & EXPLOSIONS ===================
+# =================== CANDLES & EXPLOSIONS (baseline) ===================
 def detect_candle(df: pd.DataFrame):
     if len(df)<3:
         return {"pattern":"NONE","strength":0,"dir":0}
@@ -434,7 +437,6 @@ def explosion_signal(df: pd.DataFrame, ind: dict):
 def fusion_orchestrator(df: pd.DataFrame, ind: dict, info: dict, smc: dict):
     """Builds a joint view: momentum/trend/structure/trap/liq/explosion ⇒ scores & flags."""
     try:
-        # momentum / trend
         adx=float(ind.get("adx") or 0.0)
         rsi=float(ind.get("rsi") or 50.0)
         pdi=float(ind.get("plus_di") or 0.0); mdi=float(ind.get("minus_di") or 0.0)
@@ -442,25 +444,20 @@ def fusion_orchestrator(df: pd.DataFrame, ind: dict, info: dict, smc: dict):
         mom = (1.0 if adx>=28 else 0.5 if adx>=20 else 0.2) \
               + (0.5 if rsi>=55 else 0.5 if rsi<=45 else 0.0)
 
-        # structure / liquidity targets
         structure=0.0
         price=info.get("price")
         if smc.get("eqh") and price and price>smc["eqh"]: structure+=0.5
         if smc.get("eql") and price and price<smc["eql"]: structure+=0.5
         if smc.get("ob"):
             ob=smc["ob"]; 
-            # trend-follow OB gets a nudge
             structure += 0.3
 
-        # trap risk
         trap = detect_stop_hunt(df, smc)
         trap_risk = 0.6 if trap else 0.0
 
-        # explosion
         expl = explosion_signal(df, ind)
         boom = 0.6 if expl["explosion"] else 0.0
 
-        # candle context
         cnd = detect_candle(df)
         cscore = 0.2 if cnd["pattern"] in ("MARUBOZU","HAMMER","SHOOTING") else 0.0
 
@@ -480,11 +477,6 @@ def fusion_orchestrator(df: pd.DataFrame, ind: dict, info: dict, smc: dict):
 
 # =================== APEX (FINAL SWING) CONFIRM ===================
 def apex_confirmed(side: str, df: pd.DataFrame, ind: dict, smc: dict):
-    """
-    Decide last swing likely holds → single-shot full take:
-    • near EQH/EQL or OB edge
-    • long wick rejection + ADX cooling or RSI neutral/divergence
-    """
     try:
         price=float(df["close"].iloc[-1]); adx=float(ind.get("adx") or 0.0)
         rsi=float(ind.get("rsi") or 50.0); atr=float(ind.get("atr") or 0.0)
@@ -493,15 +485,10 @@ def apex_confirmed(side: str, df: pd.DataFrame, ind: dict, smc: dict):
         rng=max(h-l,1e-12); upper=h-max(o,c); lower=min(o,c)-l
         near_top = (smc.get("eqh") and _near_level(h, smc["eqh"], 10.0)) or (smc.get("ob") and smc["ob"].get("side")=="bear" and _near_level(h, smc["ob"]["bot"], 10.0))
         near_bot = (smc.get("eql") and _near_level(l, smc["eql"], 10.0)) or (smc.get("ob") and smc["ob"].get("side")=="bull" and _near_level(l, smc["ob"]["top"], 10.0))
-
-        # rejection wick + adx cooling/neutral RSI
         reject_top = (upper/rng>=0.55 and (adx<20 or 45<=rsi<=55))
         reject_bot = (lower/rng>=0.55 and (adx<20 or 45<=rsi<=55))
-
-        if side=="long" and near_top and reject_top and atr>0:  # long near top resistance
-            return True
-        if side=="short" and near_bot and reject_bot and atr>0: # short near bottom support
-            return True
+        if side=="long" and near_top and reject_top and atr>0:  return True
+        if side=="short" and near_bot and reject_bot and atr>0: return True
     except Exception:
         pass
     return False
@@ -512,7 +499,6 @@ STATE = {
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
-    # fusion diagnostics
     "fusion_score": 0.0, "trap_risk": 0.0, "opp_votes": 0
 }
 compound_pnl = 0.0
@@ -620,14 +606,12 @@ def _reset_after_close(reason, prev_side=None):
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
         "opp_votes": 0
     })
-    # Wait for opposite RF signal after a close
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
     else: wait_for_next_signal_side = None
     logging.info(f"AFTER_CLOSE waiting_for={wait_for_next_signal_side}")
 
 def close_partial(frac, reason):
-    """Partial close + residual guard + auto strict close when remaining ≤ FINAL_CHUNK_QTY."""
     if not STATE["open"] or STATE["qty"]<=0: return
     qty_close = safe_qty(max(0.0, STATE["qty"] * min(max(frac,0.0),1.0)))
     px = price_now() or STATE["entry"]
@@ -649,17 +633,13 @@ def close_partial(frac, reason):
 
 # =================== DEFENSIVE ON OPPOSITE RF WHILE IN POSITION ===================
 def defensive_on_opposite_rf(ind: dict, info: dict):
-    """Do NOT reverse. Defensive partial + tighten trail + collect votes. Full close only after votes+confirm."""
     if not STATE["open"] or STATE["qty"]<=0: return
     px = info.get("price") or price_now() or STATE["entry"]
     rf = info.get("filter")
     adx=float(ind.get("adx") or 0.0)
-    # 1) defensive partial
     base_frac = 0.25 if not STATE.get("tp1_done") else 0.20
     close_partial(base_frac, "Opposite RF — defensive")
-    # 2) breakeven
     if STATE.get("breakeven") is None: STATE["breakeven"]=STATE["entry"]
-    # 3) tighten trail with ATR
     atr=float(ind.get("atr") or 0.0)
     if atr>0 and px is not None:
         gap = atr * max(ATR_TRAIL_MULT, 1.2)
@@ -667,10 +647,7 @@ def defensive_on_opposite_rf(ind: dict, info: dict):
             STATE["trail"]=max(STATE["trail"] or (px-gap), px-gap)
         else:
             STATE["trail"]=min(STATE["trail"] or (px+gap), px+gap)
-    # 4) votes
     STATE["opp_votes"]=int(STATE.get("opp_votes",0))+1
-
-    # confirm conditions to allow strict close
     hyst=0.0
     try:
         if px and rf: hyst = abs((px-rf)/rf)*10000.0
@@ -705,42 +682,35 @@ def _tp_ladder(info, ind, side):
     return tps, frs
 
 def manage_after_entry(df, ind, info, fusion):
-    """Breakeven + Dynamic TP + ATR trail + Apex single-shot + Ratchet lock."""
     if not STATE["open"] or STATE["qty"]<=0: return
     px = info["price"]; entry=STATE["entry"]; side=STATE["side"]
     rr = (px - entry)/entry*100*(1 if side=="long" else -1)
 
-    # dyn ladder
     dyn_tps, dyn_fracs = _tp_ladder(info, ind, side)
     STATE["_tp_cache"]=dyn_tps; STATE["_tp_fracs"]=dyn_fracs
     k = int(STATE.get("profit_targets_achieved", 0))
 
-    # TP1 baseline (adaptive by ADX)
     tp1_now = TP1_PCT_BASE*(2.2 if ind.get("adx",0)>=35 else 1.8 if ind.get("adx",0)>=28 else 1.0)
     if (not STATE["tp1_done"]) and rr >= tp1_now:
         close_partial(TP1_CLOSE_FRAC, f"TP1@{tp1_now:.2f}%")
         STATE["tp1_done"]=True
         if rr >= BREAKEVEN_AFTER: STATE["breakeven"]=entry
 
-    # APEX single-shot (save fees) — only if profit is decent
     smc = fusion.get("smc", {})
     if rr >= max(0.4, TP1_PCT_BASE*0.8) and apex_confirmed(side, df, ind, smc):
         close_market_strict("APEX_CONFIRMED_FULL_TAKE")
         return
 
-    # explosion/hold bias: delay 1st dyn TP if explosion strong & ADX strong
     hold_explosion = fusion["explosion"]["explosion"] and float(ind.get("adx",0))>=28
     if k < len(dyn_tps) and rr >= dyn_tps[k] and not hold_explosion:
         frac = dyn_fracs[k] if k < len(dyn_fracs) else 0.25
         close_partial(frac, f"TP_dyn@{dyn_tps[k]:.2f}%")
         STATE["profit_targets_achieved"] = k + 1
 
-    # highest profit tracking + ratchet lock
     if rr > STATE["highest_profit_pct"]: STATE["highest_profit_pct"]=rr
     if STATE["highest_profit_pct"]>=TRAIL_ACTIVATE_PCT and rr < STATE["highest_profit_pct"]*RATCHET_LOCK_FALLBACK:
         close_partial(0.50, f"RatchetLock {STATE['highest_profit_pct']:.2f}%→{rr:.2f}%")
 
-    # ATR Trailing after activation
     atr=float(ind.get("atr") or 0.0)
     if rr >= TRAIL_ACTIVATE_PCT and atr>0:
         gap = atr * ATR_TRAIL_MULT
@@ -754,6 +724,193 @@ def manage_after_entry(df, ind, info, fusion):
             STATE["trail"] = min(STATE["trail"] or new_trail, new_trail)
             if STATE["breakeven"] is not None: STATE["trail"] = min(STATE["trail"], STATE["breakeven"])
             if px > STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+
+# =================== SMART ADD-ONS (Candlesticks + EVX + Consensus) ===================
+def detect_candlestick_patterns(df: pd.DataFrame):
+    res = []
+    if len(df) < 3:
+        return res
+    o = df["open"].astype(float); h = df["high"].astype(float); l = df["low"].astype(float); c = df["close"].astype(float)
+    i = len(df)-1
+    o1,c1,h1,l1 = o.iloc[i-2], c.iloc[i-2], h.iloc[i-2], l.iloc[i-2]
+    o2,c2,h2,l2 = o.iloc[i-1], c.iloc[i-1], h.iloc[i-1], l.iloc[i-1]
+    o3,c3,h3,l3 = o.iloc[i],   c.iloc[i],   h.iloc[i],   l.iloc[i]
+    body1 = abs(c1-o1); body2 = abs(c2-o2); body3 = abs(c3-o3)
+    rng1 = max(h1-l1,1e-12); rng2 = max(h2-l2,1e-12); rng3 = max(h3-l3,1e-12)
+    try:
+        long_bull = (c1 > o1) and (body1 >= 0.5 * rng1)
+        small_mid  = (body2 <= 0.4 * body1)
+        strong_bear = (c3 < o3) and (c3 < (o1 + c1)/2)
+        if long_bull and small_mid and strong_bear: res.append({"pattern":"EVENING_STAR","dir":-1,"strength":3})
+    except Exception: pass
+    try:
+        long_bear = (c1 < o1) and (body1 >= 0.5 * rng1)
+        small_mid  = (body2 <= 0.4 * body1)
+        strong_bull = (c3 > o3) and (c3 > (o1 + c1)/2)
+        if long_bear and small_mid and strong_bull: res.append({"pattern":"MORNING_STAR","dir":1,"strength":3})
+    except Exception: pass
+    try:
+        if (c3 > o3) and (body3 > body2) and (o3 < c2) and (c3 > o2): res.append({"pattern":"BULLISH_ENGULFING","dir":1,"strength":2})
+        if (c3 < o3) and (body3 > body2) and (o3 > c2) and (c3 < o2): res.append({"pattern":"BEARISH_ENGULFING","dir":-1,"strength":2})
+    except Exception: pass
+    try:
+        lower_wick3 = (min(o3,c3) - l3); upper_wick3 = (h3 - max(o3,c3))
+        if lower_wick3 >= 2.0 * body3 and body3 <= 0.5 * rng3:
+            if c3 > o3: res.append({"pattern":"HAMMER","dir":1,"strength":2})
+            else:       res.append({"pattern":"HANGING_MAN","dir":-1,"strength":2})
+        if upper_wick3 >= 2.0 * body3 and body3 <= 0.5 * rng3:
+            if c3 < o3: res.append({"pattern":"SHOOTING_STAR","dir":-1,"strength":2})
+            else:       res.append({"pattern":"INVERTED_HAMMER","dir":1,"strength":2})
+    except Exception: pass
+    try:
+        if body3 <= 0.15 * rng3: res.append({"pattern":"DOJI_LIKE","dir":0,"strength":1})
+    except Exception: pass
+    try:
+        b1 = c1>o1 and (body1>=0.5*rng1); b2 = c2>o2 and (body2>=0.5*rng2); b3 = c3>o3 and (body3>=0.5*rng3)
+        if b1 and b2 and b3 and (c2>c1) and (c3>c2): res.append({"pattern":"THREE_WHITE_SOLDIERS","dir":1,"strength":3})
+        s1 = c1<o1 and (body1>=0.5*rng1); s2 = c2<o2 and (body2>=0.5*rng2); s3 = c3<o3 and (body3>=0.5*rng3)
+        if s1 and s2 and s3 and (c2<c1) and (c3<c2): res.append({"pattern":"THREE_BLACK_CROWS","dir":-1,"strength":3})
+    except Exception: pass
+    return res
+
+def _bbands(src, n=20, k=2.0):
+    ma = src.rolling(n).mean()
+    sd = src.rolling(n).std().replace(0, 1e-12)
+    top, bot = ma + k*sd, ma - k*sd
+    return ma, top, bot
+
+def evx_signal(df: pd.DataFrame, ind: dict, rf_info: dict):
+    out = {"trigger": False, "dir": 0, "strength": 0, "cooldown": False, "metrics": {}}
+    if len(df) < 200: return out
+    v = df["volume"].astype(float); c = df["close"].astype(float); o = df["open"].astype(float)
+    atr = float(ind.get("atr") or 0.0); adx = float(ind.get("adx") or 0.0)
+    vma20 = v.rolling(20).mean().iloc[-1] or 1e-9
+    v_ratio = float(v.iloc[-1] / vma20)
+    react = abs(float(c.iloc[-1]-o.iloc[-1])) / max(atr, 1e-9)
+    ma, top, bot = _bbands(c, 20, 2.0)
+    bbbw = (top - bot) / ma.replace(0, 1e-9)
+    bbbw_now = float(bbbw.iloc[-1]); bbbw_prev = float(bbbw.iloc[-2])
+    bbbw_p80 = float(bbbw.iloc[-200:-1].quantile(0.80))
+    adx_prev = float(ind.get("adx_prev", adx)); adx_slope = adx - adx_prev
+    V_SPIKE = float(os.getenv("EVX_V_SPIKE", 2.2))
+    ATR_REACT = float(os.getenv("EVX_ATR_REACT", 1.6))
+    BBBW_JUMP = float(os.getenv("EVX_BBBW_JUMP", 0.35))
+    ADX_SLOPE_MIN = float(os.getenv("EVX_ADX_SLOPE_MIN", 2.0))
+    conds = []
+    if v_ratio >= V_SPIKE: conds.append("VSpike")
+    if react  >= ATR_REACT: conds.append("ATRReact")
+    if (bbbw_now >= bbbw_p80) and ((bbbw_now - bbbw_prev)/max(bbbw_prev,1e-9) >= BBBW_JUMP): conds.append("RangeExpand")
+    if (adx >= 22.0) and (adx_slope >= ADX_SLOPE_MIN): conds.append("ADXAccel")
+    out["metrics"] = {"v_ratio": v_ratio, "react": react, "bbbw": bbbw_now, "adx": adx, "adx_slope": adx_slope, "conds": conds}
+    out["strength"] = min(3, len(conds))
+    trigger = len(conds) >= 3; out["trigger"] = bool(trigger)
+    if not trigger: return out
+    px = float(c.iloc[-1]); rf = float(rf_info.get("filter") or px)
+    out["dir"] = 1 if (px > o.iloc[-1] and px > rf) else (-1 if (px < o.iloc[-1] and px < rf) else 0)
+    V_COOLDOWN = float(os.getenv("EVX_V_COOLDOWN", 1.2))
+    cooldown = (v_ratio <= V_COOLDOWN) or ((bbbw_now < bbbw_prev*0.75) and (adx_slope <= 0))
+    out["cooldown"] = bool(cooldown)
+    return out
+
+def _current_rr_pct(px: float, entry: float, side: str) -> float:
+    try:
+        if not px or not entry or not side: return 0.0
+        rr = (px - entry) / entry * 100.0
+        return rr if side == "long" else -rr
+    except Exception:
+        return 0.0
+
+def post_entry_manager_smart(df, ind, info, fusion):
+    """
+    Works after manage_after_entry. Uses candlestick patterns + EVX + SMC proximity + Volume/ATR/ADX
+    to decide defensive partials, strict full-take on real reversals, or small supportive scale-in.
+    """
+    try:
+        if str(os.getenv("ENABLE_SMART_REV","1")) != "1":
+            return
+        patterns = detect_candlestick_patterns(df)
+        evx = evx_signal(df, ind, {"filter": info.get("filter")})
+        STATE["_patterns"]=patterns; STATE["_evx"]=evx
+
+        if not STATE.get("open"):
+            if str(os.getenv("ENABLE_EVX","1"))=="1" and evx.get("trigger") and evx.get("dir")!=0 and not fusion.get("trap"):
+                spread_bps = orderbook_spread_bps()
+                if spread_bps is None or spread_bps <= MAX_SPREAD_BPS:
+                    bal = balance_usdt()
+                    base_qty = compute_size(bal, info.get("price") or price_now())
+                    qty = safe_qty(base_qty * float(os.getenv("EVX_SIZE_CLAMP", 0.40)))
+                    if qty>0:
+                        side = "buy" if evx["dir"]==1 else "sell"
+                        open_market(side, qty, info.get("price") or price_now())
+            return
+
+        side = STATE.get("side")
+        px = info.get("price") or price_now()
+        entry = STATE.get("entry") or px
+        rr = _current_rr_pct(px, entry, side)
+        pat_dir = (patterns[-1]["dir"] if patterns else 0)
+        opposite = (side=="long" and pat_dir==-1) or (side=="short" and pat_dir==1)
+
+        v = float(df["volume"].astype(float).iloc[-1]); vma = float(df["volume"].astype(float).rolling(20).mean().iloc[-1] or 1e-9)
+        v_ratio = v/max(vma,1e-9)
+        atr=float(ind.get("atr") or 0.0)
+        react = abs(float(df["close"].astype(float).iloc[-1]-df["open"].astype(float).iloc[-1]))/max(atr,1e-9)
+        adx=float(ind.get("adx") or 0.0)
+        near = 0.0
+        smc = fusion.get("smc",{})
+        try:
+            tol = float(os.getenv("RCS_SMC_BPS",12.0))
+            if smc.get("eqh") and abs((px-smc["eqh"])/smc["eqh"])*10000.0 <= tol: near += 1.0
+            if smc.get("eql") and abs((px-smc["eql"])/smc["eql"])*10000.0 <= tol: near += 1.0
+            if isinstance(smc.get("ob"), dict):
+                ob = smc["ob"]
+                if ob.get("side")=="bear" and abs((px-ob.get("bot",px))/ob.get("bot",px))*10000.0 <= tol: near += 1.0
+                if ob.get("side")=="bull" and abs((px-ob.get("top",px))/ob.get("top",px))*10000.0 <= tol: near += 1.0
+        except Exception:
+            pass
+
+        pat_strength = abs(patterns[-1]["strength"]) if patterns else 0.0
+        score = pat_strength + near + max(0.0,(v_ratio-1.0)) + max(0.0,(react-1.0)) + (adx/50.0)
+        if evx.get("trigger"): score *= 1.4
+
+        TH_FULL = float(os.getenv("RCS_TH_FULL", 2.5))
+        TH_PART = float(os.getenv("RCS_TH_PARTIAL", 1.5))
+
+        if opposite and score >= TH_FULL:
+            min_rr = float(os.getenv("REV_MIN_RR_FULL", 0.25))
+            if rr >= min_rr:
+                close_market_strict("REVERSAL_HIGH_FULL")
+                return
+            else:
+                close_partial(0.45, "REVERSAL_HIGH_PARTIAL")
+                if atr>0:
+                    gap = atr * max(float(os.getenv("REV_TRAIL_MULT",2.0)), ATR_TRAIL_MULT)
+                    if side=="long": STATE["trail"]=max(STATE["trail"] or (px-gap), px-gap)
+                    else: STATE["trail"]=min(STATE["trail"] or (px+gap), px+gap)
+
+        elif opposite and score >= TH_PART:
+            close_partial(0.25, "REVERSAL_MEDIUM_PARTIAL")
+            if atr>0:
+                gap = atr * max(1.2, ATR_TRAIL_MULT)
+                if side=="long": STATE["trail"]=max(STATE["trail"] or (px-gap), px-gap)
+                else: STATE["trail"]=min(STATE["trail"] or (px+gap), px+gap)
+
+        if evx.get("cooldown", False) and str(os.getenv("EVX_COOLDOWN_FULLTAKE","1"))=="1":
+            if rr >= float(os.getenv("EVX_MIN_RR_FULLTAKE", 0.30)):
+                close_market_strict("EVX_COOLDOWN_FULL_TAKE")
+                return
+
+        supportive = (side=="long" and pat_dir==1) or (side=="short" and pat_dir==-1)
+        if supportive:
+            spread_bps = orderbook_spread_bps()
+            if (spread_bps is None or spread_bps <= MAX_SPREAD_BPS) and not fusion.get("trap") and (adx>=22.0 or v_ratio>1.4):
+                bal = balance_usdt()
+                add_qty = safe_qty(compute_size(bal, px) * float(os.getenv("REV_SCALE_IN_FRAC", 0.15)))
+                if add_qty > 0 and not STATE.get("tp1_done", False):
+                    open_market("buy" if side=="long" else "sell", add_qty, px)
+
+    except Exception as e:
+        logging.error(f"post_entry_manager_smart error: {e}")
 
 # =================== LOG / SNAPSHOT ===================
 def pretty_snapshot(bal, info, ind, spread_bps, fusion, reason=None, df=None):
@@ -797,42 +954,37 @@ def trade_loop():
             px  = price_now()
             df  = fetch_ohlcv()
 
-            info = rf_signal_live(df)             # ⚡ RF LIVE ONLY
+            info = rf_signal_live(df)
             ind  = compute_indicators(df)
             spread_bps = orderbook_spread_bps()
 
-            # SMC levels (use closed history quality: all but live candle)
             df_closed = df.iloc[:-1] if len(df)>=2 else df.copy()
             smc = detect_smc_levels(df_closed)
 
-            # Fusion orchestration
             fusion = fusion_orchestrator(df, ind, {"price": px or info["price"], **info}, smc)
             STATE["fusion_score"]=fusion["fusion_score"]
             STATE["trap_risk"]=fusion["trap_risk"]
 
-            # PnL snapshot
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
 
-            # Manage after entry (full system)
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, fusion)
 
-            # Opposite RF defense while in trade
+            # Smart council: Candles + EVX (non-invasive)
+            post_entry_manager_smart(df, ind, {"price": px or info["price"], **info}, fusion)
+
             if STATE["open"]:
                 if STATE["side"]=="long" and info["short"]:
                     defensive_on_opposite_rf(ind, {"price": px or info["price"], **info})
                 elif STATE["side"]=="short" and info["long"]:
                     defensive_on_opposite_rf(ind, {"price": px or info["price"], **info})
 
-            # Entry guard: spread too wide?
             reason=None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
 
-            # ENTRY: RF LIVE ONLY (no other entries)
             sig = "buy" if (ENTRY_RF_ONLY and info["long"]) else ("sell" if (ENTRY_RF_ONLY and info["short"]) else None)
 
-            # After a close: wait for opposite RF side
             if not STATE["open"] and sig and reason is None:
                 if wait_for_next_signal_side and sig != wait_for_next_signal_side:
                     reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
@@ -847,7 +999,6 @@ def trade_loop():
 
             pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, fusion, reason, df)
 
-            # bar counter
             if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) and STATE["open"]:
                 STATE["bars"] += 1
 
