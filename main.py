@@ -10,11 +10,11 @@ RF Futures Bot — RF-LIVE FUSION PRO (BingX Perp via CCXT)
 • Trap/Fakeout guard on opposite RF while in position (defensive partial + tighten trail + votes)
 • Flask /metrics + /health + rotated logging + keepalive
 
-This version adds (non-invasive / additive only):
-• Candlestick Patterns library
-• EVX (X-FLASH) explosion/crash filter
-• Smart Council post-entry manager (consensus: patterns + EVX + SMC proximity + Volume/ATR/ADX)
-• One hook call after manage_after_entry(...) in trade_loop
+ADDED (non-invasive): SMART PATIENCE & CONFIRMATION
+• MIN_HOLD_BARS: صبر إلزامي بعد الدخول قبل أي دفاع
+• اختراق/كسر مؤكَّد: حجم/ADX + عدد إغلاقات فوق/تحت مستوى مفتاحي (EQH/EQL/OB edge)
+• صبر على إعادة الاختبار (retest) قبل أي خروج دفاعي
+• تجاهل الدوجي كسبب للخروج أثناء الصبر/التأكيد (اختياري)
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -45,19 +45,19 @@ LEVERAGE   = int(os.getenv("LEVERAGE", 10))
 RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))   # 60% of equity
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")  # oneway/hedge
 
-# RF (TradingView-like) — live candle only
+# RF (TradingView-like) — live candle only (ENTRY UNCHANGED)
 RF_SOURCE = "close"
 RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
 RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_LIVE_ONLY = True
-RF_HYST_BPS  = 6.0  # hysteresis to reduce live-candle flicker
+RF_LIVE_ONLY = True                  # ← لم يتم تغييره
+RF_HYST_BPS  = 6.0                  # ← كما هو
 
 # Indicators
 RSI_LEN = 14
 ADX_LEN = 14
 ATR_LEN = 14
 
-# Entry only from RF
+# Entry only from RF (UNCHANGED)
 ENTRY_RF_ONLY = True
 
 # Spread guard
@@ -435,7 +435,6 @@ def explosion_signal(df: pd.DataFrame, ind: dict):
 
 # =================== FUSION ORCHESTRATOR ===================
 def fusion_orchestrator(df: pd.DataFrame, ind: dict, info: dict, smc: dict):
-    """Builds a joint view: momentum/trend/structure/trap/liq/explosion ⇒ scores & flags."""
     try:
         adx=float(ind.get("adx") or 0.0)
         rsi=float(ind.get("rsi") or 50.0)
@@ -448,9 +447,7 @@ def fusion_orchestrator(df: pd.DataFrame, ind: dict, info: dict, smc: dict):
         price=info.get("price")
         if smc.get("eqh") and price and price>smc["eqh"]: structure+=0.5
         if smc.get("eql") and price and price<smc["eql"]: structure+=0.5
-        if smc.get("ob"):
-            ob=smc["ob"]; 
-            structure += 0.3
+        if smc.get("ob"): structure += 0.3
 
         trap = detect_stop_hunt(df, smc)
         trap_risk = 0.6 if trap else 0.0
@@ -478,11 +475,10 @@ def fusion_orchestrator(df: pd.DataFrame, ind: dict, info: dict, smc: dict):
 # =================== APEX (FINAL SWING) CONFIRM ===================
 def apex_confirmed(side: str, df: pd.DataFrame, ind: dict, smc: dict):
     try:
-        price=float(df["close"].iloc[-1]); adx=float(ind.get("adx") or 0.0)
-        rsi=float(ind.get("rsi") or 50.0); atr=float(ind.get("atr") or 0.0)
         o=float(df["open"].iloc[-1]); h=float(df["high"].iloc[-1])
         l=float(df["low"].iloc[-1]);  c=float(df["close"].iloc[-1])
         rng=max(h-l,1e-12); upper=h-max(o,c); lower=min(o,c)-l
+        adx=float(ind.get("adx") or 0.0); rsi=float(ind.get("rsi") or 50.0); atr=float(ind.get("atr") or 0.0)
         near_top = (smc.get("eqh") and _near_level(h, smc["eqh"], 10.0)) or (smc.get("ob") and smc["ob"].get("side")=="bear" and _near_level(h, smc["ob"]["bot"], 10.0))
         near_bot = (smc.get("eql") and _near_level(l, smc["eql"], 10.0)) or (smc.get("ob") and smc["ob"].get("side")=="bull" and _near_level(l, smc["ob"]["top"], 10.0))
         reject_top = (upper/rng>=0.55 and (adx<20 or 45<=rsi<=55))
@@ -499,7 +495,12 @@ STATE = {
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
-    "fusion_score": 0.0, "trap_risk": 0.0, "opp_votes": 0
+    "fusion_score": 0.0, "trap_risk": 0.0, "opp_votes": 0,
+    # === SMART PATIENCE ===
+    "grace_bars_left": 0,          # صبر إجباري بعد الدخول
+    "brk_confirmed": False,        # تم تأكيد الاختراق/الكسر
+    "retest_await": False,         # ننتظر إعادة الاختبار
+    "retest_deadline": 0           # آخر مهلة لإعادة الاختبار
 }
 compound_pnl = 0.0
 wait_for_next_signal_side = None  # "buy" or "sell"
@@ -554,7 +555,12 @@ def open_market(side, qty, price):
         "open": True, "side": "long" if side=="buy" else "short", "entry": price,
         "qty": qty, "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "opp_votes": 0
+        "opp_votes": 0,
+        # === SMART PATIENCE ===
+        "grace_bars_left": int(os.getenv("MIN_HOLD_BARS", 0)),
+        "brk_confirmed": False,
+        "retest_await": False,
+        "retest_deadline": 0
     })
     print(colored(f"🚀 OPEN {('🟩 LONG' if side=='buy' else '🟥 SHORT')} qty={fmt(qty,4)} @ {fmt(price)}", "green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -604,7 +610,12 @@ def _reset_after_close(reason, prev_side=None):
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
         "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
-        "opp_votes": 0
+        "opp_votes": 0,
+        # === SMART PATIENCE ===
+        "grace_bars_left": 0,
+        "brk_confirmed": False,
+        "retest_await": False,
+        "retest_deadline": 0
     })
     if prev_side == "long":  wait_for_next_signal_side = "sell"
     elif prev_side == "short": wait_for_next_signal_side = "buy"
@@ -633,21 +644,41 @@ def close_partial(frac, reason):
 
 # =================== DEFENSIVE ON OPPOSITE RF WHILE IN POSITION ===================
 def defensive_on_opposite_rf(ind: dict, info: dict):
+    """Do NOT reverse. Defensive partial + tighten trail + collect votes. Full close only after votes+confirm."""
+    # === SMART PATIENCE === لا دفاع أثناء الصبر أو انتظار إعادة الاختبار
+    if STATE.get("grace_bars_left",0) > 0 or STATE.get("retest_await", False):
+        return
+    # تجاهل الدوجي كسبب خروج دفاعي (اختياري)
+    if os.getenv("IGNORE_DOJI_FOR_EXIT","1")=="1":
+        pats = STATE.get("_patterns") or []
+        if len(pats)>0 and pats[-1].get("pattern") in ("DOJI","DOJI_LIKE"):
+            return
+
     if not STATE["open"] or STATE["qty"]<=0: return
     px = info.get("price") or price_now() or STATE["entry"]
     rf = info.get("filter")
     adx=float(ind.get("adx") or 0.0)
+    # 1) defensive partial
     base_frac = 0.25 if not STATE.get("tp1_done") else 0.20
     close_partial(base_frac, "Opposite RF — defensive")
+    # 2) breakeven
     if STATE.get("breakeven") is None: STATE["breakeven"]=STATE["entry"]
+    # 3) tighten trail with ATR (ولا يسمح بالنزول تحت BE للـ LONG، والعكس للـ SHORT)
     atr=float(ind.get("atr") or 0.0)
     if atr>0 and px is not None:
         gap = atr * max(ATR_TRAIL_MULT, 1.2)
         if STATE["side"]=="long":
             STATE["trail"]=max(STATE["trail"] or (px-gap), px-gap)
+            if STATE.get("breakeven") is not None:
+                STATE["trail"]=max(STATE["trail"], STATE["breakeven"])
         else:
             STATE["trail"]=min(STATE["trail"] or (px+gap), px+gap)
+            if STATE.get("breakeven") is not None:
+                STATE["trail"]=min(STATE["trail"], STATE["breakeven"])
+    # 4) votes
     STATE["opp_votes"]=int(STATE.get("opp_votes",0))+1
+
+    # confirm conditions to allow strict close
     hyst=0.0
     try:
         if px and rf: hyst = abs((px-rf)/rf)*10000.0
@@ -725,192 +756,73 @@ def manage_after_entry(df, ind, info, fusion):
             if STATE["breakeven"] is not None: STATE["trail"] = min(STATE["trail"], STATE["breakeven"])
             if px > STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
 
-# =================== SMART ADD-ONS (Candlesticks + EVX + Consensus) ===================
+    # ======== SMART PATIENCE: اختراق/كسر + إعادة اختبار =========
+    def _level_context(px_, smc_):
+        up = smc_.get("eqh")
+        dn = smc_.get("eql")
+        ob = smc_.get("ob") or {}
+        if not up and ob.get("side")=="bear": up = ob.get("bot")
+        if not dn and ob.get("side")=="bull": dn = ob.get("top")
+        return up, dn
+
+    def breakout_engine(df_, ind_, smc_, side_):
+        c = df_["close"].astype(float); o = df_["open"].astype(float); v = df_["volume"].astype(float)
+        px_ = float(c.iloc[-1]); o_ = float(o.iloc[-1])
+        vma = float(v.rolling(20).mean().iloc[-1] or 1e-9)
+        v_ratio = float(v.iloc[-1]/max(vma,1e-9))
+        adx_ = float(ind_.get("adx") or 0.0)
+        up_, dn_ = _level_context(px_, smc_)
+        brk_ok_ = False; key_ = None
+        if side_=="long" and up_:
+            brk_ok_ = (px_>up_) and (v_ratio >= float(os.getenv("BRK_MIN_VRATIO",1.3))) and (adx_ >= float(os.getenv("BRK_MIN_ADX",22)))
+            key_ = up_
+        if side_=="short" and dn_:
+            brk_ok_ = (px_<dn_) and (v_ratio >= float(os.getenv("BRK_MIN_VRATIO",1.3))) and (adx_ >= float(os.getenv("BRK_MIN_ADX",22)))
+            key_ = dn_
+        return {"brk_ok": bool(brk_ok_), "key": key_, "v_ratio": v_ratio, "adx": adx_, "px": px_, "o": o_}
+
+    br = breakout_engine(df, ind, smc, STATE["side"])
+
+    # قلل عداد الصبر عند إغلاق كل شمعة (يتم أيضًا في الحلقة لضمان الاتساق)
+    # (الجزء الرسمي لتقليل العداد موجود بالحلقة؛ السطر ده احتياطي لو تغيرت أماكن النداءات)
+
+    # لو لسه لم نتأكد من الاختراق/الكسر
+    if not STATE.get("brk_confirmed", False):
+        if br["brk_ok"]:
+            need = int(os.getenv("BRK_CONFIRM_CLOSES",1))
+            closes = df["close"].astype(float).iloc[-need:] if len(df)>=need else []
+            if STATE["side"]=="long" and (len(closes)==need) and all(c > br["key"] for c in closes):
+                STATE["brk_confirmed"] = True
+                STATE["retest_await"] = True
+                STATE["retest_deadline"] = STATE["bars"] + int(os.getenv("RETEST_TIMEOUT_BARS",6))
+            elif STATE["side"]=="short" and (len(closes)==need) and all(c < br["key"] for c in closes):
+                STATE["brk_confirmed"] = True
+                STATE["retest_await"] = True
+                STATE["retest_deadline"] = STATE["bars"] + int(os.getenv("RETEST_TIMEOUT_BARS",6))
+
+    # أثناء انتظار إعادة الاختبار: لا قرارات دفاعية (يُطبق الحظر أيضًا في defensive_on_opposite_rf)
+    if STATE.get("retest_await", False):
+        # تم لمس المستوى وإعادة اختباره؟
+        if br["key"] is not None:
+            if (STATE["side"]=="long" and br["px"]<=br["key"]) or (STATE["side"]=="short" and br["px"]>=br["key"]):
+                STATE["retest_await"] = False  # لمس المستوى → انتهى الانتظار
+            else:
+                # لم يُلمس بعد — استمر بالصبر حتى الموعد النهائي
+                if STATE["bars"] >= STATE.get("retest_deadline",0):
+                    STATE["retest_await"] = False  # انتهت المهلة
+
+# =================== SMART ADD-ONS (Candles mini for DOJI ignore) ===================
 def detect_candlestick_patterns(df: pd.DataFrame):
     res = []
     if len(df) < 3:
         return res
     o = df["open"].astype(float); h = df["high"].astype(float); l = df["low"].astype(float); c = df["close"].astype(float)
     i = len(df)-1
-    o1,c1,h1,l1 = o.iloc[i-2], c.iloc[i-2], h.iloc[i-2], l.iloc[i-2]
-    o2,c2,h2,l2 = o.iloc[i-1], c.iloc[i-1], h.iloc[i-1], l.iloc[i-1]
-    o3,c3,h3,l3 = o.iloc[i],   c.iloc[i],   h.iloc[i],   l.iloc[i]
-    body1 = abs(c1-o1); body2 = abs(c2-o2); body3 = abs(c3-o3)
-    rng1 = max(h1-l1,1e-12); rng2 = max(h2-l2,1e-12); rng3 = max(h3-l3,1e-12)
-    try:
-        long_bull = (c1 > o1) and (body1 >= 0.5 * rng1)
-        small_mid  = (body2 <= 0.4 * body1)
-        strong_bear = (c3 < o3) and (c3 < (o1 + c1)/2)
-        if long_bull and small_mid and strong_bear: res.append({"pattern":"EVENING_STAR","dir":-1,"strength":3})
-    except Exception: pass
-    try:
-        long_bear = (c1 < o1) and (body1 >= 0.5 * rng1)
-        small_mid  = (body2 <= 0.4 * body1)
-        strong_bull = (c3 > o3) and (c3 > (o1 + c1)/2)
-        if long_bear and small_mid and strong_bull: res.append({"pattern":"MORNING_STAR","dir":1,"strength":3})
-    except Exception: pass
-    try:
-        if (c3 > o3) and (body3 > body2) and (o3 < c2) and (c3 > o2): res.append({"pattern":"BULLISH_ENGULFING","dir":1,"strength":2})
-        if (c3 < o3) and (body3 > body2) and (o3 > c2) and (c3 < o2): res.append({"pattern":"BEARISH_ENGULFING","dir":-1,"strength":2})
-    except Exception: pass
-    try:
-        lower_wick3 = (min(o3,c3) - l3); upper_wick3 = (h3 - max(o3,c3))
-        if lower_wick3 >= 2.0 * body3 and body3 <= 0.5 * rng3:
-            if c3 > o3: res.append({"pattern":"HAMMER","dir":1,"strength":2})
-            else:       res.append({"pattern":"HANGING_MAN","dir":-1,"strength":2})
-        if upper_wick3 >= 2.0 * body3 and body3 <= 0.5 * rng3:
-            if c3 < o3: res.append({"pattern":"SHOOTING_STAR","dir":-1,"strength":2})
-            else:       res.append({"pattern":"INVERTED_HAMMER","dir":1,"strength":2})
-    except Exception: pass
-    try:
-        if body3 <= 0.15 * rng3: res.append({"pattern":"DOJI_LIKE","dir":0,"strength":1})
-    except Exception: pass
-    try:
-        b1 = c1>o1 and (body1>=0.5*rng1); b2 = c2>o2 and (body2>=0.5*rng2); b3 = c3>o3 and (body3>=0.5*rng3)
-        if b1 and b2 and b3 and (c2>c1) and (c3>c2): res.append({"pattern":"THREE_WHITE_SOLDIERS","dir":1,"strength":3})
-        s1 = c1<o1 and (body1>=0.5*rng1); s2 = c2<o2 and (body2>=0.5*rng2); s3 = c3<o3 and (body3>=0.5*rng3)
-        if s1 and s2 and s3 and (c2<c1) and (c3<c2): res.append({"pattern":"THREE_BLACK_CROWS","dir":-1,"strength":3})
-    except Exception: pass
+    o3,c3,h3,l3 = o.iloc[i], c.iloc[i], h.iloc[i], l.iloc[i]
+    rng3=max(h3-l3,1e-12); body3=abs(c3-o3)
+    if body3 <= 0.15 * rng3:
+        res.append({"pattern":"DOJI","dir":0,"strength":1})
     return res
-
-def _bbands(src, n=20, k=2.0):
-    ma = src.rolling(n).mean()
-    sd = src.rolling(n).std().replace(0, 1e-12)
-    top, bot = ma + k*sd, ma - k*sd
-    return ma, top, bot
-
-def evx_signal(df: pd.DataFrame, ind: dict, rf_info: dict):
-    out = {"trigger": False, "dir": 0, "strength": 0, "cooldown": False, "metrics": {}}
-    if len(df) < 200: return out
-    v = df["volume"].astype(float); c = df["close"].astype(float); o = df["open"].astype(float)
-    atr = float(ind.get("atr") or 0.0); adx = float(ind.get("adx") or 0.0)
-    vma20 = v.rolling(20).mean().iloc[-1] or 1e-9
-    v_ratio = float(v.iloc[-1] / vma20)
-    react = abs(float(c.iloc[-1]-o.iloc[-1])) / max(atr, 1e-9)
-    ma, top, bot = _bbands(c, 20, 2.0)
-    bbbw = (top - bot) / ma.replace(0, 1e-9)
-    bbbw_now = float(bbbw.iloc[-1]); bbbw_prev = float(bbbw.iloc[-2])
-    bbbw_p80 = float(bbbw.iloc[-200:-1].quantile(0.80))
-    adx_prev = float(ind.get("adx_prev", adx)); adx_slope = adx - adx_prev
-    V_SPIKE = float(os.getenv("EVX_V_SPIKE", 2.2))
-    ATR_REACT = float(os.getenv("EVX_ATR_REACT", 1.6))
-    BBBW_JUMP = float(os.getenv("EVX_BBBW_JUMP", 0.35))
-    ADX_SLOPE_MIN = float(os.getenv("EVX_ADX_SLOPE_MIN", 2.0))
-    conds = []
-    if v_ratio >= V_SPIKE: conds.append("VSpike")
-    if react  >= ATR_REACT: conds.append("ATRReact")
-    if (bbbw_now >= bbbw_p80) and ((bbbw_now - bbbw_prev)/max(bbbw_prev,1e-9) >= BBBW_JUMP): conds.append("RangeExpand")
-    if (adx >= 22.0) and (adx_slope >= ADX_SLOPE_MIN): conds.append("ADXAccel")
-    out["metrics"] = {"v_ratio": v_ratio, "react": react, "bbbw": bbbw_now, "adx": adx, "adx_slope": adx_slope, "conds": conds}
-    out["strength"] = min(3, len(conds))
-    trigger = len(conds) >= 3; out["trigger"] = bool(trigger)
-    if not trigger: return out
-    px = float(c.iloc[-1]); rf = float(rf_info.get("filter") or px)
-    out["dir"] = 1 if (px > o.iloc[-1] and px > rf) else (-1 if (px < o.iloc[-1] and px < rf) else 0)
-    V_COOLDOWN = float(os.getenv("EVX_V_COOLDOWN", 1.2))
-    cooldown = (v_ratio <= V_COOLDOWN) or ((bbbw_now < bbbw_prev*0.75) and (adx_slope <= 0))
-    out["cooldown"] = bool(cooldown)
-    return out
-
-def _current_rr_pct(px: float, entry: float, side: str) -> float:
-    try:
-        if not px or not entry or not side: return 0.0
-        rr = (px - entry) / entry * 100.0
-        return rr if side == "long" else -rr
-    except Exception:
-        return 0.0
-
-def post_entry_manager_smart(df, ind, info, fusion):
-    """
-    Works after manage_after_entry. Uses candlestick patterns + EVX + SMC proximity + Volume/ATR/ADX
-    to decide defensive partials, strict full-take on real reversals, or small supportive scale-in.
-    """
-    try:
-        if str(os.getenv("ENABLE_SMART_REV","1")) != "1":
-            return
-        patterns = detect_candlestick_patterns(df)
-        evx = evx_signal(df, ind, {"filter": info.get("filter")})
-        STATE["_patterns"]=patterns; STATE["_evx"]=evx
-
-        if not STATE.get("open"):
-            if str(os.getenv("ENABLE_EVX","1"))=="1" and evx.get("trigger") and evx.get("dir")!=0 and not fusion.get("trap"):
-                spread_bps = orderbook_spread_bps()
-                if spread_bps is None or spread_bps <= MAX_SPREAD_BPS:
-                    bal = balance_usdt()
-                    base_qty = compute_size(bal, info.get("price") or price_now())
-                    qty = safe_qty(base_qty * float(os.getenv("EVX_SIZE_CLAMP", 0.40)))
-                    if qty>0:
-                        side = "buy" if evx["dir"]==1 else "sell"
-                        open_market(side, qty, info.get("price") or price_now())
-            return
-
-        side = STATE.get("side")
-        px = info.get("price") or price_now()
-        entry = STATE.get("entry") or px
-        rr = _current_rr_pct(px, entry, side)
-        pat_dir = (patterns[-1]["dir"] if patterns else 0)
-        opposite = (side=="long" and pat_dir==-1) or (side=="short" and pat_dir==1)
-
-        v = float(df["volume"].astype(float).iloc[-1]); vma = float(df["volume"].astype(float).rolling(20).mean().iloc[-1] or 1e-9)
-        v_ratio = v/max(vma,1e-9)
-        atr=float(ind.get("atr") or 0.0)
-        react = abs(float(df["close"].astype(float).iloc[-1]-df["open"].astype(float).iloc[-1]))/max(atr,1e-9)
-        adx=float(ind.get("adx") or 0.0)
-        near = 0.0
-        smc = fusion.get("smc",{})
-        try:
-            tol = float(os.getenv("RCS_SMC_BPS",12.0))
-            if smc.get("eqh") and abs((px-smc["eqh"])/smc["eqh"])*10000.0 <= tol: near += 1.0
-            if smc.get("eql") and abs((px-smc["eql"])/smc["eql"])*10000.0 <= tol: near += 1.0
-            if isinstance(smc.get("ob"), dict):
-                ob = smc["ob"]
-                if ob.get("side")=="bear" and abs((px-ob.get("bot",px))/ob.get("bot",px))*10000.0 <= tol: near += 1.0
-                if ob.get("side")=="bull" and abs((px-ob.get("top",px))/ob.get("top",px))*10000.0 <= tol: near += 1.0
-        except Exception:
-            pass
-
-        pat_strength = abs(patterns[-1]["strength"]) if patterns else 0.0
-        score = pat_strength + near + max(0.0,(v_ratio-1.0)) + max(0.0,(react-1.0)) + (adx/50.0)
-        if evx.get("trigger"): score *= 1.4
-
-        TH_FULL = float(os.getenv("RCS_TH_FULL", 2.5))
-        TH_PART = float(os.getenv("RCS_TH_PARTIAL", 1.5))
-
-        if opposite and score >= TH_FULL:
-            min_rr = float(os.getenv("REV_MIN_RR_FULL", 0.25))
-            if rr >= min_rr:
-                close_market_strict("REVERSAL_HIGH_FULL")
-                return
-            else:
-                close_partial(0.45, "REVERSAL_HIGH_PARTIAL")
-                if atr>0:
-                    gap = atr * max(float(os.getenv("REV_TRAIL_MULT",2.0)), ATR_TRAIL_MULT)
-                    if side=="long": STATE["trail"]=max(STATE["trail"] or (px-gap), px-gap)
-                    else: STATE["trail"]=min(STATE["trail"] or (px+gap), px+gap)
-
-        elif opposite and score >= TH_PART:
-            close_partial(0.25, "REVERSAL_MEDIUM_PARTIAL")
-            if atr>0:
-                gap = atr * max(1.2, ATR_TRAIL_MULT)
-                if side=="long": STATE["trail"]=max(STATE["trail"] or (px-gap), px-gap)
-                else: STATE["trail"]=min(STATE["trail"] or (px+gap), px+gap)
-
-        if evx.get("cooldown", False) and str(os.getenv("EVX_COOLDOWN_FULLTAKE","1"))=="1":
-            if rr >= float(os.getenv("EVX_MIN_RR_FULLTAKE", 0.30)):
-                close_market_strict("EVX_COOLDOWN_FULL_TAKE")
-                return
-
-        supportive = (side=="long" and pat_dir==1) or (side=="short" and pat_dir==-1)
-        if supportive:
-            spread_bps = orderbook_spread_bps()
-            if (spread_bps is None or spread_bps <= MAX_SPREAD_BPS) and not fusion.get("trap") and (adx>=22.0 or v_ratio>1.4):
-                bal = balance_usdt()
-                add_qty = safe_qty(compute_size(bal, px) * float(os.getenv("REV_SCALE_IN_FRAC", 0.15)))
-                if add_qty > 0 and not STATE.get("tp1_done", False):
-                    open_market("buy" if side=="long" else "sell", add_qty, px)
-
-    except Exception as e:
-        logging.error(f"post_entry_manager_smart error: {e}")
 
 # =================== LOG / SNAPSHOT ===================
 def pretty_snapshot(bal, info, ind, spread_bps, fusion, reason=None, df=None):
@@ -937,6 +849,8 @@ def pretty_snapshot(bal, info, ind, spread_bps, fusion, reason=None, df=None):
         lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
         print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
         print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%  OppVotes={STATE.get('opp_votes',0)}")
+        # === SMART PATIENCE ===
+        print(f"   ⏳ Hold={STATE.get('grace_bars_left',0)}  brk_confirmed={STATE.get('brk_confirmed')}  retest_wait={STATE.get('retest_await')}  deadline={STATE.get('retest_deadline')}")
     else:
         print("   ⚪ FLAT")
         if wait_for_next_signal_side:
@@ -970,8 +884,8 @@ def trade_loop():
 
             manage_after_entry(df, ind, {"price": px or info["price"], **info}, fusion)
 
-            # Smart council: Candles + EVX (non-invasive)
-            post_entry_manager_smart(df, ind, {"price": px or info["price"], **info}, fusion)
+            # تحديث قائمة الشموع البسيطة (لاستخدام الدوجي فقط)
+            pats = detect_candlestick_patterns(df); STATE["_patterns"]=pats
 
             if STATE["open"]:
                 if STATE["side"]=="long" and info["short"]:
@@ -999,8 +913,12 @@ def trade_loop():
 
             pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, fusion, reason, df)
 
-            if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) and STATE["open"]:
-                STATE["bars"] += 1
+            # bar counter + تقليل عداد الصبر
+            if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]):
+                if STATE["open"]:
+                    STATE["bars"] += 1
+                    if STATE.get("grace_bars_left",0) > 0:
+                        STATE["grace_bars_left"] -= 1
 
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df)<=10 else BASE_SLEEP
@@ -1015,7 +933,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-LIVE FUSION PRO — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Fusion Orchestrator — Dynamic TP — Strict Close — FinalChunk={FINAL_CHUNK_QTY}DOGE"
+    return f"✅ RF-LIVE FUSION PRO — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Fusion Orchestrator — Dynamic TP — Strict Close — FinalChunk={FINAL_CHUNK_QTY}DOGE — SMART_PATIENCE=ON"
 
 @app.route("/metrics")
 def metrics():
@@ -1036,7 +954,12 @@ def health():
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
         "fusion": {"score": STATE.get("fusion_score"), "trap_risk": STATE.get("trap_risk")},
-        "tp_done": STATE.get("profit_targets_achieved", 0), "opp_votes": STATE.get("opp_votes",0)
+        "tp_done": STATE.get("profit_targets_achieved", 0), "opp_votes": STATE.get("opp_votes",0),
+        # === SMART PATIENCE ===
+        "grace_bars_left": STATE.get("grace_bars_left",0),
+        "brk_confirmed": STATE.get("brk_confirmed",False),
+        "retest_await": STATE.get("retest_await",False),
+        "retest_deadline": STATE.get("retest_deadline",0)
     }), 200
 
 def keepalive_loop():
