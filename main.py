@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT)
-• Entry: Range Filter (TradingView-like) — LIVE CANDLE ONLY
-• Post-entry: Dynamic TP ladder + Breakeven + ATR-trailing
-• Strict close with exchange verification
-• Opposite-signal wait policy after a close
-• Dust guard: force close if remaining ≤ FINAL_CHUNK_QTY (default 40 DOGE)
-• Flask /metrics + /health + rotated logging
+RF Futures Bot — RF-LIVE ONLY (BingX Perp via CCXT) + ORCHESTRA
+• Entry: Range Filter (TradingView-like) — LIVE CANDLE ONLY (RF فقط)
+• Post-entry (Orchestra): EQH/EQL + FVG + Trap/Wicks + Volume/Momentum consensus
+• Dynamic TP ladder + Breakeven + ATR-trailing + Impulse/Wick harvesting
+• One-shot full exit عند تأكد "آخر قمة/آخر قاع" (لتقليل العمولات)
+• Strict close مع التحقق من المنصّة + Dust/Final-chunk guard (<= 40 DOGE)
+• Opposite-signal wait policy بعد أي إغلاق
+• Flask /metrics + /health + rotated logging + HUD ملوّن
+
+مهم: لم أغيّر منطق الدخول مطلقًا — ما زال RF على الشمعة الحيّة فقط.
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -34,7 +37,8 @@ PORT = int(os.getenv("PORT", 5000))
 SYMBOL     = os.getenv("SYMBOL", "DOGE/USDT:USDT")
 INTERVAL   = os.getenv("INTERVAL", "15m")
 LEVERAGE   = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))   # 60% من الرصيد
+RISK_ALLOC = float(os.getenv("RISK_ALLOC", 0.60))   # 60%
+
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")  # oneway/hedge
 
 # RF (TradingView-like) — live candle only
@@ -77,6 +81,25 @@ CLOSE_VERIFY_WAIT_S  = 2.0
 # Pacing
 BASE_SLEEP   = 5
 NEAR_CLOSE_S = 1
+
+# ============ ORCHESTRA (Post-Entry Smart Layer) ============
+ORCHESTRA_ENABLED = True
+
+# Equal High/Low + FVG + Traps
+EQ_TOLERANCE_PCT   = 0.05     # تشابه القمم/القيعان ±0.05%
+LEVEL_PROX_BPS     = 10.0     # قرب من مستوى سيولة (bps)
+FVG_MAX_GAP_ATR    = 2.0      # أكبر فجوة مقبولة كـ ATR
+TRAP_WICK_PCT      = 60.0     # % من مدى الشمعة لازم يكون ذيل
+TRAP_BODY_MAX_PCT  = 25.0     # جسم صغير = فخ
+VOL_SPIKE_X        = 1.30     # حجم أكبر من متوسط 20 ×1.3
+REJECT_NEED_VOTES  = 2        # عدد مرات الرفض قبل قرار قوي
+CONFIRM_BARS       = 1        # انتظر شمعة/شمعتين حسب الحاجة
+IMPULSE_X_ATR      = 1.2      # جسم ≥ 1.2×ATR = اندفاع
+WICK_HARVEST_PCT   = 45.0     # ذيل ≥ 45% → جني جزئي
+HOLD_STRONG_ADX    = 28       # ADX قوي = اتركها تجري
+ONE_SHOT_MIN_PCT   = 0.60     # أقل ربح لتفعيل One-shot (لو آخر قمة/قاع تأكدت)
+TRAIL_WIDE_MULT    = 2.0      # تشديد/توسيع التريل في الزخم
+RF_FAKE_GUARD      = True     # لا خروج كامل على قلبة RF وهمية بدون تأكيد
 
 # =================== LOGGING ===================
 def setup_file_logging():
@@ -300,13 +323,85 @@ def rf_signal_live(df: pd.DataFrame):
         "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])
     }
 
+# =================== STRUCTURE / LIQUIDITY ===================
+def _find_swings(df: pd.DataFrame, left:int=2, right:int=2):
+    if len(df) < left+right+3:
+        return [None]*len(df), [None]*len(df)
+    h = df["high"].astype(float).values
+    l = df["low"].astype(float).values
+    ph = [None]*len(df)
+    pl = [None]*len(df)
+    for i in range(left, len(df)-right):
+        if all(h[i] >= h[j] for j in range(i-left, i+right+1)):
+            ph[i] = h[i]
+        if all(l[i] <= l[j] for j in range(i-left, i+right+1)):
+            pl[i] = l[i]
+    return ph, pl
+
+def _eq_levels(ph, pl):
+    eqh_candidates = []; eql_candidates = []
+    for arr, is_high in ((ph, True),(pl, False)):
+        for i, price in enumerate(arr):
+            if price is None: continue
+            tol = price * (EQ_TOLERANCE_PCT/100.0)
+            local = []
+            for j in range(max(0,i-10), min(len(arr), i+10)):
+                pj = arr[j]
+                if pj is not None and abs(pj - price) <= tol:
+                    local.append(pj)
+            if len(local) >= 2:
+                if is_high: eqh_candidates.append(max(local))
+                else:       eql_candidates.append(min(local))
+    eqh = max(eqh_candidates) if eqh_candidates else None
+    eql = min(eql_candidates) if eql_candidates else None
+    return eqh, eql
+
+def _fvg_scan(df_closed: pd.DataFrame, atr_now: float):
+    """بسيطة: تلتقط فجوة واحدة قريبة حديثًا."""
+    try:
+        if len(df_closed) < 3 or atr_now <= 0: return None
+        for i in range(len(df_closed)-3, max(len(df_closed)-20, 2), -1):
+            prev_high = float(df_closed["high"].iloc[i-1])
+            prev_low  = float(df_closed["low"].iloc[i-1])
+            cur_low   = float(df_closed["low"].iloc[i])
+            cur_high  = float(df_closed["high"].iloc[i])
+            # فجوة صاعدة
+            if cur_low > prev_high and (cur_low - prev_high) <= FVG_MAX_GAP_ATR*atr_now:
+                return {"type":"BULL_FVG","bottom":prev_high,"top":cur_low}
+            # فجوة هابطة
+            if cur_high < prev_low  and (prev_low - cur_high) <= FVG_MAX_GAP_ATR*atr_now:
+                return {"type":"BEAR_FVG","bottom":cur_high,"top":prev_low}
+    except Exception:
+        pass
+    return None
+
+def build_structure_snapshot(df_full: pd.DataFrame, ind: dict):
+    """يُبنى على الشموع المغلقة فقط حتى لا يُعيد رسم نفسه أثناء القرار."""
+    df_closed = df_full.iloc[:-1] if len(df_full)>=2 else df_full.copy()
+    ph, pl = _find_swings(df_closed)
+    eqh, eql = _eq_levels(ph, pl)
+    fvg = _fvg_scan(df_closed, float(ind.get("atr") or 0.0))
+    return {"eqh":eqh, "eql":eql, "fvg":fvg}
+
+def _bps(a,b):
+    try: return abs((a-b)/b)*10000.0
+    except Exception: return 0.0
+
 # =================== STATE ===================
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
     "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
     "tp1_done": False, "highest_profit_pct": 0.0,
     "profit_targets_achieved": 0,
+    # ORCHESTRA
+    "struct": None,                 # {"eqh":..,"eql":..,"fvg":..}
+    "rejection_votes": 0,           # رفضات متتالية عند قمة/قاع
+    "hold_votes": 0,                # أصوات استمرار الترند
+    "last_level_tag": None,         # "EQH"/"EQL"/"FVG"
+    "last_reject_bar_ts": None,     # للتباعد بين الأصوات
+    "confirm_queue": 0,             # لانتظار الشمعة القادمة عند القرار
 }
+
 compound_pnl = 0.0
 wait_for_next_signal_side = None  # "buy" or "sell" (ننتظر الإشارة العكسية بعد الإغلاق)
 
@@ -359,7 +454,10 @@ def open_market(side, qty, price):
     STATE.update({
         "open": True, "side": "long" if side=="buy" else "short", "entry": price,
         "qty": qty, "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0
+        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
+        # reset orchestra
+        "struct": None, "rejection_votes": 0, "hold_votes": 0,
+        "last_level_tag": None, "last_reject_bar_ts": None, "confirm_queue": 0
     })
     print(colored(f"🚀 OPEN {('LONG' if side=='buy' else 'SHORT')} qty={fmt(qty,4)} @ {fmt(price)}", "green" if side=="buy" else "red"))
     logging.info(f"OPEN {side} qty={qty} price={price}")
@@ -408,7 +506,9 @@ def _reset_after_close(reason, prev_side=None):
     STATE.update({
         "open": False, "side": None, "entry": None, "qty": 0.0,
         "pnl": 0.0, "bars": 0, "trail": None, "breakeven": None,
-        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0
+        "tp1_done": False, "highest_profit_pct": 0.0, "profit_targets_achieved": 0,
+        "struct": None, "rejection_votes": 0, "hold_votes": 0,
+        "last_level_tag": None, "last_reject_bar_ts": None, "confirm_queue": 0
     })
     # انتظر الإشارة العكسية من RF
     if prev_side == "long":  wait_for_next_signal_side = "sell"
@@ -488,42 +588,198 @@ def manage_after_entry(df, ind, info):
     if rr > STATE["highest_profit_pct"]: STATE["highest_profit_pct"]=rr
     # تريل ATR بعد تفعيل حد الربح
     if rr >= TRAIL_ACTIVATE_PCT and ind.get("atr",0)>0:
-        gap = ind["atr"] * ATR_TRAIL_MULT
+        # وسّع التريل في الزخم القوي
+        trail_mult = TRAIL_WIDE_MULT if ind.get("adx",0) >= HOLD_STRONG_ADX else ATR_TRAIL_MULT
+        gap = ind["atr"] * trail_mult
         if side=="long":
             new_trail = px - gap
             STATE["trail"] = max(STATE["trail"] or new_trail, new_trail)
             if STATE["breakeven"] is not None: STATE["trail"] = max(STATE["trail"], STATE["breakeven"])
-            if px < STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+            if px < STATE["trail"]: close_market_strict(f"TRAIL_ATR({trail_mult}x)")
         else:
             new_trail = px + gap
             STATE["trail"] = min(STATE["trail"] or new_trail, new_trail)
             if STATE["breakeven"] is not None: STATE["trail"] = min(STATE["trail"], STATE["breakeven"])
-            if px > STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
+            if px > STATE["trail"]: close_market_strict(f"TRAIL_ATR({trail_mult}x)")
+
+# =================== ORCHESTRA (post-entry smart brain) ===================
+def _candle_stats(df):
+    if len(df)<1: return {}
+    o = float(df["open"].iloc[-1])
+    h = float(df["high"].iloc[-1])
+    l = float(df["low"].iloc[-1])
+    c = float(df["close"].iloc[-1])
+    rng = max(h-l, 1e-12); body = abs(c-o)
+    upper = h - max(o,c); lower = min(o,c) - l
+    return {
+        "range":rng, "body":body,
+        "body_pct": (body/rng)*100.0 if rng>0 else 0.0,
+        "upper_pct": (upper/rng)*100.0 if rng>0 else 0.0,
+        "lower_pct": (lower/rng)*100.0 if rng>0 else 0.0,
+        "bull": c>o, "bear": c<o
+    }
+
+def _vol_ratio(df):
+    if len(df)<21: return 1.0
+    v = float(df["volume"].iloc[-1])
+    vma = df["volume"].iloc[-21:-1].astype(float).mean()
+    return (v/max(vma,1e-9)) if vma>0 else 1.0
+
+def near_level(px, lvl, bps):
+    try: return abs((px-lvl)/lvl)*10000.0 <= bps
+    except Exception: return False
+
+def orchestra_post_entry(df, ind, info):
+    """تُشغَّل بعد الدخول — تُقرر: hold/partial/full وفق بنية/زخم/فخاخ/حجم."""
+    if not (ORCHESTRA_ENABLED and STATE["open"] and STATE["qty"]>0): return
+    px   = info["price"]; entry = STATE["entry"]; side = STATE["side"]
+    rr   = (px - entry)/entry*100*(1 if side=="long" else -1)
+    atr  = float(ind.get("atr") or 0.0)
+    adx  = float(ind.get("adx") or 0.0)
+    rsi  = float(ind.get("rsi") or 50.0)
+    cndl = _candle_stats(df)
+    volx = _vol_ratio(df)
+    df_closed = df.iloc[:-1] if len(df)>=2 else df.copy()
+
+    # 1) Build/refresh structure snapshot (مرة كل لووب لتبسيط)
+    STATE["struct"] = build_structure_snapshot(df, ind)
+    eqh = STATE["struct"]["eqh"]; eql = STATE["struct"]["eql"]; fvg = STATE["struct"]["fvg"]
+
+    # 2) Trap/Wick detection عند مستويات السيولة
+    trap = None
+    if atr>0 and cndl:
+        # فخ صعودي (ضرب قيعان) / فخ هبوطي (ضرب قمم)
+        if cndl["upper_pct"]>=TRAP_WICK_PCT and cndl["body_pct"]<=TRAP_BODY_MAX_PCT and volx>=VOL_SPIKE_X:
+            # ذيل علوي كبير → رفض قمم
+            if eqh and near_level(float(df["high"].iloc[-1]), eqh, LEVEL_PROX_BPS): trap="bear_trap_at_EQH"
+            elif fvg and fvg.get("type")=="BEAR_FVG" and near_level(float(df["high"].iloc[-1]), fvg["bottom"], LEVEL_PROX_BPS): trap="bear_trap_at_FVG"
+        if cndl["lower_pct"]>=TRAP_WICK_PCT and cndl["body_pct"]<=TRAP_BODY_MAX_PCT and volx>=VOL_SPIKE_X:
+            # ذيل سفلي كبير → رفض قيعان
+            if eql and near_level(float(df["low"].iloc[-1]), eql, LEVEL_PROX_BPS): trap="bull_trap_at_EQL"
+            elif fvg and fvg.get("type")=="BULL_FVG" and near_level(float(df["low"].iloc[-1]), fvg["top"], LEVEL_PROX_BPS): trap="bull_trap_at_FVG"
+
+    if trap:
+        # جني جزئي دفاعي + تعادل + شد تريل
+        close_partial(0.20, f"TRAP {trap}")
+        if rr >= BREAKEVEN_AFTER and STATE.get("breakeven") is None:
+            STATE["breakeven"]=entry
+        if atr>0:
+            gap = atr * max(ATR_TRAIL_MULT, 1.4)
+            if side=="long":
+                STATE["trail"] = max(STATE["trail"] or (px-gap), px-gap)
+            else:
+                STATE["trail"] = min(STATE["trail"] or (px+gap), px+gap)
+
+    # 3) Impulse/Wick harvesting
+    if atr>0 and cndl["body"] >= IMPULSE_X_ATR*atr:
+        # اندفاع في اتجاه الصفقة
+        if (cndl["bull"] and side=="long") or (cndl["bear"] and side=="short"):
+            frac = 0.50 if cndl["body"] >= 2.0*atr else 0.33
+            close_partial(frac, f"IMPULSE x{cndl['body']/atr:.2f} ATR")
+            # وسّع التريل مع الزخم
+            gap = atr * TRAIL_WIDE_MULT
+            if side=="long":  STATE["trail"] = max(STATE["trail"] or (px-gap), px-gap)
+            else:             STATE["trail"] = min(STATE["trail"] or (px+gap), px+gap)
+    # ذيل طويل ضد الصفقة
+    if side=="long" and cndl["upper_pct"]>=WICK_HARVEST_PCT:
+        close_partial(0.25, f"UPPER-WICK {cndl['upper_pct']:.0f}%")
+    if side=="short" and cndl["lower_pct"]>=WICK_HARVEST_PCT:
+        close_partial(0.25, f"LOWER-WICK {cndl['lower_pct']:.0f}%")
+
+    # 4) Hold vs Rejection votes near last EQH/EQL / FVG
+    targeted_level = None; tagged = None
+    if side=="long":
+        if eqh and near_level(px, eqh, LEVEL_PROX_BPS): targeted_level = eqh; tagged="EQH"
+        elif fvg and fvg.get("type")=="BEAR_FVG" and near_level(px, fvg["bottom"], LEVEL_PROX_BPS): targeted_level=fvg["bottom"]; tagged="FVG"
+    else:  # short
+        if eql and near_level(px, eql, LEVEL_PROX_BPS): targeted_level = eql; tagged="EQL"
+        elif fvg and fvg.get("type")=="BULL_FVG" and near_level(px, fvg["top"], LEVEL_PROX_BPS): targeted_level=fvg["top"]; tagged="FVG"
+
+    # أصوات استمرار الترند (ADX قوي + RSI داعم)
+    if (side=="long" and adx>=HOLD_STRONG_ADX and rsi>=55) or (side=="short" and adx>=HOLD_STRONG_ADX and rsi<=45):
+        STATE["hold_votes"] = min(STATE.get("hold_votes",0)+1, 3)
+    else:
+        STATE["hold_votes"] = max(0, STATE.get("hold_votes",0)-1)
+
+    # رفضات عند مستوى سيولة
+    if targeted_level:
+        STATE["last_level_tag"] = tagged
+        # رصد رفض: ذيل ضد الاختراق + حجم مرتفع + ADX يتسطح/ينخفض
+        adx_flat_or_down = adx < HOLD_STRONG_ADX or True
+        is_reject = False
+        if side=="long":
+            is_reject = (float(df["high"].iloc[-1])>targeted_level and px<targeted_level and cndl["upper_pct"]>=40.0 and volx>=VOL_SPIKE_X and adx_flat_or_down)
+        else:
+            is_reject = (float(df["low"].iloc[-1])<targeted_level and px>targeted_level and cndl["lower_pct"]>=40.0 and volx>=VOL_SPIKE_X and adx_flat_or_down)
+        if is_reject:
+            STATE["rejection_votes"] = min(STATE.get("rejection_votes",0)+1, 3)
+            STATE["last_reject_bar_ts"] = int(df["time"].iloc[-1])
+        # لو استمرار قوي والرفض ضعيف — صفّر جزء من الأصوات
+        if STATE["hold_votes"]>=2 and not is_reject:
+            STATE["rejection_votes"] = max(0, STATE.get("rejection_votes",0)-1)
+
+    # 5) Fake-RF guard (لا خروج كامل على قلبة وهمية أثناء صفقة رابحة)
+    # (نكتفي بجزئي + شد تريل، والخروج الكامل بعد التأكيد)
+    if RF_FAKE_GUARD:
+        # نبني RF live للبار الحالي — عندك info جاهزة
+        flipped_against = (side=="long" and info.get("short")) or (side=="short" and info.get("long"))
+        if flipped_against and rr >= 0.20:
+            close_partial(0.20, "Opposite RF (guard partial)")
+            if atr>0:
+                gap = atr * max(1.4, ATR_TRAIL_MULT)
+                if side=="long":  STATE["trail"] = max(STATE["trail"] or (px-gap), px-gap)
+                else:             STATE["trail"] = min(STATE["trail"] or (px+gap), px+gap)
+            # لا نُغلق كاملًا الآن — ننتظر شمعة/تأكيد
+            STATE["confirm_queue"] = max(STATE.get("confirm_queue",0), CONFIRM_BARS)
+
+    # 6) ONE-SHOT decision — عندما نتأكد أنها "آخر قمة/قاع"
+    # شروط: قرب من EQH/EQL/FVG + رفضات كافية + ADX يتراجع/RSI يعود للحياد + ربح فوق حد معين
+    last_conf_bar_ok = STATE.get("confirm_queue",0) == 0
+    if targeted_level and STATE.get("rejection_votes",0) >= REJECT_NEED_VOTES and rr >= ONE_SHOT_MIN_PCT and last_conf_bar_ok:
+        # تأكيد إضافي خفيف
+        neutral_rsi = (45 <= rsi <= 55)
+        if neutral_rsi or adx < HOLD_STRONG_ADX or volx < 1.1:
+            # خرووووج مرة واحدة لتقليل العمولات
+            print(colored(f"💥 ONE-SHOT EXIT @{fmt(rr,2)}% — last {STATE['last_level_tag']} confirmed (votes={STATE['rejection_votes']})", "magenta"))
+            close_market_strict("ONE_SHOT_LAST_LEVEL")
+            return
+
+    # 7) Decrement confirm queue (انتظار الشمعة القادمة)
+    if STATE.get("confirm_queue",0) > 0:
+        STATE["confirm_queue"] = max(0, STATE["confirm_queue"]-1)
 
 # =================== LOOP / LOG ===================
 def pretty_snapshot(bal, info, ind, spread_bps, reason=None, df=None):
     left_s = time_to_candle_close(df) if df is not None else 0
-    print(colored("─"*100,"cyan"))
+    print(colored("─"*108,"cyan"))
     print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
-    print(colored("─"*100,"cyan"))
-    print("📈 INDICATORS & RF")
+    print(colored("─"*108,"cyan"))
+    print("📈 RF & INDICATORS")
     print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))}  hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))}")
-    print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}")
-    print(f"   🎯 ENTRY: RF-LIVE ONLY  |  spread_bps={fmt(spread_bps,2)}")
-    print(f"   ⏱️ closes_in ≈ {left_s}s")
-    print("\n🧭 POSITION")
-    bal_line = f"Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
-    print(colored(f"   {bal_line}", "yellow"))
+    print(f"   🧮 RSI={fmt(ind.get('rsi'))}  +DI={fmt(ind.get('plus_di'))}  -DI={fmt(ind.get('minus_di'))}  ADX={fmt(ind.get('adx'))}  ATR={fmt(ind.get('atr'))}  📶 spread={fmt(spread_bps,2)}bps")
+    print(f"   🎯 ENTRY MODE: RF-LIVE ONLY  |  ⏱️ closes_in ≈ {left_s}s")
+    # Orchestra HUD
+    if ORCHESTRA_ENABLED:
+        st = STATE.get("struct") or {}
+        eqh, eql, fvg = st.get("eqh"), st.get("eql"), st.get("fvg")
+        fvg_txt = f"FVG[{(fvg or {}).get('type')}]({fmt((fvg or {}).get('bottom'))}-{fmt((fvg or {}).get('top'))})" if fvg else "—"
+        print(colored(f"   🧠 STRUCT: EQH={fmt(eqh)}  EQL={fmt(eql)}  {fvg_txt}", "yellow"))
+        print(colored(f"   🗳️ Votes: HOLD={STATE.get('hold_votes',0)}  REJECT={STATE.get('rejection_votes',0)}  confirm_wait={STATE.get('confirm_queue',0)}  tag={STATE.get('last_level_tag')}", "yellow"))
+
+    print("\n🧭 POSITION & PNL")
+    bal_line = f"💰 Balance={fmt(bal,2)}  Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x  CompoundPnL={fmt(compound_pnl)}  Eq~{fmt((bal or 0)+compound_pnl,2)}"
+    print(colored(f"   {bal_line}", "white"))
     if STATE["open"]:
         lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
-        print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}")
-        print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%")
+        rr = ((info.get("price") or STATE["entry"])-STATE["entry"])/max(STATE["entry"],1e-9)*100*(1 if STATE["side"]=="long" else -1)
+        print(f"   {lamp}  Entry={fmt(STATE['entry'])}  Qty={fmt(STATE['qty'],4)}  Bars={STATE['bars']}  Trail={fmt(STATE['trail'])}  BE={fmt(STATE['breakeven'])}  RR%={fmt(rr,2)}")
+        print(f"   🎯 TP_done={STATE['profit_targets_achieved']}  HP={fmt(STATE['highest_profit_pct'],2)}%  final_chunk={FINAL_CHUNK_QTY} DOGE")
     else:
         print("   ⚪ FLAT")
         if wait_for_next_signal_side:
             print(colored(f"   ⏳ Waiting for opposite RF: {wait_for_next_signal_side.upper()}", "cyan"))
     if reason: print(colored(f"   ℹ️ reason: {reason}", "white"))
-    print(colored("─"*100,"cyan"))
+    print(colored("─"*108,"cyan"))
 
 def trade_loop():
     global wait_for_next_signal_side
@@ -539,15 +795,19 @@ def trade_loop():
             # PnL snapshot
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
-            # إدارة بعد الدخول
+            # إدارة بعد الدخول (الأساسية)
             manage_after_entry(df, ind, {"price": px or info["price"], **info})
+            # المنظومة الذكية
+            orchestra_post_entry(df, ind, {"price": px or info["price"], **info})
+
             # تأخير الدخول لو السبريد كبير
             reason=None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
             # الدخول من RF فقط
             sig = "buy" if (ENTRY_RF_ONLY and info["long"]) else ("sell" if (ENTRY_RF_ONLY and info["short"]) else None)
-            # سياسة الانتظار العكسية
+
+            # سياسة الانتظار العكسية (بعد أي إغلاق)
             if not STATE["open"] and sig and reason is None:
                 if wait_for_next_signal_side and sig != wait_for_next_signal_side:
                     reason=f"waiting opposite RF: need {wait_for_next_signal_side.upper()}"
@@ -559,6 +819,7 @@ def trade_loop():
                             wait_for_next_signal_side = None
                     else:
                         reason="qty<=0"
+
             pretty_snapshot(bal, {"price": px or info["price"], **info}, ind, spread_bps, reason, df)
             loop_i += 1
             sleep_s = NEAR_CLOSE_S if time_to_candle_close(df)<=10 else BASE_SLEEP
@@ -573,16 +834,24 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-LIVE Bot — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Dynamic TP — Strict Close"
+    return f"✅ RF-LIVE Bot — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Dynamic TP — Strict Close — ORCHESTRA ON"
 
 @app.route("/metrics")
 def metrics():
     return jsonify({
         "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
         "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
-        "state": STATE, "compound_pnl": compound_pnl,
+        "state": {k: (v if k!='struct' else str(v)) for k,v in STATE.items()},
+        "compound_pnl": compound_pnl,
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
-        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY}
+        "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
+        "orchestra": {
+            "enabled": ORCHESTRA_ENABLED,
+            "reject_votes": STATE.get("rejection_votes",0),
+            "hold_votes": STATE.get("hold_votes",0),
+            "last_level_tag": STATE.get("last_level_tag"),
+            "confirm_queue": STATE.get("confirm_queue",0),
+        }
     })
 
 @app.route("/health")
@@ -591,7 +860,8 @@ def health():
         "ok": True, "mode": "live" if MODE_LIVE else "paper",
         "open": STATE["open"], "side": STATE["side"], "qty": STATE["qty"],
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
-        "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side
+        "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
+        "orchestra_enabled": ORCHESTRA_ENABLED
     }), 200
 
 def keepalive_loop():
@@ -611,7 +881,7 @@ def keepalive_loop():
 if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}", "yellow"))
-    print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
+    print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}  •  ORCHESTRA={'ON' if ORCHESTRA_ENABLED else 'OFF'}", "yellow"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
