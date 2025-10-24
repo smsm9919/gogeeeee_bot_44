@@ -648,6 +648,7 @@ def close_partial(frac, reason):
         close_market_strict("FINAL_CHUNK_RULE")
 
 # =================== DEFENSIVE ON OPPOSITE RF WHILE IN POSITION ===================
+defensive_on_opposite_rf_doc = """Do NOT reverse. Defensive partial + tighten trail + collect votes. Full close only after votes+confirm."""
 def defensive_on_opposite_rf(ind: dict, info: dict):
     """Do NOT reverse. Defensive partial + tighten trail + collect votes. Full close only after votes+confirm."""
     if not STATE["open"] or STATE["qty"]<=0: return
@@ -828,6 +829,12 @@ def trade_loop():
             reason=None
             if spread_bps is not None and spread_bps > MAX_SPREAD_BPS:
                 reason=f"spread too high ({fmt(spread_bps,2)}bps > {MAX_SPREAD_BPS})"
+
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # التعديل الوحيد المطلوب: إيقاف التداول عندما ADX < 19 (منع فتح صفقات جديدة فقط)
+            if (reason is None) and (float(ind.get("adx") or 0.0) < 17.0):
+                reason = f"ADX<17 ({fmt(ind.get('adx'))}) — trading paused"
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
             # ENTRY: RF LIVE ONLY (no other entries)
             sig = "buy" if (ENTRY_RF_ONLY and info["long"]) else ("sell" if (ENTRY_RF_ONLY and info["short"]) else None)
