@@ -43,7 +43,7 @@ POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")  # oneway/hedge
 RF_SOURCE = "close"
 RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
 RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_LIVE_ONLY = False
+RF_LIVE_ONLY = True
 RF_HYST_BPS  = 6.0  # hysteresis to reduce live-candle flicker
 
 # Indicators
