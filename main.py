@@ -1,209 +1,229 @@
 # -*- coding: utf-8 -*-
 """
-DOGE/USDT – BingX  • RF+Council OB Bot (Closed-candle fallback)
-- Council hunts bottoms/tops via 6 OB patterns (Normal, PinBar, Doji, Engulfing, Tweezer, Manip/Swipe)
-- If no clean council entry: fallback to Range Filter on the last CLOSED candle
-- Fusion management: TP ladder, BE, ATR-trail, ratchet lock, strict close
-- Clear council logs
+DOGE BingX Futures Bot — Council+Trend & RF-Closed fallback
+- Entry: Council (zones + wicks) OR Trend (EMA/ADX) → else RF closed signal
+- One position at a time (no same-direction stacking)
+- Take-Profit: exactly TWO stages (TP1 partial, TP2 full close)
+- Full-take override: if decent profit + strong wick-cluster in favor → close all
+- Closed-candle only (no live-candle flip entries)
+- Anti-double: per-candle entry lock, cooldown after close, daily trade cap & stop
+- Flask health/metrics
 """
 
 import os, time, math, random, signal, sys, traceback, logging
-from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 import pandas as pd
 import ccxt
 from flask import Flask, jsonify
 
+# ========= الإعدادات (من الكود مباشرة، يمكن تعديلها هنا) =========
+EXCHANGE_NAME   = "bingx"               # BingX Perp via ccxt
+SYMBOL          = "DOGE/USDT:USDT"
+INTERVAL        = "15m"
+LEVERAGE        = 10
+RISK_ALLOC      = 0.60                  # 60% من الرصيد × ليفرج
+POSITION_MODE   = "oneway"              # oneway/hedge
+
+# مؤشرات
+RSI_LEN = 14
+ADX_LEN = 14
+ATR_LEN = 14
+
+# Range Filter (TradingView-like) — نستخدم الشمعة المغلقة فقط
+RF_SOURCE   = "close"
+RF_PERIOD   = 20
+RF_MULT     = 3.5
+RF_HYST_BPS = 8.0                       # فلترة أقوى للإشارة المغلقة
+
+# تريند (يركب الاتجاه)
+EMA_FAST = 21
+EMA_SLOW = 50
+ADX_TREND_MIN = 18.0
+
+# سبريد/حمايات
+MAX_SPREAD_BPS = 8.0
+
+# إدارة الصفقة — جني الأرباح على مرتين
+TP1_PCT       = 0.40     # % من السعر
+TP1_CLOSE_FR  = 0.50     # يغلق 50% في TP1
+TP2_PCT       = 1.20     # يصفّي كل الباقي
+FULL_TAKE_MIN = 0.60     # % حد أدنى للربح لإتاحة Full Take بالذيول
+
+# تهدئة ومنع الازدواج
+COOLDOWN_AFTER_CLOSE_S = 90
+MAX_TRADES_PER_DAY     = 12
+DAILY_STOP_PCT         = 6.0            # إيقاف يومي لو خسرنا X%
+
+# سيرفر
+PORT     = int(os.getenv("PORT", 5000))
+SELF_URL = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
+
+# مفاتيح (لو حطيتها كـ Secrets هتشتغل لايف؛ لو فاضية البوت Paper)
+API_KEY    = os.getenv("BINGX_API_KEY", "")
+API_SECRET = os.getenv("BINGX_API_SECRET", "")
+MODE_LIVE  = bool(API_KEY and API_SECRET)
+
+# ========= لوجينج =========
+def setup_logs():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        fh = RotatingFileHandler("bot.log", maxBytes=3_000_000, backupCount=4, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        logger.addHandler(fh)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+setup_logs()
+
 try:
     from termcolor import colored
 except Exception:
     def colored(t,*a,**k): return t
 
-# =============== ENV ===============
-API_KEY   = os.getenv("BINGX_API_KEY", "")
-API_SECRET= os.getenv("BINGX_API_SECRET", "")
-MODE_LIVE = bool(API_KEY and API_SECRET)
-
-SELF_URL  = os.getenv("SELF_URL", "") or os.getenv("RENDER_EXTERNAL_URL", "")
-PORT      = int(os.getenv("PORT", 5000))
-
-SYMBOL    = os.getenv("SYMBOL", "DOGE/USDT:USDT")
-INTERVAL  = os.getenv("INTERVAL", "15m")
-LEVERAGE  = int(os.getenv("LEVERAGE", 10))
-RISK_ALLOC= float(os.getenv("RISK_ALLOC", 0.60))
-POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "oneway")
-
-# Range Filter
-RF_SOURCE = os.getenv("RF_SOURCE","close")
-RF_PERIOD = int(os.getenv("RF_PERIOD", 20))
-RF_MULT   = float(os.getenv("RF_MULT", 3.5))
-RF_HYST_BPS = float(os.getenv("RF_HYST_BPS", 6))  # فقط للهسترة، إشارة الدخول على الشمعة المغلقة
-USE_RF_CLOSED = True   # ← الدخول بالشمعة المغلقة fallback
-
-# Indicators
-RSI_LEN = int(os.getenv("RSI_LEN",14))
-ADX_LEN = int(os.getenv("ADX_LEN",14))
-ATR_LEN = int(os.getenv("ATR_LEN",14))
-
-MAX_SPREAD_BPS = float(os.getenv("MAX_SPREAD_BPS", 8.0))
-
-# Management
-TP1_PCT_BASE       = float(os.getenv("TP1_PCT_BASE", 0.40))
-TP1_CLOSE_FRAC     = float(os.getenv("TP1_CLOSE_FRAC", 0.50))
-BREAKEVEN_AFTER    = float(os.getenv("BREAKEVEN_AFTER", 0.30))
-TRAIL_ACTIVATE_PCT = float(os.getenv("TRAIL_ACTIVATE_PCT", 1.20))
-ATR_TRAIL_MULT     = float(os.getenv("ATR_TRAIL_MULT", 1.6))
-
-FINAL_CHUNK_QTY    = float(os.getenv("FINAL_CHUNK_QTY", 50.0))   # لوت الدوجي الافتراضي
-RESIDUAL_MIN_QTY   = float(os.getenv("RESIDUAL_MIN_QTY", 9.0))
-
-CLOSE_RETRY_ATTEMPTS = 6
-CLOSE_VERIFY_WAIT_S  = 2.0
-
-BASE_SLEEP   = 5
-NEAR_CLOSE_S = 1
-
-# =============== LOGGING ===============
-def setup_file_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    if not any(isinstance(h, RotatingFileHandler) and getattr(h,"baseFilename","").endswith("bot.log")
-               for h in logger.handlers):
-        fh = RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=7, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-        logger.addHandler(fh)
-    logging.getLogger("werkzeug").setLevel(logging.ERROR)
-    print(colored("🗂️ log rotation ready","cyan"))
-setup_file_logging()
-
-# =============== EXCHANGE ===============
+# ========= بورصة =========
 def make_ex():
-    return ccxt.bingx({
+    ex = ccxt.bingx({
         "apiKey": API_KEY,
         "secret": API_SECRET,
         "enableRateLimit": True,
         "timeout": 20000,
-        "options": {"defaultType":"swap"}
+        "options": {"defaultType": "swap"}
     })
+    return ex
+
 ex = make_ex()
 MARKET = {}
-AMT_PREC=0; LOT_STEP=None; LOT_MIN=None
+AMT_PREC = 0
+LOT_STEP = None
+LOT_MIN  = None
 
 def load_market_specs():
     global MARKET, AMT_PREC, LOT_STEP, LOT_MIN
     try:
         ex.load_markets()
-        MARKET = ex.markets.get(SYMBOL, {})
-        AMT_PREC = int((MARKET.get("precision",{}) or {}).get("amount", 0) or 0)
-        LOT_STEP = (MARKET.get("limits",{}) or {}).get("amount",{}).get("step", None)
-        LOT_MIN  = (MARKET.get("limits",{}) or {}).get("amount",{}).get("min",  None)
-        print(colored(f"🔧 precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}","cyan"))
-    except Exception as e:
-        print(colored(f"⚠️ load_market_specs: {e}","yellow"))
-def ensure_leverage_mode():
-    try:
+        MARKET   = ex.markets.get(SYMBOL, {})
+        AMT_PREC = int((MARKET.get("precision", {}) or {}).get("amount", 0) or 0)
+        LOT_STEP = (MARKET.get("limits", {}) or {}).get("amount", {}).get("step", None)
+        LOT_MIN  = (MARKET.get("limits", {}) or {}).get("amount", {}).get("min",  None)
+        print(colored(f"🔧 precision={AMT_PREC}, step={LOT_STEP}, min={LOT_MIN}", "cyan"))
         try:
             ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
-            print(colored(f"✅ leverage set {LEVERAGE}x","green"))
+            print(colored(f"✅ leverage set {LEVERAGE}x", "green"))
         except Exception as e:
-            print(colored(f"⚠️ set_leverage warn: {e}","yellow"))
-        print(colored(f"📌 position mode: {POSITION_MODE}","cyan"))
+            print(colored(f"⚠️ set_leverage warn: {e}", "yellow"))
     except Exception as e:
-        print(colored(f"⚠️ ensure_leverage_mode: {e}","yellow"))
-try:
-    load_market_specs()
-    ensure_leverage_mode()
-except Exception as e:
-    print(colored(f"⚠️ exchange init: {e}","yellow"))
+        print(colored(f"⚠️ load markets: {e}", "yellow"))
 
-# =============== HELPERS ===============
+load_market_specs()
+
+# ========= أدوات =========
 def _round_amt(q):
     if q is None: return 0.0
     try:
-        d=Decimal(str(q))
+        d = Decimal(str(q))
         if LOT_STEP and isinstance(LOT_STEP,(int,float)) and LOT_STEP>0:
-            step=Decimal(str(LOT_STEP))
-            d=(d/step).to_integral_value(rounding=ROUND_DOWN)*step
-        prec=int(AMT_PREC) if AMT_PREC>=0 else 0
-        d=d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
-        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d<Decimal(str(LOT_MIN)): return 0.0
+            step = Decimal(str(LOT_STEP))
+            d = (d/step).to_integral_value(rounding=ROUND_DOWN)*step
+        prec = int(AMT_PREC) if AMT_PREC and AMT_PREC>=0 else 0
+        d = d.quantize(Decimal(1).scaleb(-prec), rounding=ROUND_DOWN)
+        if LOT_MIN and isinstance(LOT_MIN,(int,float)) and LOT_MIN>0 and d < Decimal(str(LOT_MIN)):
+            return 0.0
         return float(d)
-    except Exception: return max(0.0, float(q))
-def safe_qty(q):
-    q=_round_amt(q)
-    if q<=0: print(colored(f"⚠️ qty invalid after normalize → {q}","yellow"))
+    except Exception:
+        return float(max(0.0, q or 0.0))
+
+def safe_qty(q): 
+    q = _round_amt(q)
+    if q<=0: print(colored(f"⚠️ qty invalid after normalize → {q}", "yellow"))
     return q
-def fmt(v,d=6,na="—"):
+
+def fmt(v, d=6, na="—"):
     try:
-        if v is None or (isinstance(v,float) and (math.isinf(v) or math.isnan(v))): return na
+        if v is None or (isinstance(v,float) and (math.isnan(v) or math.isinf(v))): return na
         return f"{float(v):.{d}f}"
-    except Exception: return na
-def with_retry(fn, tries=3, base=0.4):
+    except Exception:
+        return na
+
+def with_retry(fn, tries=3, base=0.35):
     for i in range(tries):
         try: return fn()
-        except Exception:
+        except Exception as e:
             if i==tries-1: raise
-            time.sleep(base*(2**i)+random.random()*0.25)
+            time.sleep(base*(2**i) + random.random()*0.2)
+
 def fetch_ohlcv(limit=600):
-    rows=with_retry(lambda: ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit, params={"type":"swap"}))
+    rows = with_retry(lambda: ex.fetch_ohlcv(SYMBOL, timeframe=INTERVAL, limit=limit, params={"type":"swap"}))
     return pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+
 def price_now():
     try:
-        t=with_retry(lambda: ex.fetch_ticker(SYMBOL))
+        t = with_retry(lambda: ex.fetch_ticker(SYMBOL))
         return t.get("last") or t.get("close")
     except Exception: return None
+
 def balance_usdt():
     if not MODE_LIVE: return 100.0
     try:
-        b=with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
+        b = with_retry(lambda: ex.fetch_balance(params={"type":"swap"}))
         return b.get("total",{}).get("USDT") or b.get("free",{}).get("USDT")
     except Exception: return None
+
 def orderbook_spread_bps():
     try:
-        ob=with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
-        bid=ob["bids"][0][0] if ob["bids"] else None
-        ask=ob["asks"][0][0] if ob["asks"] else None
+        ob = with_retry(lambda: ex.fetch_order_book(SYMBOL, limit=5))
+        bid = ob["bids"][0][0] if ob["bids"] else None
+        ask = ob["asks"][0][0] if ob["asks"] else None
         if not (bid and ask): return None
-        mid=(bid+ask)/2.0
+        mid = (bid+ask)/2.0
         return ((ask-bid)/mid)*10000.0
-    except Exception: return None
-def _interval_seconds(iv:str)->int:
-    iv=(iv or "").lower().strip()
-    if iv.endswith("m"): return int(float(iv[:-1]))*60
-    if iv.endswith("h"): return int(float(iv[:-1]))*3600
-    if iv.endswith("d"): return int(float(iv[:-1]))*86400
-    return 15*60
-def time_to_candle_close(df: pd.DataFrame)->int:
-    tf=_interval_seconds(INTERVAL)
+    except Exception:
+        return None
+
+def _iv_sec(iv):
+    iv = (iv or "15m").lower()
+    if iv.endswith("m"): return int(iv[:-1])*60
+    if iv.endswith("h"): return int(iv[:-1])*3600
+    if iv.endswith("d"): return int(iv[:-1])*86400
+    return 900
+
+def time_to_close(df):
+    tf = _iv_sec(INTERVAL)
     if len(df)==0: return tf
-    cur=int(df["time"].iloc[-1]); now=int(time.time()*1000)
-    nxt=cur+tf*1000
-    while nxt<=now: nxt+=tf*1000
-    return int(max(0,nxt-now)/1000)
+    cur_start = int(df["time"].iloc[-1])
+    now_ms = int(time.time()*1000)
+    nxt = cur_start + tf*1000
+    while nxt <= now_ms: nxt += tf*1000
+    return int(max(0, nxt-now_ms)/1000)
 
-# =============== INDICATORS ===============
-def wilder_ema(s: pd.Series, n:int):
-    return s.ewm(alpha=1/n, adjust=False).mean()
-def compute_indicators(df: pd.DataFrame):
-    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN)+2:
-        return {"rsi":50,"plus_di":0,"minus_di":0,"adx":0,"atr":0}
-    c,h,l = df["close"].astype(float), df["high"].astype(float), df["low"].astype(float)
-    tr = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
-    atr= wilder_ema(tr, ATR_LEN)
+# ========= مؤشرات و RF-Closed =========
+def wema(s, n): return s.ewm(alpha=1/n, adjust=False).mean()
 
-    delta=c.diff(); up=delta.clip(lower=0); dn=(-delta).clip(lower=0)
-    rs = wilder_ema(up,RSI_LEN)/wilder_ema(dn,RSI_LEN).replace(0,1e-12)
-    rsi = 100-(100/(1+rs))
+def indicators(df: pd.DataFrame):
+    if len(df) < max(ATR_LEN, RSI_LEN, ADX_LEN) + 3:
+        return {"rsi":50.0,"plus_di":0.0,"minus_di":0.0,"adx":0.0,"atr":0.0,"ema_fast":0.0,"ema_slow":0.0}
+    c = df["close"].astype(float)
+    h = df["high"].astype(float)
+    l = df["low"].astype(float)
 
-    upm=h.diff(); dnm=l.shift(1)-l
-    plus_dm = upm.where((upm>dnm)&(upm>0),0.0)
-    minus_dm= dnm.where((dnm>upm)&(dnm>0),0.0)
-    plus_di = 100*(wilder_ema(plus_dm,ADX_LEN)/atr.replace(0,1e-12))
-    minus_di= 100*(wilder_ema(minus_dm,ADX_LEN)/atr.replace(0,1e-12))
-    dx = (100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0)
-    adx = wilder_ema(dx, ADX_LEN)
+    tr  = pd.concat([(h-l).abs(), (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+    atr = wema(tr, ATR_LEN)
+
+    delta=c.diff(); up=delta.clip(lower=0.0); dn=(-delta).clip(lower=0.0)
+    rs = wema(up, RSI_LEN) / wema(dn, RSI_LEN).replace(0,1e-12)
+    rsi = 100 - (100/(1+rs))
+
+    up_move=h.diff(); down_move=l.shift(1)-l
+    plus_dm=up_move.where((up_move>down_move)&(up_move>0),0.0)
+    minus_dm=down_move.where((down_move>up_move)&(down_move>0),0.0)
+    plus_di=100*(wema(plus_dm, ADX_LEN)/atr.replace(0,1e-12))
+    minus_di=100*(wema(minus_dm, ADX_LEN)/atr.replace(0,1e-12))
+    dx=(100*(plus_di-minus_di).abs()/(plus_di+minus_di).replace(0,1e-12)).fillna(0.0)
+    adx=wema(dx, ADX_LEN)
+
+    ema_fast = c.ewm(span=EMA_FAST, adjust=False).mean()
+    ema_slow = c.ewm(span=EMA_SLOW, adjust=False).mean()
 
     i=len(df)-1
     return {
@@ -211,471 +231,393 @@ def compute_indicators(df: pd.DataFrame):
         "plus_di": float(plus_di.iloc[i]),
         "minus_di": float(minus_di.iloc[i]),
         "adx": float(adx.iloc[i]),
-        "atr": float(atr.iloc[i])
+        "atr": float(atr.iloc[i]),
+        "ema_fast": float(ema_fast.iloc[i]),
+        "ema_slow": float(ema_slow.iloc[i]),
     }
 
-# =============== RANGE FILTER (TV-like, CLOSED) ===============
-def _ema(s: pd.Series, n:int): return s.ewm(span=n, adjust=False).mean()
-def _rng_size(src: pd.Series, qty: float, n:int)->pd.Series:
-    avrng = _ema((src-src.shift(1)).abs(), n); wper=(n*2)-1
-    return _ema(avrng, wper)*qty
-def _rng_filter(src: pd.Series, rsize: pd.Series):
+def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
+def _rng_size(src, qty, n):
+    avrng = _ema((src - src.shift(1)).abs(), n); wper=(n*2)-1
+    return _ema(avrng, wper) * qty
+def _rng_filter(src, rsize):
     rf=[float(src.iloc[0])]
     for i in range(1,len(src)):
         prev=rf[-1]; x=float(src.iloc[i]); r=float(rsize.iloc[i]); cur=prev
-        if x-r>prev: cur=x-r
-        if x+r<prev: cur=x+r
+        if x - r > prev: cur = x - r
+        if x + r < prev: cur = x + r
         rf.append(cur)
     filt=pd.Series(rf, index=src.index, dtype="float64")
-    return filt+rsize, filt-rsize, filt
+    return filt + rsize, filt - rsize, filt
+
 def rf_signal_closed(df: pd.DataFrame):
-    """إشارة على الشمعة المُغلقة السابقة فقط."""
-    if len(df) < RF_PERIOD+3:
-        return {"time": int(df["time"].iloc[-1]) if len(df) else int(time.time()*1000),
-                "long": False, "short": False, "filter": float(df["close"].iloc[-1]) if len(df) else 0.0,
-                "hi":0.0,"lo":0.0,"price": float(df["close"].iloc[-1]) if len(df) else 0.0}
-    src=df[RF_SOURCE].astype(float)
-    hi,lo,filt=_rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
-    # استخدم الشمعة المغلقة: -2 بالنسبة للسعر والفِلتر
-    p_prev=float(src.iloc[-3]); p_close=float(src.iloc[-2])
-    f_prev=float(filt.iloc[-3]); f_close=float(filt.iloc[-2])
-    long_flip  = (p_prev<=f_prev and p_close>f_close and abs((p_close-f_close)/f_close)*10000.0>=RF_HYST_BPS)
-    short_flip = (p_prev>=f_prev and p_close<f_close and abs((p_close-f_close)/f_close)*10000.0>=RF_HYST_BPS)
-    return {
-        "time": int(df["time"].iloc[-2]),
-        "price": float(df["close"].iloc[-1]),   # السعر الحالي للتنفيذ
-        "long": bool(long_flip),
-        "short": bool(short_flip),
-        "filter": f_close, "hi": float(hi.iloc[-2]), "lo": float(lo.iloc[-2])
-    }
+    """إشارة RF على الشمعة المغلقة (نقارن آخر شمعتين مغلقتين)."""
+    if len(df) < RF_PERIOD + 3:
+        i=-2 if len(df)>=2 else -1
+        price = float(df["close"].iloc[i])
+        return {"time": int(df["time"].iloc[i]), "price": price,
+                "long": False, "short": False, "filter": price, "hi": price, "lo": price}
+    d = df.iloc[:-1]  # نستخدم المغلقة فقط
+    src = d[RF_SOURCE].astype(float)
+    hi, lo, filt = _rng_filter(src, _rng_size(src, RF_MULT, RF_PERIOD))
+    p_now = float(src.iloc[-1]); p_prev=float(src.iloc[-2])
+    f_now = float(filt.iloc[-1]); f_prev=float(filt.iloc[-2])
+    def _bps(a,b): 
+        try: return abs((a-b)/b)*10000.0
+        except Exception: return 0.0
+    long_flip  = (p_prev<=f_prev and p_now>f_now and _bps(p_now,f_now)>=RF_HYST_BPS)
+    short_flip = (p_prev>=f_prev and p_now<f_now and _bps(p_now,f_now)>=RF_HYST_BPS)
+    return {"time": int(d["time"].iloc[-1]), "price": p_now, "long": bool(long_flip), "short": bool(short_flip),
+            "filter": f_now, "hi": float(hi.iloc[-1]), "lo": float(lo.iloc[-1])}
 
-# =============== OB / COUNCIL ==================
-def _body_wicks(o,h,l,c):
-    rng=max(h-l,1e-12); body=abs(c-o)
-    upper=h-max(o,c); lower=min(o,c)-l
-    return rng, body, upper, lower
-
-def detect_ob_type(prev_o, prev_h, prev_l, prev_c, o, h, l, c):
-    """يصنف نوع الـ OB الصاعد من شمعتين (تقريبي – للصيد فقط)."""
-    # normal: شمعة حمراء صغيرة ثم خضراء اندفاعية
-    rng1, body1, *_ = _body_wicks(prev_o, prev_h, prev_l, prev_c)
-    rng2, body2, up2, lo2 = _body_wicks(o, h, l, c)
-
-    res=None; score=0
-    if prev_c<prev_o and body1<=0.5*rng1 and c>o and body2>=0.6*rng2:
-        res=("NORMAL", 1)
-
-    # pin bar: ذيل سفلي طويل في الشمعة الثانية
-    if c>o and (lo2/rng2)>=0.55:
-        res=("PINBAR", max(score,2))
-
-    # doji: جسم صغير جداً في الشمعة الثانية
-    if rng2>0 and (body2/rng2)<=0.12 and c>o:
-        res=("DOJI", max(score,1))
-
-    # engulfing: الشمعة الثانية تغطي الأولى
-    if c>o and (o<=prev_c) and (c>=prev_o):
-        res=("ENGULFING", 3)
-
-    # tweezer bottom: قاعين متقاربين
-    if abs(l-prev_l)/max(l,1e-9) <= 0.0015 and c>o:
-        res=("TWEEZER", 3)
-
-    # manip/swipe: نزول يكسر لوّ سابق ثم ارتداد قوي وإغلاق فوقه
-    if l<prev_l and c>o and c>prev_o:
-        res=("MANIP", 3)
-
-    return res  # (name, score) or None
-
-def build_demand_zone(prev_o, prev_h, prev_l, prev_c):
-    # نعمل box تحت آخر شمعة حمراء: [low, high] = demand
-    bot=min(prev_o, prev_c, prev_l); top=max(prev_o, prev_c, prev_l)
-    return {"side":"demand","bot":bot,"top":top}
-
-def find_recent_bull_ob(df: pd.DataFrame):
-    """يرجع أقوى OB صاعد قريب + نوعه + درجته"""
-    if len(df)<5: return None
-    d=df.iloc[:-1]  # استخدم شموع مغلقة
-    for i in range(len(d)-2, 1, -1):
-        prev_o,prev_h,prev_l,prev_c = map(float, d[["open","high","low","close"]].iloc[i-1])
-        o,h,l,c = map(float, d[["open","high","low","close"]].iloc[i])
-        clas = detect_ob_type(prev_o,prev_h,prev_l,prev_c,o,h,l,c)
-        if clas:
-            name,score=clas
-            zone=build_demand_zone(prev_o,prev_h,prev_l,prev_c)
-            return {"name":name,"score":score,"zone":zone,"time":int(d["time"].iloc[i])}
-    return None
-
-def near(px, lvl, bps=12.0):
+# ========= مجلس الإدارة (اصطياد قمم/قيعان + ذيول) =========
+def _near(px, lvl, bps):
     try: return abs((px-lvl)/lvl)*10000.0 <= bps
     except Exception: return False
 
-class Council:
-    def __init__(self):
-        self.open=False; self.side=None; self.entry=None
-        self.min_votes_entry=4; self.min_votes_exit=3
-        self._last_log=None  # يخزن آخر لوج منسق
+def swing_points(df, left=2, right=2):
+    if len(df) < left+right+3: return [], []
+    h=df["high"].astype(float).values; l=df["low"].astype(float).values
+    ph=[None]*len(df); pl=[None]*len(df)
+    for i in range(left, len(df)-right):
+        if all(h[i]>=h[j] for j in range(i-left, i+right+1)): ph[i]=h[i]
+        if all(l[i]<=l[j] for j in range(i-left, i+right+1)): pl[i]=l[i]
+    return ph, pl
 
-    def vote(self, df: pd.DataFrame, ind: dict):
-        """يجمع الأصوات وأسبابها + log واضح."""
-        votes_buy=votes_sell=0; reasons_b=[]; reasons_s=[]
-        price=float(df["close"].iloc[-1])
+def detect_zones(df):
+    d = df.iloc[:-1] if len(df)>=2 else df.copy()
+    ph, pl = swing_points(d,2,2)
+    highs=[p for p in ph if p is not None][-12:]
+    lows =[p for p in pl if p is not None][-12:]
+    sup=dem=None
+    if highs:
+        top=max(highs); bot=top - (top-min(highs))*0.25 if len(highs)>1 else top*0.996
+        sup={"top":top,"bot":bot}
+    if lows:
+        bot=min(lows); top=bot + (max(lows)-bot)*0.25 if len(lows)>1 else bot*1.004
+        dem={"top":top,"bot":bot}
+    return {"supply":sup,"demand":dem}
 
-        # 1) OB detection
-        ob=find_recent_bull_ob(df)
-        if ob:
-            z=ob["zone"]
-            touched = (float(df["low"].iloc[-1])<=z["top"]) or near(float(df["low"].iloc[-1]), z["top"])
-            if touched:
-                votes_buy += min(3, ob["score"])
-                reasons_b.append(f"OB:{ob['name']}@{fmt(z['bot'])}~{fmt(z['top'])} (+{min(3,ob['score'])})")
+def wick_rejection(df):
+    if len(df)<2: return {"bull":False,"bear":False,"strength":0}
+    o=float(df["open"].iloc[-1]); h=float(df["high"].iloc[-1])
+    l=float(df["low"].iloc[-1]);  c=float(df["close"].iloc[-1])
+    rng=max(h-l,1e-12); upper=h-max(o,c); lower=min(o,c)-l
+    bull = (lower/rng)>=0.55 and c>o
+    bear = (upper/rng)>=0.55 and c<o
+    strength = max(upper, lower)/rng
+    return {"bull":bull,"bear":bear,"strength":float(strength)}
 
-        # 2) RSI محايد وانعكاس لأعلى/لأسفل
-        rsi=ind.get("rsi",50.0); o=float(df["open"].iloc[-1]); c=float(df["close"].iloc[-1])
-        if 45<=rsi<=55:
-            if c>o: votes_buy+=1; reasons_b.append("RSI neutral ↗")
-            if c<o: votes_sell+=1; reasons_s.append("RSI neutral ↘")
+def council_entry(df, ind):
+    zones = detect_zones(df)
+    w = wick_rejection(df)
+    px = float(df["close"].iloc[-1])
+    # لمس منطقة + ذيل رفض قوي → دخول معاكس
+    if zones["demand"]:
+        near_dem = (px<=zones["demand"]["top"]) or _near(px,zones["demand"]["top"],12.0)
+        if near_dem and w["bull"]: return {"side":"buy", "reason":"Reject@Demand wick"}
+    if zones["supply"]:
+        near_sup = (px>=zones["supply"]["bot"]) or _near(px,zones["supply"]["bot"],12.0)
+        if near_sup and w["bear"]: return {"side":"sell","reason":"Reject@Supply wick"}
+    # لو في اتجاه واضح (EMA/ADX) نركب التريند
+    if ind["ema_fast"]>ind["ema_slow"] and ind["adx"]>=ADX_TREND_MIN:
+        return {"side":"buy","reason":"Trend EMA↑ + ADX"}
+    if ind["ema_fast"]<ind["ema_slow"] and ind["adx"]>=ADX_TREND_MIN:
+        return {"side":"sell","reason":"Trend EMA↓ + ADX"}
+    return None
 
-        # 3) +DI/-DI مع ADX
-        pdi,mdi,adx = ind.get("plus_di",0), ind.get("minus_di",0), ind.get("adx",0)
-        if adx>=18 and pdi>mdi: votes_buy+=1; reasons_b.append("+DI>−DI & ADX")
-        if adx>=18 and mdi>pdi: votes_sell+=1; reasons_s.append("−DI>+DI & ADX")
+def full_take_signal(rr_pct, df, ind):
+    """قفل كامل لو ربح محترم + ذيول جماعية مؤيدة."""
+    if rr_pct < FULL_TAKE_MIN: 
+        return False
+    w = wick_rejection(df)
+    if rr_pct>TP2_PCT*0.9:  # قريب من TP2
+        return True
+    return (w["bull"] and rr_pct>FULL_TAKE_MIN) or (w["bear"] and rr_pct>FULL_TAKE_MIN)
 
-        # 4) شموع (هامر/شوتنج ستار)
-        rng, body, up, lo = _body_wicks(o,float(df["high"].iloc[-1]),float(df["low"].iloc[-1]),c)
-        if (lo/rng)>=0.6 and c>o: votes_buy+=1; reasons_b.append("Hammer-like")
-        if (up/rng)>=0.6 and c<o: votes_sell+=1; reasons_s.append("Shooting-like")
-
-        # 5) ATR انفجار حجم/مدى (خفيف)
-        atr=float(ind.get("atr") or 0.0)
-        if atr>0 and abs(c-o)/atr>=1.2: 
-            if c>o: votes_buy+=1; reasons_b.append("Body≥1.2×ATR")
-            else:   votes_sell+=1; reasons_s.append("Body≥1.2×ATR (down)")
-
-        # صياغة اللوج المنسق
-        council_log = (
-            f"🏛 Council | buy={votes_buy} [{', '.join(reasons_b) or '—'}] "
-            f"| sell={votes_sell} [{', '.join(reasons_s) or '—'}]"
-        )
-        self._last_log=council_log
-        print(colored(council_log, "green" if votes_buy>votes_sell else "red" if votes_sell>votes_buy else "cyan"))
-
-        return votes_buy, reasons_b, votes_sell, reasons_s, ob
-
-    def entry_decision(self, df, ind):
-        b, rb, s, rs, ob = self.vote(df, ind)
-        if not self.open:
-            if b >= self.min_votes_entry:
-                self.open=True; self.side="long"; self.entry=float(df["close"].iloc[-1])
-                return {"side":"buy", "reason": f"council {b}✓ :: {rb}", "ob": ob}
-            if s >= self.min_votes_entry:
-                self.open=True; self.side="short"; self.entry=float(df["close"].iloc[-1])
-                return {"side":"sell","reason": f"council {s}✓ :: {rs}", "ob": None}
-        return None
-
-    def exit_decision(self, df, ind):
-        if not self.open: return None
-        # خروج بسيط: ADX يبرد + RSI يعود للحياد + شمعة معاكسة قوية
-        rsi=ind.get("rsi",50.0); adx=ind.get("adx",0.0)
-        o=float(df["open"].iloc[-1]); c=float(df["close"].iloc[-1])
-        counter=(c<o and self.side=="long") or (c>o and self.side=="short")
-        votes=0; reasons=[]
-        if 45<=rsi<=55: votes+=1; reasons.append("RSI neutral")
-        if adx<18:      votes+=1; reasons.append("ADX cool-off")
-        if counter:     votes+=1; reasons.append("Counter candle")
-        if votes>=self.min_votes_exit:
-            self.open=False; self.side=None; self.entry=None
-            return {"action":"close","reason":" / ".join(reasons)}
-        return None
-
-council = Council()
-
-# =============== STATE/ORDERS ===============
+# ========= الحالة =========
 STATE = {
-    "open":False,"side":None,"entry":None,"qty":0.0,"pnl":0.0,"bars":0,
-    "trail":None,"breakeven":None,"tp1_done":False,
-    "highest_profit_pct":0.0,"profit_targets_achieved":0
+    "open": False, "side": None, "entry": None, "qty": 0.0,
+    "tp1_done": False, "bars": 0, "trail": None,
 }
-compound_pnl=0.0
+compound_pnl = 0.0
 
+SAFE = {
+    "BAR_LOCK": None,                # لا دخول أكثر من مرة في نفس الشمعة
+    "LAST_CLOSE_AT": 0.0,
+    "JUST_CLOSED_UNTIL": 0.0,
+    "TRADES_TODAY": 0,
+    "DAY_KEY": datetime.utcnow().date().isoformat(),
+    "START_EQUITY": None,
+    "LOSS_STOP_ACTIVE": False,
+}
+
+def reset_day_if_needed(bal):
+    today = datetime.utcnow().date().isoformat()
+    if SAFE["DAY_KEY"] != today:
+        SAFE["DAY_KEY"] = today
+        SAFE["TRADES_TODAY"] = 0
+        SAFE["LOSS_STOP_ACTIVE"] = False
+        SAFE["START_EQUITY"] = (bal or 0.0) + (compound_pnl or 0.0)
+
+def equity_now(bal): return (bal or 0.0) + (compound_pnl or 0.0)
+
+def daily_stop_hit(bal):
+    if SAFE["START_EQUITY"] is None:
+        SAFE["START_EQUITY"] = equity_now(bal)
+    drop = SAFE["START_EQUITY"] - equity_now(bal)
+    if SAFE["START_EQUITY"]>0:
+        dd = (drop/SAFE["START_EQUITY"])*100.0
+        if dd >= DAILY_STOP_PCT: SAFE["LOSS_STOP_ACTIVE"]=True
+    return SAFE["LOSS_STOP_ACTIVE"]
+
+# ========= أوامر =========
 def _params_open(side):
     if POSITION_MODE=="hedge":
         return {"positionSide":"LONG" if side=="buy" else "SHORT", "reduceOnly":False}
-    return {"positionSide":"BOTH","reduceOnly":False}
+    return {"positionSide":"BOTH", "reduceOnly":False}
+
 def _params_close():
     if POSITION_MODE=="hedge":
-        return {"positionSide":"LONG" if STATE.get("side")=="long" else "SHORT","reduceOnly":True}
-    return {"positionSide":"BOTH","reduceOnly":True}
+        return {"positionSide":"LONG" if STATE.get("side")=="long" else "SHORT", "reduceOnly":True}
+    return {"positionSide":"BOTH", "reduceOnly":True}
 
 def _read_position():
     try:
-        poss=ex.fetch_positions(params={"type":"swap"})
+        poss = ex.fetch_positions(params={"type":"swap"})
         for p in poss:
-            sym=(p.get("symbol") or p.get("info",{}).get("symbol") or "")
+            sym = p.get("symbol") or p.get("info",{}).get("symbol") or ""
             if SYMBOL.split(":")[0] not in sym: continue
-            qty=abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
-            if qty<=0: return 0.0,None,None
-            entry=float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
-            side_raw=(p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
-            side="long" if "long" in side_raw or float(p.get("cost",0))>0 else "short"
+            qty = abs(float(p.get("contracts") or p.get("info",{}).get("positionAmt") or 0))
+            if qty<=0: return 0.0, None, None
+            entry = float(p.get("entryPrice") or p.get("info",{}).get("avgEntryPrice") or 0)
+            side_raw = (p.get("side") or p.get("info",{}).get("positionSide") or "").lower()
+            side = "long" if ("long" in side_raw or float(p.get("cost",0))>0) else "short"
             return qty, side, entry
     except Exception as e:
         logging.error(f"_read_position: {e}")
-    return 0.0,None,None
+    return 0.0, None, None
 
 def compute_size(balance, price):
-    cap=(balance or 0.0)*RISK_ALLOC*LEVERAGE
-    raw=max(0.0, cap/max(float(price or 0.0), 1e-9))
+    cap = (balance or 0.0) * RISK_ALLOC * LEVERAGE
+    raw = max(0.0, cap/max(price or 1e-9, 1e-9))
     return safe_qty(raw)
 
 def open_market(side, qty, price, tag=""):
-    if qty<=0: print(colored("❌ skip open (qty<=0)","red")); return False
+    now = time.time()
+    if STATE["open"]:
+        print(colored("⏸️ position already open — skip", "yellow")); return False
+    if SAFE["LOSS_STOP_ACTIVE"]:
+        print(colored("⛔ daily stop active — skip open", "red")); return False
+    if SAFE["TRADES_TODAY"] >= MAX_TRADES_PER_DAY:
+        print(colored("⛔ max trades per day reached", "red")); return False
+    if now - SAFE["LAST_CLOSE_AT"] < COOLDOWN_AFTER_CLOSE_S:
+        print(colored("⏳ cooldown after close — skip", "yellow")); return False
+    if qty<=0:
+        print(colored("❌ qty<=0", "red")); return False
     if MODE_LIVE:
         try:
             try: ex.set_leverage(LEVERAGE, SYMBOL, params={"side":"BOTH"})
             except Exception: pass
             ex.create_order(SYMBOL,"market",side,qty,None,_params_open(side))
         except Exception as e:
-            print(colored(f"❌ open: {e}","red")); logging.error(f"open_market: {e}"); return False
-    STATE.update({
-        "open":True, "side":"long" if side=="buy" else "short", "entry":price,
-        "qty":qty, "pnl":0.0, "bars":0, "trail":None, "breakeven":None,
-        "tp1_done":False, "highest_profit_pct":0.0, "profit_targets_achieved":0
-    })
-    print(colored(f"🚀 OPEN {('🟩 LONG' if side=='buy' else '🟥 SHORT')} qty={fmt(qty,4)} @ {fmt(price)} {tag}","green" if side=='buy' else "red"))
+            print(colored(f"❌ open: {e}", "red")); logging.error(f"open_market: {e}"); return False
+    STATE.update({"open":True, "side":"long" if side=="buy" else "short",
+                  "entry":price, "qty":qty, "tp1_done":False, "bars":0, "trail":None})
+    SAFE["TRADES_TODAY"] += 1
+    print(colored(f"🚀 OPEN {('🟩 LONG' if side=='buy' else '🟥 SHORT')} qty={fmt(qty,4)} @ {fmt(price)} {tag}",
+                  "green" if side=='buy' else "red"))
     return True
 
-def close_market_strict(reason="STRICT"):
+def close_market_strict(reason="CLOSE"):
     global compound_pnl
+    now = time.time()
+    if now < SAFE["JUST_CLOSED_UNTIL"]:
+        print(colored("🧯 close already triggered — skip duplicate", "yellow")); return
+    SAFE["JUST_CLOSED_UNTIL"] = now + 3.0
+
     exch_qty, exch_side, exch_entry = _read_position()
-    if exch_qty<=0 and not STATE.get("open"): return
-    if exch_qty<=0 and STATE.get("open"):
-        # ورقي
-        px = price_now() or STATE["entry"]; entry=STATE["entry"]; side=STATE["side"]
-        pnl=(px-entry)*STATE["qty"]*(1 if side=="long" else -1)
-        compound_pnl+=pnl
-        print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
-        STATE.update({"open":False,"side":None,"entry":None,"qty":0.0})
+    if exch_qty<=0 and not STATE["open"]:
         return
-    side_to_close="sell" if exch_side=="long" else "buy"
-    qty_to_close=safe_qty(exch_qty)
-    attempts=0; last=None
-    while attempts<CLOSE_RETRY_ATTEMPTS:
-        try:
-            if MODE_LIVE:
-                params=_params_close(); params["reduceOnly"]=True
-                ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
-            time.sleep(CLOSE_VERIFY_WAIT_S)
-            left,_,_= _read_position()
-            if left<=0:
-                px=price_now() or STATE.get("entry") or exch_entry
-                entry_px=STATE.get("entry") or exch_entry or px
-                side=STATE.get("side") or exch_side
-                qty=exch_qty
-                pnl=(px-entry_px)*qty*(1 if side=="long" else -1)
-                compound_pnl+=pnl
-                print(colored(f"🔚 STRICT CLOSE {side} reason={reason} pnl={fmt(pnl)} total={fmt(compound_pnl)}","magenta"))
-                STATE.update({"open":False,"side":None,"entry":None,"qty":0.0})
-                return
-            qty_to_close=safe_qty(left); attempts+=1
-            print(colored(f"⚠️ strict close retry {attempts} residual={fmt(left,4)}","yellow"))
-        except Exception as e:
-            last=e; attempts+=1; time.sleep(CLOSE_VERIFY_WAIT_S)
-    print(colored(f"❌ STRICT CLOSE FAILED last_error={last}","red"))
+    side_to_close = "sell" if (STATE.get("side")=="long" or exch_side=="long") else "buy"
+    qty_to_close  = safe_qty(STATE.get("qty") or exch_qty)
+    if qty_to_close<=0:
+        STATE.update({"open":False,"side":None,"entry":None,"qty":0.0})
+        SAFE["LAST_CLOSE_AT"]=now; SAFE["BAR_LOCK"]=None
+        return
+
+    try:
+        if MODE_LIVE:
+            params=_params_close(); params["reduceOnly"]=True
+            ex.create_order(SYMBOL,"market",side_to_close,qty_to_close,None,params)
+        time.sleep(1.5)
+        px = price_now() or STATE.get("entry") or exch_entry
+        entry_px = STATE.get("entry") or exch_entry or px
+        side = STATE.get("side") or exch_side or ("long" if side_to_close=="sell" else "short")
+        pnl = (px - entry_px) * qty_to_close * (1 if side=="long" else -1)
+        compound_pnl += pnl
+    except Exception as e:
+        logging.error(f"close_market_strict: {e}")
+    finally:
+        STATE.update({"open":False,"side":None,"entry":None,"qty":0.0})
+        SAFE["LAST_CLOSE_AT"]=now; SAFE["BAR_LOCK"]=None
+        print(colored(f"🔚 CLOSE reason={reason} totalPnL={fmt(compound_pnl)}", "magenta"))
 
 def close_partial(frac, reason):
     if not STATE["open"] or STATE["qty"]<=0: return
-    qty_close=safe_qty(max(0.0, STATE["qty"]*min(max(frac,0.0),1.0)))
-    px=price_now() or STATE["entry"]
-    min_unit=max(RESIDUAL_MIN_QTY, LOT_MIN or RESIDUAL_MIN_QTY)
-    if qty_close<min_unit:
-        print(colored(f"⏸️ skip partial (amount={fmt(qty_close,4)} < min_unit={fmt(min_unit,4)})","yellow")); return
-    side="sell" if STATE["side"]=="long" else "buy"
+    qty = safe_qty(STATE["qty"] * min(max(frac,0.0),1.0))
+    if qty<=0: return
+    side = "sell" if STATE["side"]=="long" else "buy"
     if MODE_LIVE:
-        try: ex.create_order(SYMBOL,"market",side,qty_close,None,_params_close())
-        except Exception as e: print(colored(f"❌ partial: {e}","red")); return
-    pnl=(px-STATE["entry"])*qty_close*(1 if STATE["side"]=="long" else -1)
-    STATE["qty"]=safe_qty(STATE["qty"]-qty_close)
-    print(colored(f"🔻 PARTIAL {reason} closed={fmt(qty_close,4)} pnl={fmt(pnl)} rem={fmt(STATE['qty'],4)}","magenta"))
-    if STATE["qty"]<=FINAL_CHUNK_QTY and STATE["qty"]>0:
-        close_market_strict("FINAL_CHUNK_RULE")
+        try:
+            params=_params_close(); params["reduceOnly"]=True
+            ex.create_order(SYMBOL,"market",side,qty,None,params)
+        except Exception as e:
+            print(colored(f"❌ partial close: {e}", "red")); return
+    px = price_now() or STATE["entry"]
+    pnl = (px - STATE["entry"]) * qty * (1 if STATE["side"]=="long" else -1)
+    print(colored(f"🔻 PARTIAL {reason} qty={fmt(qty,4)} pnl={fmt(pnl)}", "magenta"))
+    STATE["qty"] = safe_qty(STATE["qty"] - qty)
+    if STATE["qty"]<=0: 
+        close_market_strict("PARTIAL_ALL_DONE")
 
-# =============== MANAGEMENT ===============
-def _consensus(ind, price, filt, side):
-    score=0.0
-    adx=float(ind.get("adx") or 0.0); rsi=float(ind.get("rsi") or 50.0)
-    if (side=="long" and rsi>=55) or (side=="short" and rsi<=45): score+=1.0
-    if adx>=28: score+=1.0
-    elif adx>=20: score+=0.5
-    try:
-        if abs(price-filt)/max(filt,1e-9) >= (RF_HYST_BPS/10000.0): score+=0.5
-    except Exception: pass
-    return score
-def _tp_ladder(info, ind, side):
-    px=info["price"]; atr=float(ind.get("atr") or 0.0)
-    atr_pct=(atr/max(px,1e-9))*100.0 if px else 0.5
-    score=_consensus(ind, px, info.get("filter",px), side)
-    mults = [1.8,3.2,5.0] if score>=2.5 else [1.6,2.8,4.5] if score>=1.5 else [1.2,2.4,4.0]
-    return [round(m*atr_pct,2) for m in mults],[0.25,0.30,0.45]
-
-def manage_after_entry(df, ind, info):
+# ========= الإدارة بعد الدخول (TP1/TP2 فقط + FullTake) =========
+def manage_position(df, ind, px):
     if not STATE["open"] or STATE["qty"]<=0: return
-    px=info["price"]; entry=STATE["entry"]; side=STATE["side"]
-    rr=(px-entry)/entry*100*(1 if side=="long" else -1)
+    entry = STATE["entry"]; side = STATE["side"]
+    rr = (px - entry)/entry*100.0 * (1 if side=="long" else -1)
 
-    # TP1 + Breakeven
-    tp1_now=TP1_PCT_BASE*(2.2 if ind.get("adx",0)>=35 else 1.8 if ind.get("adx",0)>=28 else 1.0)
-    if (not STATE["tp1_done"]) and rr>=tp1_now:
-        close_partial(TP1_CLOSE_FRAC, f"TP1@{tp1_now:.2f}%"); STATE["tp1_done"]=True
-        if rr>=BREAKEVEN_AFTER: STATE["breakeven"]=entry
+    # Full take لو ربح محترم + ذيول
+    if full_take_signal(rr, df, ind):
+        close_market_strict("FULL_TAKE_WICKS")
+        return
 
-    # Dynamic ladder
-    dyn_tps,dyn_fracs=_tp_ladder(info, ind, side)
-    k=int(STATE.get("profit_targets_achieved",0))
-    if k<len(dyn_tps) and rr>=dyn_tps[k]:
-        close_partial(dyn_fracs[k], f"TP_dyn@{dyn_tps[k]:.2f}%")
-        STATE["profit_targets_achieved"]=k+1
+    # TP1 → يغلق 50% فقط مرّة واحدة
+    if (not STATE["tp1_done"]) and rr >= TP1_PCT:
+        close_partial(TP1_CLOSE_FR, f"TP1@{TP1_PCT:.2f}%")
+        STATE["tp1_done"] = True
 
-    # Ratchet
-    if rr>STATE["highest_profit_pct"]: STATE["highest_profit_pct"]=rr
-    if STATE["highest_profit_pct"]>=TRAIL_ACTIVATE_PCT and rr<STATE["highest_profit_pct"]*0.60:
-        close_partial(0.50, f"Ratchet {STATE['highest_profit_pct']:.2f}%→{rr:.2f}%")
+    # TP2 → يغلق كل المتبقي
+    if rr >= TP2_PCT:
+        close_market_strict(f"TP2@{TP2_PCT:.2f}%")
 
-    # ATR trail
-    atr=float(ind.get("atr") or 0.0)
-    if rr>=TRAIL_ACTIVATE_PCT and atr>0:
-        gap=atr*ATR_TRAIL_MULT
-        if side=="long":
-            new=px-gap; STATE["trail"]=max(STATE["trail"] or new, new)
-            if STATE["breakeven"] is not None: STATE["trail"]=max(STATE["trail"], STATE["breakeven"])
-            if px<STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
-        else:
-            new=px+gap; STATE["trail"]=min(STATE["trail"] or new, new)
-            if STATE["breakeven"] is not None: STATE["trail"]=min(STATE["trail"], STATE["breakeven"])
-            if px>STATE["trail"]: close_market_strict(f"TRAIL_ATR({ATR_TRAIL_MULT}x)")
-
-# =============== UI LOG ===============
-def pretty_snapshot(bal, info, ind, spread_bps, extra=None, df=None):
-    left_s=time_to_candle_close(df) if df is not None else 0
-    print(colored("─"*110,"cyan"))
-    print(colored(f"📊 {SYMBOL} {INTERVAL} • {'LIVE' if MODE_LIVE else 'PAPER'} • {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC","cyan"))
-    print(colored("─"*110,"cyan"))
-    print("📈 INDICATORS")
-    print(f"   💲 Price {fmt(info.get('price'))} | RF filt={fmt(info.get('filter'))} hi={fmt(info.get('hi'))} lo={fmt(info.get('lo'))} | spread={fmt(spread_bps,2)}bps")
-    print(f"   🧮 RSI={fmt(ind.get('rsi'))} +DI={fmt(ind.get('plus_di'))} -DI={fmt(ind.get('minus_di'))} ADX={fmt(ind.get('adx'))} ATR={fmt(ind.get('atr'))}")
-    if extra and extra.get("council_log"):
-        print(colored(extra["council_log"], "green"))
-    print(f"   ⏱️ closes_in ≈ {left_s}s")
-
-    print("\n🧭 POSITION")
-    bal_line=f"Balance={fmt(bal,2)} Risk={int(RISK_ALLOC*100)}%×{LEVERAGE}x CompoundPnL={fmt(compound_pnl)} Eq~{fmt((bal or 0)+compound_pnl,2)}"
-    print(colored(f"   {bal_line}","yellow"))
+# ========= الطباعة/اللوج لمجلس الإدارة =========
+def print_council_log(df, ind, rf, reason_entry=None, reason_skip=None):
+    tz = time_to_close(df)
+    s = (
+        f"\n━━━━━━━━━━━━━━━━ COUNCIL VIEW ━━━━━━━━━━━━━━━━\n"
+        f"Symbol {SYMBOL}  TF {INTERVAL}  Mode {'LIVE' if MODE_LIVE else 'PAPER'}\n"
+        f"Price {fmt(rf['price'])}  RF={fmt(rf['filter'])}  spread≈{fmt(orderbook_spread_bps(),2)} bps  closes_in≈{tz}s\n"
+        f"ADX {fmt(ind['adx'])}  RSI {fmt(ind['rsi'])}  +DI {fmt(ind['plus_di'])}  -DI {fmt(ind['minus_di'])}\n"
+        f"EMA Fast {fmt(ind['ema_fast'])}  Slow {fmt(ind['ema_slow'])}\n"
+    )
+    if reason_entry: s += f"ENTRY ⟶ {reason_entry}\n"
+    if reason_skip:  s += f"SKIP  ⟶ {reason_skip}\n"
     if STATE["open"]:
-        lamp='🟩 LONG' if STATE['side']=='long' else '🟥 SHORT'
-        print(f"   {lamp} Entry={fmt(STATE['entry'])} Qty={fmt(STATE['qty'],4)} Bars={STATE['bars']} Trail={fmt(STATE['trail'])} BE={fmt(STATE['breakeven'])}")
-        print(f"   🎯 TP_done={STATE['profit_targets_achieved']} HP={fmt(STATE['highest_profit_pct'],2)}%")
+        s += f"POSITION ⟶ {'LONG' if STATE['side']=='long' else 'SHORT'}  entry {fmt(STATE['entry'])} qty {fmt(STATE['qty'],4)} tp1_done={STATE['tp1_done']}\n"
     else:
-        print("   ⚪ FLAT")
-    if extra and extra.get("reason"): print(colored(f"   ℹ️ reason: {extra['reason']}","white"))
-    print(colored("─"*110,"cyan"))
+        s += "POSITION ⟶ FLAT\n"
+    s +=   "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    print(colored(s, "cyan"))
 
-# =============== MAIN LOOP ===============
-app=Flask(__name__)
-
-def trade_loop():
+# ========= الحلقة الرئيسية =========
+def loop():
     while True:
         try:
-            bal=balance_usdt()
-            df = fetch_ohlcv()
-            ind=compute_indicators(df)
-            spread=orderbook_spread_bps()
+            bal = balance_usdt()
+            reset_day_if_needed(bal)
+            if daily_stop_hit(bal):
+                print(colored("🛑 Daily stop active — pause today", "red"))
+                time.sleep(30); continue
 
-            # Council decisions (logs happen inside)
-            entry_council = council.entry_decision(df, ind)
-            exit_council  = council.exit_decision(df, ind)
+            df  = fetch_ohlcv()
+            ind = indicators(df)
+            rf  = rf_signal_closed(df)
+            px  = price_now() or rf["price"]
 
-            info_rf = rf_signal_closed(df) if USE_RF_CLOSED else {"price": price_now()}
+            # تحديث إدارة الصفقة
+            if STATE["open"]: 
+                manage_position(df, ind, px)
 
-            # Exit first
-            if STATE["open"] and exit_council:
-                print(colored(f"🏛 Council EXIT → {exit_council['reason']}","yellow"))
-                close_market_strict(f"COUNCIL_EXIT: {exit_council['reason']}")
+            # حارس سبريد و ADX
+            reason_skip = None
+            sp = orderbook_spread_bps()
+            if sp is not None and sp > MAX_SPREAD_BPS:
+                reason_skip = f"spread too high ({fmt(sp,2)}bps)"
+            if reason_skip is None and ind["adx"] < 15.0:
+                reason_skip = "ADX<15 pause"
 
-            # Manage open trade
-            px=price_now() or info_rf["price"]
-            if STATE["open"] and px:
-                STATE["pnl"]=(px-STATE["entry"])*STATE["qty"]*(1 if STATE["side"]=="long" else -1)
-                manage_after_entry(df, ind, {"price":px, **info_rf})
+            # لا دخول أثناء وجود مركز
+            if STATE["open"]:
+                print_council_log(df, ind, rf, reason_skip=reason_skip)
+                time.sleep(5); continue
 
-            # Entry logic
-            reason=None
-            if spread is not None and spread>MAX_SPREAD_BPS:
-                reason=f"spread too high ({fmt(spread,2)}bps > {MAX_SPREAD_BPS})"
+            # قفل الشمعة (لا ندخل نفس الشمعة مرتين)
+            bar_id = int(df["time"].iloc[-2]) if len(df)>=2 else int(df["time"].iloc[-1])
+            if SAFE["BAR_LOCK"] == bar_id:
+                time.sleep(3); continue
 
-            if (reason is None) and (float(ind.get("adx") or 0.0) < 15.0):
-                reason=f"ADX<{15} — pause entries"
+            # قرار مجلس الإدارة/التريند
+            entry = None if reason_skip else council_entry(df, ind)
 
-            if not STATE["open"] and reason is None:
-                sig=None; tag=""
-                if entry_council:
-                    sig=entry_council["side"]; tag=f"[Council] {entry_council['reason']}"
-                elif info_rf["long"]:
-                    sig="buy"; tag="[RF-closed LONG]"
-                elif info_rf["short"]:
-                    sig="sell"; tag="[RF-closed SHORT]"
+            # لو مفيش قرار واضح → fallback RF-Closed
+            if (entry is None) and (reason_skip is None):
+                if rf["long"]:  entry = {"side":"buy",  "reason":"RF-Closed LONG"}
+                if rf["short"]: entry = {"side":"sell", "reason":"RF-Closed SHORT"}
 
-                if sig:
-                    qty=compute_size(bal, px or info_rf["price"])
-                    if qty>0: open_market(sig, qty, px or info_rf["price"], tag)
-                    else: reason="qty<=0"
+            # تنفيذ الدخول (صفقة واحدة فقط)
+            if entry and (reason_skip is None):
+                qty = compute_size(bal, px)
+                ok  = open_market(entry["side"], qty, px, tag=f"[{entry['reason']}]")
+                if ok:
+                    SAFE["BAR_LOCK"] = bar_id
+                print_council_log(df, ind, rf, reason_entry=entry["reason"])
+            else:
+                print_council_log(df, ind, rf, reason_skip=reason_skip)
 
-            # snapshot
-            pretty_snapshot(bal, {"price":px or info_rf["price"], **info_rf}, ind, spread,
-                            extra={"reason":reason,"council_log":council._last_log}, df=df)
-
-            # bar counter
+            # عداد الشموع للمركز لو اتفتح
             if len(df)>=2 and int(df["time"].iloc[-1])!=int(df["time"].iloc[-2]) and STATE["open"]:
-                STATE["bars"]+=1
+                STATE["bars"] += 1
 
-            sleep = NEAR_CLOSE_S if time_to_candle_close(df)<=10 else BASE_SLEEP
-            time.sleep(sleep)
+            time.sleep(5)
         except Exception as e:
-            print(colored(f"❌ loop error: {e}\n{traceback.format_exc()}","red"))
-            logging.error(f"loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(BASE_SLEEP)
+            logging.error(f"loop: {e}\n{traceback.format_exc()}")
+            print(colored(f"❌ loop error: {e}", "red"))
+            time.sleep(5)
+
+# ========= API / Keepalive =========
+app = Flask(__name__)
 
 @app.route("/")
-def home():
-    mode="LIVE" if MODE_LIVE else "PAPER"
-    return f"✅ DOGE RF+Council OB — {SYMBOL} {INTERVAL} — {mode} — Closed-candle RF fallback — FinalChunk={FINAL_CHUNK_QTY}"
+def root():
+    return f"DOGE BingX Bot — {SYMBOL} {INTERVAL} — {'LIVE' if MODE_LIVE else 'PAPER'} — TP1/TP2 only — Council+Trend & RF-Closed"
 
 @app.route("/metrics")
 def metrics():
     return jsonify({
-        "symbol":SYMBOL,"interval":INTERVAL,"mode":"live" if MODE_LIVE else "paper",
-        "leverage":LEVERAGE,"risk_alloc":RISK_ALLOC,"price":price_now(),
-        "state":STATE,"compound_pnl":compound_pnl,"council_log":council._last_log
+        "symbol": SYMBOL, "interval": INTERVAL, "mode": "live" if MODE_LIVE else "paper",
+        "leverage": LEVERAGE, "risk_alloc": RISK_ALLOC, "price": price_now(),
+        "state": STATE, "compound_pnl": compound_pnl,
+        "limits": {"max_trades_day": MAX_TRADES_PER_DAY, "daily_stop_pct": DAILY_STOP_PCT},
     })
 
-def keepalive_loop():
+def keepalive():
     url=(SELF_URL or "").strip().rstrip("/")
-    if not url:
-        print(colored("⛔ keepalive disabled (SELF_URL not set)","yellow")); return
+    if not url: return
     import requests
-    sess=requests.Session(); sess.headers.update({"User-Agent":"rf-council-keepalive"})
-    print(colored(f"KEEPALIVE → {url} every 50s","cyan"))
+    sess=requests.Session(); sess.headers.update({"User-Agent":"doge-council/keepalive"})
     while True:
         try: sess.get(url, timeout=8)
         except Exception: pass
         time.sleep(50)
 
-if __name__=="__main__":
-    print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL} • {INTERVAL}","yellow"))
-    print(colored(f"RISK: {int(RISK_ALLOC*100)}%×{LEVERAGE}x • RF closed fallback={'ON' if USE_RF_CLOSED else 'OFF'}","yellow"))
-    logging.info("service starting…")
+# ========= BOOT =========
+if __name__ == "__main__":
+    print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
+    print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  — TP1={TP1_PCT}%/{int(TP1_CLOSE_FR*100)}%  TP2={TP2_PCT}% (full)", "yellow"))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
     import threading
-    threading.Thread(target=trade_loop, daemon=True).start()
-    threading.Thread(target=keepalive_loop, daemon=True).start()
+    threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=keepalive, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
