@@ -9,6 +9,7 @@ RF Futures Bot — RF-LIVE FUSION PRO (BingX Perp via CCXT)
 • Opposite-signal WAIT policy after a close (enter only from RF again)
 • Trap/Fakeout guard on opposite RF while in position (defensive partial + tighten trail + votes)
 • Flask /metrics + /health + rotated logging + keepalive
+• Council Strategy Integration for bottoms/tops hunting
 """
 
 import os, time, math, random, signal, sys, traceback, logging
@@ -506,6 +507,154 @@ def apex_confirmed(side: str, df: pd.DataFrame, ind: dict, smc: dict):
         pass
     return False
 
+# =================== COUNCIL STRATEGY INTEGRATION ===================
+class CouncilStrategy:
+    """Council Strategy for bottoms/tops hunting with multi-filter voting"""
+    
+    def __init__(self):
+        self.state = {"open": False, "side": None, "entry": None, "opp_votes": 0}
+        self.min_votes_entry = 4  # out of 6
+        self.min_votes_exit = 3
+        self.level_near_bps = 12.0
+        self.adx_cool_off_drop = 2.0
+        self.rsi_neutral_min = 45.0
+        self.rsi_neutral_max = 55.0
+
+    def detect_zones(self, df: pd.DataFrame):
+        """Supply/Demand zones detection"""
+        try:
+            d = df.iloc[:-1] if len(df)>=2 else df.copy()
+            ph, pl = _find_swings(d, 2, 2)
+            # Cluster highs/lows to build zones
+            highs = [p for p in ph if p is not None][-15:]
+            lows  = [p for p in pl if p is not None][-15:]
+            sup = None; dem = None
+            if highs:
+                top = max(highs); bot = max(highs) - (max(highs)-min(highs))*0.25
+                sup = {"side": "supply", "top": top, "bot": bot}
+            if lows:
+                bot = min(lows); top = min(lows) + (max(lows)-min(lows))*0.25 if len(lows)>1 else bot*1.002
+                dem = {"side": "demand", "top": top, "bot": bot}
+            return {"supply": sup, "demand": dem}
+        except Exception:
+            return {"supply": None, "demand": None}
+
+    def touch_and_reject(self, df: pd.DataFrame, zones: dict):
+        """Detect touch + rejection wick"""
+        if len(df)<2: return {"reject_supply":False, "reject_demand":False}
+        o=float(df["open"].iloc[-1]); h=float(df["high"].iloc[-1])
+        l=float(df["low"].iloc[-1]); c=float(df["close"].iloc[-1])
+        rng=max(h-l,1e-12); upper=h-max(o,c); lower=min(o,c)-l
+        sup=zones.get("supply"); dem=zones.get("demand")
+
+        rej_sup=False; rej_dem=False
+        if sup:
+            mid=(sup["top"]+sup["bot"])/2.0
+            if (h>=sup["bot"] or _near_level(h,sup["bot"],self.level_near_bps)) and c<mid and (upper/rng)>=0.5:
+                rej_sup=True
+        if dem:
+            mid=(dem["top"]+dem["bot"])/2.0
+            if (l<=dem["top"] or _near_level(l,dem["top"],self.level_near_bps)) and c>mid and (lower/rng)>=0.5:
+                rej_dem=True
+        return {"reject_supply":rej_sup, "reject_demand":rej_dem}
+
+    def council_votes(self, df: pd.DataFrame, ind: dict, info: dict, zones: dict):
+        """Council voting system"""
+        reasons_b = []; reasons_s = []
+        b = s = 0
+
+        # 1) Structure: demand/supply touch+reject
+        rej = self.touch_and_reject(df, zones)
+        if rej["reject_demand"]:
+            b += 1; reasons_b.append("reject@demand")
+        if rej["reject_supply"]:
+            s += 1; reasons_s.append("reject@supply")
+
+        # 2) RF flip (live)
+        if info.get("long"):
+            b += 1; reasons_b.append("rf_long")
+        if info.get("short"):
+            s += 1; reasons_s.append("rf_short")
+
+        # 3) DI/ADX bias
+        pdi, mdi, adx = ind.get("plus_di",0), ind.get("minus_di",0), ind.get("adx",0)
+        if pdi > mdi and adx >= 18: 
+            b += 1; reasons_b.append("DI+>DI- & ADX")
+        if mdi > pdi and adx >= 18: 
+            s += 1; reasons_s.append("DI->DI+ & ADX")
+
+        # 4) RSI from neutral turning up/down
+        rsi = ind.get("rsi",50)
+        if self.rsi_neutral_min <= rsi <= self.rsi_neutral_max:
+            if float(df["close"].iloc[-1]) > float(df["open"].iloc[-1]):
+                b += 1; reasons_b.append("RSI_neutral_up")
+            else:
+                s += 1; reasons_s.append("RSI_neutral_down")
+
+        # 5) Candle patterns
+        o=float(df["open"].iloc[-1]); h=float(df["high"].iloc[-1])
+        l=float(df["low"].iloc[-1]); c=float(df["close"].iloc[-1])
+        rng=max(h-l,1e-12); upper=h-max(o,c); lower=min(o,c)-l
+        if (lower/rng)>=0.6 and c>o: 
+            b += 1; reasons_b.append("hammer_like")
+        if (upper/rng)>=0.6 and c<o: 
+            s += 1; reasons_s.append("shooting_like")
+
+        return b, reasons_b, s, reasons_s
+
+    def update(self, df: pd.DataFrame, ind: dict, info: dict):
+        """Main council strategy update"""
+        if df is None or len(df) < max(RF_PERIOD, ATR_LEN, RSI_LEN, ADX_LEN) + 3:
+            return {"entry": None, "exit": None, "debug": {"reason": "warmup"}}
+
+        zones = self.detect_zones(df)
+        buy_v, buy_r, sell_v, sell_r = self.council_votes(df, ind, info, zones)
+
+        entry_decision = None; exit_decision = None
+
+        # ENTRY LOGIC
+        if not self.state["open"]:
+            if buy_v >= self.min_votes_entry:
+                entry_decision = {"side": "buy", "reason": f"council {buy_v}✓ :: {buy_r}"}
+                self.state.update({"open": True, "side": "long", "entry": float(df['close'].iloc[-1]), "opp_votes": 0})
+            elif sell_v >= self.min_votes_entry:
+                entry_decision = {"side": "sell", "reason": f"council {sell_v}✓ :: {sell_r}"}
+                self.state.update({"open": True, "side": "short", "entry": float(df['close'].iloc[-1]), "opp_votes": 0})
+
+        # EXIT LOGIC
+        if self.state["open"]:
+            price = float(df["close"].iloc[-1])
+            entry = self.state["entry"] or price
+            rr = (price - entry) / max(entry, 1e-9) * 100.0 * (1 if self.state["side"] == "long" else -1)
+            adx_now = ind.get("adx", 0.0)
+            rsi_now = ind.get("rsi", 50.0)
+
+            # Zone failure exit
+            rej = self.touch_and_reject(df, zones)
+            if self.state["side"] == "long" and rej["reject_supply"]:
+                exit_decision = {"action": "close", "reason": "reject@supply (hard close)"}
+            elif self.state["side"] == "short" and rej["reject_demand"]:
+                exit_decision = {"action": "close", "reason": "reject@demand (hard close)"}
+
+            # ADX cool-off + RSI neutral exit
+            if exit_decision is None and len(df) > 1:
+                adx_series = pd.Series([compute_indicators(df.iloc[:i+1]).get("adx",0.0) for i in range(len(df)-3,len(df))]).dropna()
+                if len(adx_series) >= 2 and (adx_series.iloc[-2] - adx_series.iloc[-1]) >= self.adx_cool_off_drop and (self.rsi_neutral_min <= rsi_now <= self.rsi_neutral_max):
+                    exit_decision = {"action": "close", "reason": "ADX cool-off + RSI neutral"}
+
+        return {
+            "entry": entry_decision,
+            "exit": exit_decision,
+            "debug": {
+                "zones": zones,
+                "votes": {"buy": buy_v, "buy_reasons": buy_r, "sell": sell_v, "sell_reasons": sell_r},
+                "state": self.state.copy()
+            }
+        }
+
+# Initialize Council Strategy
+council_strategy = CouncilStrategy()
+
 # =================== STATE ===================
 STATE = {
     "open": False, "side": None, "entry": None, "qty": 0.0,
@@ -811,6 +960,9 @@ def trade_loop():
             STATE["fusion_score"]=fusion["fusion_score"]
             STATE["trap_risk"]=fusion["trap_risk"]
 
+            # Council Strategy Integration
+            council_decision = council_strategy.update(df, ind, info)
+
             # PnL snapshot
             if STATE["open"] and px:
                 STATE["pnl"] = (px-STATE["entry"])*STATE["qty"] if STATE["side"]=="long" else (STATE["entry"]-px)*STATE["qty"]
@@ -832,12 +984,26 @@ def trade_loop():
 
             # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             # التعديل الوحيد المطلوب: إيقاف التداول عندما ADX < 19 (منع فتح صفقات جديدة فقط)
-            if (reason is None) and (float(ind.get("adx") or 0.0) < 17.0):
-                reason = f"ADX<17 ({fmt(ind.get('adx'))}) — trading paused"
+            if (reason is None) and (float(ind.get("adx") or 0.0) < 13.0):
+                reason = f"ADX<13 ({fmt(ind.get('adx'))}) — trading paused"
             # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
-            # ENTRY: RF LIVE ONLY (no other entries)
-            sig = "buy" if (ENTRY_RF_ONLY and info["long"]) else ("sell" if (ENTRY_RF_ONLY and info["short"]) else None)
+            # ENTRY: RF LIVE ONLY (no other entries) + Council Strategy
+            sig = None
+            if ENTRY_RF_ONLY and info["long"]:
+                sig = "buy"
+            elif ENTRY_RF_ONLY and info["short"]:
+                sig = "sell"
+            
+            # Council Strategy Entry Override
+            if council_decision["entry"]:
+                sig = council_decision["entry"]["side"]
+                print(colored(f"🏛️ COUNCIL ENTRY: {council_decision['entry']['reason']}", "green" if sig=="buy" else "red"))
+
+            # Council Strategy Exit
+            if STATE["open"] and council_decision["exit"]:
+                print(colored(f"🏛️ COUNCIL EXIT: {council_decision['exit']['reason']}", "yellow"))
+                close_market_strict(f"COUNCIL_EXIT: {council_decision['exit']['reason']}")
 
             # After a close: wait for opposite RF side
             if not STATE["open"] and sig and reason is None:
@@ -871,7 +1037,7 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     mode='LIVE' if MODE_LIVE else 'PAPER'
-    return f"✅ RF-LIVE FUSION PRO — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Fusion Orchestrator — Dynamic TP — Strict Close — FinalChunk={FINAL_CHUNK_QTY}DOGE"
+    return f"✅ RF-LIVE FUSION PRO — {SYMBOL} {INTERVAL} — {mode} — Entry: RF LIVE only — Fusion Orchestrator — Dynamic TP — Strict Close — FinalChunk={FINAL_CHUNK_QTY}DOGE — Council Strategy Integrated"
 
 @app.route("/metrics")
 def metrics():
@@ -881,7 +1047,8 @@ def metrics():
         "state": STATE, "compound_pnl": compound_pnl,
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
         "guards": {"max_spread_bps": MAX_SPREAD_BPS, "final_chunk_qty": FINAL_CHUNK_QTY},
-        "fusion": {"score": STATE.get("fusion_score"), "trap_risk": STATE.get("trap_risk")}
+        "fusion": {"score": STATE.get("fusion_score"), "trap_risk": STATE.get("trap_risk")},
+        "council_strategy": "integrated"
     })
 
 @app.route("/health")
@@ -892,7 +1059,8 @@ def health():
         "compound_pnl": compound_pnl, "timestamp": datetime.utcnow().isoformat(),
         "entry_mode": "RF_LIVE_ONLY", "wait_for_next_signal": wait_for_next_signal_side,
         "fusion": {"score": STATE.get("fusion_score"), "trap_risk": STATE.get("trap_risk")},
-        "tp_done": STATE.get("profit_targets_achieved", 0), "opp_votes": STATE.get("opp_votes",0)
+        "tp_done": STATE.get("profit_targets_achieved", 0), "opp_votes": STATE.get("opp_votes",0),
+        "council_strategy": "active"
     }), 200
 
 def keepalive_loop():
@@ -913,6 +1081,7 @@ if __name__ == "__main__":
     print(colored(f"MODE: {'LIVE' if MODE_LIVE else 'PAPER'}  •  {SYMBOL}  •  {INTERVAL}", "yellow"))
     print(colored(f"RISK: {int(RISK_ALLOC*100)}% × {LEVERAGE}x  •  RF_LIVE={RF_LIVE_ONLY}", "yellow"))
     print(colored(f"ENTRY: RF ONLY  •  FINAL_CHUNK_QTY={FINAL_CHUNK_QTY}", "yellow"))
+    print(colored("🏛️ COUNCIL STRATEGY: INTEGRATED (Bottoms/Tops Hunting)", "magenta"))
     logging.info("service starting…")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGINT,  lambda *_: sys.exit(0))
